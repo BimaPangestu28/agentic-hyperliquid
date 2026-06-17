@@ -18,6 +18,7 @@ pub struct AssetMeta {
     pub max_leverage: u32,
 }
 
+#[derive(Debug)]
 pub struct SizingInput<'a> {
     pub setup: &'a TradeSetup,
     pub equity: f64,
@@ -73,6 +74,7 @@ impl LeverageMap {
 
 /// Rounds `value` DOWN to `decimals` places.
 fn floor_to(value: f64, decimals: u32) -> f64 {
+    debug_assert!(decimals <= 8, "szDecimals beyond f64-safe range");
     let factor = 10_f64.powi(decimals as i32);
     (value * factor).floor() / factor
 }
@@ -96,8 +98,8 @@ pub fn build_plan(input: &SizingInput) -> Result<ExecutionPlan, SizingError> {
 
     // Validate stop side.
     match setup.direction {
-        Direction::Long if setup.stop_loss >= setup.entry => return Err(SizingError::InvalidStopSide),
-        Direction::Short if setup.stop_loss <= setup.entry => return Err(SizingError::InvalidStopSide),
+        Direction::Long if setup.stop_loss > setup.entry => return Err(SizingError::InvalidStopSide),
+        Direction::Short if setup.stop_loss < setup.entry => return Err(SizingError::InvalidStopSide),
         _ => {}
     }
 
@@ -211,6 +213,15 @@ mod tests {
         let meta = AssetMeta { sz_decimals: 1, max_leverage: 10 };
         let input = SizingInput { setup: &setup, equity: 10_000.0, risk_pct: 1.0, profile: RiskProfile::Moderate, leverage: &leverage(), asset_meta: &meta };
         assert_eq!(build_plan(&input).unwrap_err(), SizingError::InvalidStopSide);
+    }
+
+    #[test]
+    fn rejects_zero_stop_distance() {
+        let mut setup = pendle_setup();
+        setup.stop_loss = setup.entry; // equal => zero risk distance
+        let meta = AssetMeta { sz_decimals: 1, max_leverage: 10 };
+        let input = SizingInput { setup: &setup, equity: 10_000.0, risk_pct: 1.0, profile: RiskProfile::Moderate, leverage: &leverage(), asset_meta: &meta };
+        assert_eq!(build_plan(&input).unwrap_err(), SizingError::ZeroStopDistance);
     }
 
     #[test]
