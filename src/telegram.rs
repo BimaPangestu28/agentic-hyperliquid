@@ -1,7 +1,11 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
+use crate::config::LeverageMap;
+use crate::hyperliquid::{EntryOrder, Exchange, TriggerOrder};
 use crate::parser::Direction;
-use crate::sizing::{ExecutionPlan, RiskProfile};
+use crate::sizing::{build_plan, ExecutionPlan, RiskProfile, SizingError, SizingInput};
+use crate::state::PendingTrade;
+use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
@@ -66,6 +70,302 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
     ])
 }
 
+/// Recomputes the plan for a different risk profile, reusing the cached equity
+/// and asset metadata captured when the card was first parsed.
+pub fn recompute_plan(
+    trade: &PendingTrade,
+    profile: RiskProfile,
+    risk_pct: f64,
+    leverage: &LeverageMap,
+) -> Result<ExecutionPlan, SizingError> {
+    build_plan(&SizingInput {
+        setup: &trade.setup,
+        equity: trade.equity,
+        risk_pct,
+        profile,
+        leverage,
+        asset_meta: &trade.asset_meta,
+    })
+}
+
+/// Sets leverage, places the entry order, waits for fill (limit only), then
+/// places the reduce-only bracket. Bracket side is opposite the position.
+pub async fn execute_plan<E: Exchange>(
+    exchange: &E,
+    plan: &ExecutionPlan,
+    use_limit: bool,
+    fill_timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let is_buy = matches!(plan.direction, Direction::Long);
+    exchange.set_leverage(&plan.coin, plan.leverage).await?;
+
+    let entry = EntryOrder {
+        coin: plan.coin.clone(),
+        is_buy,
+        size: plan.size,
+        limit_price: if use_limit { Some(plan.entry) } else { None },
+    };
+    let entry_result = exchange.place_entry(&entry).await?;
+
+    // For a limit order, wait until the position actually exists before
+    // arming the bracket; otherwise the triggers would have nothing to reduce.
+    if use_limit && !entry_result.filled {
+        let deadline = fill_timeout_secs;
+        let mut elapsed = 0;
+        loop {
+            if exchange.position_size(&plan.coin).await? >= plan.size * 0.99 {
+                break;
+            }
+            if elapsed >= deadline {
+                anyhow::bail!("entry limit order not filled within {deadline}s; bracket not placed");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            elapsed += 1;
+        }
+    }
+
+    // Bracket: SL (full size) + each TP. Closing side is opposite the entry.
+    let close_is_buy = !is_buy;
+    exchange
+        .place_trigger(&TriggerOrder {
+            coin: plan.coin.clone(),
+            is_buy: close_is_buy,
+            size: plan.stop_loss.size,
+            trigger_price: plan.stop_loss.price,
+            is_take_profit: false,
+        })
+        .await?;
+    for take_profit in &plan.take_profits {
+        exchange
+            .place_trigger(&TriggerOrder {
+                coin: plan.coin.clone(),
+                is_buy: close_is_buy,
+                size: take_profit.size,
+                trigger_price: take_profit.price,
+                is_take_profit: true,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+// ── Dispatcher wiring ─────────────────────────────────────────────────────────
+
+use crate::journal::Journal;
+use crate::parser::parse_setup;
+use crate::state::PendingStore;
+use std::sync::Arc;
+use teloxide::prelude::*;
+use teloxide::types::ParseMode;
+
+struct BotContext<E: Exchange + 'static> {
+    config: crate::config::Config,
+    exchange: Arc<E>,
+    store: Arc<PendingStore>,
+    journal: Arc<Journal>,
+}
+
+fn profile_from_callback(data: &str) -> Option<RiskProfile> {
+    match data {
+        CB_CONSERVATIVE => Some(RiskProfile::Conservative),
+        CB_MODERATE => Some(RiskProfile::Moderate),
+        CB_AGGRESSIVE => Some(RiskProfile::Aggressive),
+        _ => None,
+    }
+}
+
+async fn on_message<E: Exchange + 'static>(
+    bot: Bot,
+    message: Message,
+    context: Arc<BotContext<E>>,
+) -> anyhow::Result<()> {
+    // teloxide-core 0.10: Message.from is Option<User> (field, not method)
+    let user_id = match message.from() {
+        Some(user) => user.id.0 as i64,
+        None => return Ok(()),
+    };
+    if !context.config.is_allowed(user_id) {
+        return Ok(()); // ignore non-allowlisted users
+    }
+    let text = match message.text() {
+        Some(text) => text,
+        None => return Ok(()),
+    };
+
+    let setup = match parse_setup(text) {
+        Ok(setup) => setup,
+        Err(error) => {
+            bot.send_message(message.chat.id, format!("Could not parse setup: {error}")).await?;
+            return Ok(());
+        }
+    };
+
+    if let Some(gate) = context.config.confidence_gate {
+        if setup.confidence.map(|confidence| confidence < gate).unwrap_or(false) {
+            bot.send_message(
+                message.chat.id,
+                format!("Confidence {:?} below gate {gate}; skipped.", setup.confidence),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    let equity = context.exchange.equity().await?;
+    let asset_meta = context.exchange.asset_meta(&setup.coin).await?;
+    let profile = RiskProfile::Moderate;
+    let plan = match build_plan(&SizingInput {
+        setup: &setup,
+        equity,
+        risk_pct: context.config.risk_pct,
+        profile,
+        leverage: &context.config.leverage,
+        asset_meta: &asset_meta,
+    }) {
+        Ok(plan) => plan,
+        Err(error) => {
+            bot.send_message(message.chat.id, format!("Cannot size trade: {error}")).await?;
+            return Ok(());
+        }
+    };
+
+    let sent = bot
+        .send_message(message.chat.id, render_summary(&plan, profile))
+        .parse_mode(ParseMode::Markdown)
+        .reply_markup(confirmation_keyboard(profile))
+        .await?;
+
+    // Key by message id (i32 from MessageId(i32), cast to i64 for PendingStore)
+    context.store.insert(
+        sent.id.0 as i64,
+        PendingTrade { setup, equity, asset_meta, profile, plan },
+    );
+    Ok(())
+}
+
+async fn on_callback<E: Exchange + 'static>(
+    bot: Bot,
+    query: CallbackQuery,
+    context: Arc<BotContext<E>>,
+) -> anyhow::Result<()> {
+    // teloxide-core 0.10: query.message is Option<MaybeInaccessibleMessage>
+    // Use the helper regular_message() to get a &Message only when accessible.
+    let message = match query.regular_message() {
+        Some(message) => message.clone(),
+        None => return Ok(()),
+    };
+    // MessageId(i32), cast to i64 for PendingStore key
+    let key = message.id.0 as i64;
+    let data = query.data.clone().unwrap_or_default();
+
+    // Profile switch: recompute and edit the message in place.
+    if let Some(profile) = profile_from_callback(&data) {
+        if let Some(mut trade) = context.store.get(key) {
+            match recompute_plan(&trade, profile, context.config.risk_pct, &context.config.leverage) {
+                Ok(plan) => {
+                    trade.profile = profile;
+                    trade.plan = plan.clone();
+                    context.store.insert(key, trade);
+                    bot.edit_message_text(
+                        message.chat.id,
+                        message.id,
+                        render_summary(&plan, profile),
+                    )
+                    .parse_mode(ParseMode::Markdown)
+                    .reply_markup(confirmation_keyboard(profile))
+                    .await?;
+                }
+                Err(error) => {
+                    bot.answer_callback_query(&query.id)
+                        .text(format!("{error}"))
+                        .show_alert(true)
+                        .await?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if data == CB_CANCEL {
+        context.store.remove(key);
+        bot.edit_message_text(message.chat.id, message.id, "Cancelled.").await?;
+        return Ok(());
+    }
+
+    let use_limit = match data.as_str() {
+        CB_LIMIT => true,
+        CB_MARKET => false,
+        _ => return Ok(()),
+    };
+
+    let trade = match context.store.remove(key) {
+        Some(trade) => trade,
+        None => {
+            bot.answer_callback_query(&query.id).text("Setup expired.").await?;
+            return Ok(());
+        }
+    };
+
+    bot.answer_callback_query(&query.id).await?;
+    bot.edit_message_text(
+        message.chat.id,
+        message.id,
+        format!("Executing {}…", trade.plan.coin),
+    )
+    .await?;
+
+    match execute_plan(
+        context.exchange.as_ref(),
+        &trade.plan,
+        use_limit,
+        context.config.entry_fill_timeout_secs,
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = context.journal.record(&trade.plan, None);
+            bot.send_message(
+                message.chat.id,
+                format!("✅ Executed {} with SL/TP bracket.", trade.plan.coin),
+            )
+            .await?;
+        }
+        Err(error) => {
+            bot.send_message(
+                message.chat.id,
+                format!("❌ Execution failed: {error}"),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn run<E: Exchange + 'static>(
+    config: crate::config::Config,
+    exchange: Arc<E>,
+) -> anyhow::Result<()> {
+    let bot = Bot::new(&config.telegram_token);
+    let context: Arc<BotContext<E>> = Arc::new(BotContext {
+        config,
+        exchange,
+        store: Arc::new(PendingStore::new()),
+        journal: Arc::new(Journal::open("trades.db")?),
+    });
+
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(on_message::<E>))
+        .branch(Update::filter_callback_query().endpoint(on_callback::<E>));
+
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![context])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +409,28 @@ mod tests {
         let first_row = &markup.inline_keyboard[0];
         assert!(first_row[2].text.contains('✓')); // Aggressive marked
         assert!(!first_row[0].text.contains('✓'));
+    }
+
+    use crate::hyperliquid::mock::MockExchange;
+    use crate::sizing::AssetMeta;
+
+    #[tokio::test]
+    async fn execute_plan_sets_leverage_then_entry_then_brackets() {
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            ..Default::default()
+        };
+        let plan = plan(); // long, size 666.6, 2 TPs
+        super::execute_plan(&exchange, &plan, false, 1).await.unwrap();
+
+        assert_eq!(exchange.leverage_calls.lock().unwrap().len(), 1);
+        assert_eq!(exchange.entries.lock().unwrap().len(), 1);
+        // SL + TP1 + TP2 = 3 trigger orders, all reduce-only, opposite side (sell).
+        let triggers = exchange.triggers.lock().unwrap();
+        assert_eq!(triggers.len(), 3);
+        assert!(triggers.iter().all(|t| !t.is_buy)); // closing a long => sell
+        assert_eq!(triggers.iter().filter(|t| t.is_take_profit).count(), 2);
+        assert_eq!(triggers.iter().filter(|t| !t.is_take_profit).count(), 1);
     }
 }

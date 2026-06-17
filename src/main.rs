@@ -6,6 +6,14 @@ mod sizing;
 mod state;
 mod telegram;
 
-fn main() {
-    println!("agent-hyperliquid scaffold");
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
+    tracing_subscriber::fmt::init();
+
+    let config = config::from_env()?;
+    let exchange = hyperliquid::HyperliquidExchange::connect(&config).await?;
+    telegram::run(config, Arc::new(exchange)).await
 }
