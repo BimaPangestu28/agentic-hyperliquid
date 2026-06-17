@@ -95,8 +95,8 @@ pub mod mock {
             })
         }
 
-        async fn position_size(&self, _coin: &str) -> anyhow::Result<f64> {
-            Ok(self.entries.lock().unwrap().iter().map(|e| e.size).sum())
+        async fn position_size(&self, coin: &str) -> anyhow::Result<f64> {
+            Ok(self.entries.lock().unwrap().iter().filter(|e| e.coin.eq_ignore_ascii_case(coin)).map(|e| e.size).sum())
         }
     }
 
@@ -248,7 +248,9 @@ impl Exchange for HyperliquidExchange {
         let (limit_px, tif) = match order.limit_price {
             Some(px) => (px, "Gtc"),
             None => {
-                let px = if order.is_buy { f64::MAX } else { 0.0_f64 };
+                // TODO(before mainnet): replace this IOC-at-extreme-price hack with ExchangeClient::market_open + slippage params.
+                // f64::MAX (buy) / 1e-8 (sell) are aggressive sentinels intended to cross the book immediately under IOC.
+                let px = if order.is_buy { f64::MAX } else { 1e-8 };
                 (px, "Ioc")
             }
         };
@@ -310,18 +312,11 @@ impl Exchange for HyperliquidExchange {
     /// Returns the absolute size of the open position for `coin` (0.0 if flat).
     async fn position_size(&self, coin: &str) -> anyhow::Result<f64> {
         let state = self.info.user_state(self.address).await?;
-        let size = state
-            .asset_positions
-            .iter()
-            .find(|p| p.position.coin.eq_ignore_ascii_case(coin))
-            .map(|p| {
-                p.position
-                    .szi
-                    .parse::<f64>()
-                    .unwrap_or(0.0)
-                    .abs()
-            })
-            .unwrap_or(0.0);
-        Ok(size)
+        match state.asset_positions.iter().find(|p| p.position.coin.eq_ignore_ascii_case(coin)) {
+            Some(p) => Ok(p.position.szi.parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("cannot parse position szi {:?}: {e}", p.position.szi))?
+                .abs()),
+            None => Ok(0.0),
+        }
     }
 }

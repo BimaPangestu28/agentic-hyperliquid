@@ -92,7 +92,8 @@ fn estimate_liquidation(direction: Direction, entry: f64, leverage: u32) -> f64 
 pub fn build_plan(input: &SizingInput) -> Result<ExecutionPlan, SizingError> {
     let setup = input.setup;
     let leverage = input.leverage.leverage_for(input.profile);
-    if leverage > input.asset_meta.max_leverage {
+    // max_leverage == 0 means the cap is unknown (SDK universe omits it); skip the check.
+    if input.asset_meta.max_leverage > 0 && leverage > input.asset_meta.max_leverage {
         return Err(SizingError::LeverageTooHigh { requested: leverage, cap: input.asset_meta.max_leverage });
     }
 
@@ -239,6 +240,14 @@ mod tests {
         let input = SizingInput { setup: &setup, equity: 1.0, risk_pct: 1.0, profile: RiskProfile::Moderate, leverage: &leverage(), asset_meta: &meta };
         // risk = 0.01, size ~0.066 -> floor 0.0 -> below min
         assert_eq!(build_plan(&input).unwrap_err(), SizingError::BelowMinSize(MIN_ORDER_NOTIONAL));
+    }
+
+    #[test]
+    fn unknown_max_leverage_skips_cap_check() {
+        let setup = pendle_setup();
+        let meta = AssetMeta { sz_decimals: 1, max_leverage: 0 }; // 0 = unknown cap
+        let input = SizingInput { setup: &setup, equity: 10_000.0, risk_pct: 1.0, profile: RiskProfile::Aggressive, leverage: &leverage(), asset_meta: &meta };
+        assert!(build_plan(&input).is_ok());
     }
 
     #[test]
