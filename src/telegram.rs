@@ -180,7 +180,7 @@ async fn on_message<E: Exchange + 'static>(
     context: Arc<BotContext<E>>,
 ) -> anyhow::Result<()> {
     // teloxide-core 0.10: Message.from is Option<User> (field, not method)
-    let user_id = match message.from() {
+    let user_id = match message.from.as_ref() {
         Some(user) => user.id.0 as i64,
         None => return Ok(()),
     };
@@ -274,6 +274,7 @@ async fn on_callback<E: Exchange + 'static>(
                     .parse_mode(ParseMode::Markdown)
                     .reply_markup(confirmation_keyboard(profile))
                     .await?;
+                    bot.answer_callback_query(&query.id).await?;
                 }
                 Err(error) => {
                     bot.answer_callback_query(&query.id)
@@ -282,6 +283,8 @@ async fn on_callback<E: Exchange + 'static>(
                         .await?;
                 }
             }
+        } else {
+            bot.answer_callback_query(&query.id).text("Setup expired.").await?;
         }
         return Ok(());
     }
