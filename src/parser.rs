@@ -41,6 +41,15 @@ fn parse_money(token: &str) -> Option<f64> {
     cleaned.parse::<f64>().ok()
 }
 
+/// True for a take-profit label like `TP1`, `TP2` (panic-safe on multi-byte input).
+fn is_take_profit_label(line: &str) -> bool {
+    let upper = line.to_ascii_uppercase();
+    match upper.strip_prefix("TP") {
+        Some(rest) => !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
 fn find_value_after<'a>(lines: &'a [&'a str], label: &str) -> Option<&'a str> {
     lines
         .iter()
@@ -79,10 +88,16 @@ pub fn parse_setup(text: &str) -> Result<TradeSetup, ParseError> {
     let stop_loss = find_value_after(&lines, "SL")
         .and_then(parse_money)
         .ok_or_else(|| ParseError::MissingFields("stop_loss".into()))?;
+    if stop_loss <= 0.0 {
+        return Err(ParseError::InvalidValue("stop_loss must be positive".into()));
+    }
 
     let entry = find_value_after(&lines, "Entry")
         .and_then(parse_money)
         .ok_or_else(|| ParseError::MissingFields("entry".into()))?;
+    if entry <= 0.0 {
+        return Err(ParseError::InvalidValue("entry must be positive".into()));
+    }
 
     // Take-profits: for each TPn label, the next price line is the price; the
     // first subsequent line ending in `%` that is not a +/- price-change is the
@@ -90,16 +105,19 @@ pub fn parse_setup(text: &str) -> Result<TradeSetup, ParseError> {
     let mut take_profits = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let label = line.trim();
-        if !(label.len() >= 3 && label.to_ascii_uppercase().starts_with("TP") && label[2..].chars().all(|c| c.is_ascii_digit())) {
+        if !is_take_profit_label(label) {
             continue;
         }
         let price = lines.get(index + 1).and_then(|l| parse_money(l))
             .ok_or_else(|| ParseError::InvalidValue(format!("{label} price")))?;
+        if price <= 0.0 {
+            return Err(ParseError::InvalidValue(format!("{label} price must be positive")));
+        }
         // Scan following lines until the next TP label or end for an allocation %.
         let mut allocation_pct = 100.0;
         for follow in &lines[index + 1..] {
             let f = follow.trim();
-            if f.to_ascii_uppercase().starts_with("TP") && f.len() >= 3 && f[2..].chars().all(|c| c.is_ascii_digit()) {
+            if is_take_profit_label(f) {
                 break;
             }
             // Allocation lines have no sign; price-change lines start with + or -.
@@ -178,5 +196,12 @@ $2.00
         let text = "Trading setup for BTC\nDirection\nLONG\nSL\n$70000\nTP1\n$80000\n100%";
         let err = parse_setup(text).unwrap_err();
         assert_eq!(err, ParseError::MissingFields("entry".into()));
+    }
+
+    #[test]
+    fn rejects_non_positive_entry() {
+        let text = "Trading setup for BTC\nDirection\nLONG\nSL\n$0\nEntry\n$0\nTP1\n$80000\n100%";
+        let err = parse_setup(text).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidValue(_)));
     }
 }
