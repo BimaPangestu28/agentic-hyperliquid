@@ -36,6 +36,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dotenvy",
+ "ethers",
  "hyperliquid_rust_sdk",
  "rusqlite",
  "serde",

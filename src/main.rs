@@ -1,4 +1,5 @@
 mod config;
+mod hyperliquid;
 mod parser;
 mod sizing;
 
