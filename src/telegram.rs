@@ -8,7 +8,7 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agent Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help";
+const WELCOME_TEXT: &str = "\u{1F44B} Agent Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -274,6 +274,25 @@ async fn on_message<E: Exchange + 'static>(
         None => return Ok(()),
     };
 
+    // /stats is handled here (needs async exchange + journal) rather than in the
+    // pure command_response function. Intercept before command_response so it
+    // does not fall through to the "unknown command" branch.
+    if text
+        .trim()
+        .split_whitespace()
+        .next()
+        .map(|w| w.split('@').next().unwrap_or("").eq_ignore_ascii_case("/stats"))
+        .unwrap_or(false)
+    {
+        let fills = context.exchange.user_fills().await.unwrap_or_default();
+        let trades = context.journal.all_trades().unwrap_or_default();
+        let stats = crate::stats::compute_stats(&fills, &trades);
+        // Plain text — no parse_mode — so no MarkdownV2 escaping needed.
+        bot.send_message(message.chat.id, crate::stats::render_stats(&stats))
+            .await?;
+        return Ok(());
+    }
+
     if let Some(reply) = command_response(text) {
         bot.send_message(message.chat.id, reply).await?;
         return Ok(());
@@ -468,6 +487,19 @@ async fn on_callback<E: Exchange + 'static>(
     )
     .await?;
 
+    // Capture signal metadata and timestamp before the async execute_plan call
+    // so we can journal even on error. `trade` is not moved by execute_plan
+    // (which only borrows &trade.plan), but extracting up-front keeps the
+    // borrow checker happy and avoids re-accessing after a potential move.
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let trade_confidence = trade.setup.confidence;
+    let trade_timeframe = trade.setup.timeframe.clone();
+    let trade_risk_reward = trade.setup.risk_reward;
+    let trade_profile = format!("{:?}", trade.profile);
+
     match execute_plan(
         context.exchange.as_ref(),
         &trade.plan,
@@ -481,7 +513,15 @@ async fn on_callback<E: Exchange + 'static>(
             // auditable — even when subsequent steps (e.g. bracket placement)
             // returned Ok. execute_plan signature is kept as Result<()>; order
             // id is journalled as None here (thread-out is a future task).
-            let _ = context.journal.record(&trade.plan, None);
+            let _ = context.journal.record(
+                &trade.plan,
+                None,
+                trade_confidence,
+                trade_timeframe.as_deref(),
+                trade_risk_reward,
+                &trade_profile,
+                opened_at,
+            );
             bot.send_message(
                 message.chat.id,
                 format!("✅ Executed {} with SL/TP bracket.", trade.plan.coin),
@@ -492,7 +532,15 @@ async fn on_callback<E: Exchange + 'static>(
             // Journal on failure too: a partial fill may have opened a position
             // even when execute_plan returns Err, so we must leave an audit
             // trail before sending the error message.
-            let _ = context.journal.record(&trade.plan, None);
+            let _ = context.journal.record(
+                &trade.plan,
+                None,
+                trade_confidence,
+                trade_timeframe.as_deref(),
+                trade_risk_reward,
+                &trade_profile,
+                opened_at,
+            );
             bot.send_message(
                 message.chat.id,
                 format!("❌ Execution failed: {error}"),

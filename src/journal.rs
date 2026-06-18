@@ -8,6 +8,9 @@ pub struct Journal {
     connection: Mutex<Connection>,
 }
 
+/// Full schema with all signal-metadata and timestamp columns.
+/// New databases receive this directly; existing databases are migrated via
+/// idempotent `ALTER TABLE` statements in `MIGRATIONS`.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     coin TEXT NOT NULL,
@@ -16,12 +19,46 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS trades (
     entry REAL NOT NULL,
     leverage INTEGER NOT NULL,
     stop_loss REAL NOT NULL,
-    entry_order_id INTEGER
+    entry_order_id INTEGER,
+    confidence INTEGER,
+    timeframe TEXT,
+    risk_reward REAL,
+    profile TEXT,
+    notional REAL,
+    risk_amount REAL,
+    opened_at INTEGER
 )";
+
+/// Idempotent migrations for existing databases that predate the signal-metadata
+/// columns. Each statement is executed and its error is silently ignored —
+/// SQLite returns an error if the column already exists, which is expected.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE trades ADD COLUMN confidence INTEGER",
+    "ALTER TABLE trades ADD COLUMN timeframe TEXT",
+    "ALTER TABLE trades ADD COLUMN risk_reward REAL",
+    "ALTER TABLE trades ADD COLUMN profile TEXT",
+    "ALTER TABLE trades ADD COLUMN notional REAL",
+    "ALTER TABLE trades ADD COLUMN risk_amount REAL",
+    "ALTER TABLE trades ADD COLUMN opened_at INTEGER",
+];
+
+/// Signal metadata + timestamp read back from the journal for stats attribution.
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub coin: String,
+    pub confidence: Option<u8>,
+    pub timeframe: Option<String>,
+    pub opened_at: i64,
+}
 
 impl Journal {
     fn from_connection(connection: Connection) -> anyhow::Result<Self> {
         connection.execute(SCHEMA, [])?;
+        // Run migrations idempotently — ignore "duplicate column" errors on
+        // pre-existing databases.
+        for migration in MIGRATIONS {
+            let _ = connection.execute(migration, []);
+        }
         Ok(Self { connection: Mutex::new(connection) })
     }
 
@@ -34,11 +71,29 @@ impl Journal {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    pub fn record(&self, plan: &ExecutionPlan, entry_order_id: Option<u64>) -> anyhow::Result<()> {
+    /// Records an executed trade with its signal metadata and entry timestamp.
+    ///
+    /// - `confidence`: signal confidence score (0–10), stored as `Option<i64>`.
+    /// - `timeframe`: signal timeframe string (e.g. "swing", "scalp").
+    /// - `risk_reward`: signal risk:reward ratio.
+    /// - `profile`: risk profile label (e.g. "Moderate").
+    /// - `opened_at`: UNIX seconds when the trade was submitted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        plan: &ExecutionPlan,
+        entry_order_id: Option<u64>,
+        confidence: Option<u8>,
+        timeframe: Option<&str>,
+        risk_reward: Option<f64>,
+        profile: &str,
+        opened_at: i64,
+    ) -> anyhow::Result<()> {
         let connection = self.connection.lock().unwrap();
         connection.execute(
-            "INSERT INTO trades (coin, direction, size, entry, leverage, stop_loss, entry_order_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO trades (coin, direction, size, entry, leverage, stop_loss, entry_order_id,
+                                 confidence, timeframe, risk_reward, profile, notional, risk_amount, opened_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 plan.coin,
                 format!("{:?}", plan.direction),
@@ -47,9 +102,33 @@ impl Journal {
                 plan.leverage,
                 plan.stop_loss.price,
                 entry_order_id.map(|id| id as i64),
+                confidence.map(|c| c as i64),
+                timeframe,
+                risk_reward,
+                profile,
+                plan.notional,
+                plan.risk_amount,
+                opened_at,
             ],
         )?;
         Ok(())
+    }
+
+    /// Returns all journaled trade records ordered by entry time, for stats attribution.
+    pub fn all_trades(&self) -> anyhow::Result<Vec<TradeRecord>> {
+        let connection = self.connection.lock().unwrap();
+        let mut stmt = connection.prepare(
+            "SELECT coin, confidence, timeframe, opened_at FROM trades ORDER BY opened_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(TradeRecord {
+                coin: row.get(0)?,
+                confidence: row.get::<_, Option<i64>>(1)?.map(|v| v as u8),
+                timeframe: row.get(2)?,
+                opened_at: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     #[cfg(test)]
@@ -82,7 +161,7 @@ mod tests {
             take_profits: vec![],
             warnings: vec![],
         };
-        journal.record(&plan, Some(42)).unwrap();
+        journal.record(&plan, Some(42), Some(8), Some("swing"), Some(2.8), "Moderate", 1_700_000_000).unwrap();
         assert_eq!(journal.count().unwrap(), 1);
     }
 }
