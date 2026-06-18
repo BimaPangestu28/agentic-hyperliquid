@@ -8,6 +8,8 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
+const WELCOME_TEXT: &str = "\u{1F44B} Agent Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help";
+
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
 pub const CB_AGGRESSIVE: &str = "profile:aggressive";
@@ -223,6 +225,28 @@ struct BotContext<E: Exchange + 'static> {
     http: reqwest::Client,
 }
 
+/// Returns a reply for a slash-command message, or None if the text is not a
+/// command (and should be parsed as a trading-setup card).
+fn command_response(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    // Take the command word without args, strip a possible @botname suffix, lowercase.
+    let command = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match command.as_str() {
+        "/start" | "/help" => Some(WELCOME_TEXT.to_string()),
+        _ => Some("Unknown command. Send /help, or paste a trading-setup card.".to_string()),
+    }
+}
+
 fn profile_from_callback(data: &str) -> Option<RiskProfile> {
     match data {
         CB_CONSERVATIVE => Some(RiskProfile::Conservative),
@@ -249,6 +273,11 @@ async fn on_message<E: Exchange + 'static>(
         Some(text) => text,
         None => return Ok(()),
     };
+
+    if let Some(reply) = command_response(text) {
+        bot.send_message(message.chat.id, reply).await?;
+        return Ok(());
+    }
 
     let parse_result = match &context.config.deepseek_api_key {
         Some(api_key) => {
@@ -503,6 +532,23 @@ mod tests {
         // prices contain '.', notional/TP lines contain '(' — both must be backslash-escaped for MarkdownV2
         assert!(text.contains("\\."), "decimal points must be escaped");
         assert!(text.contains("\\("), "parentheses must be escaped");
+    }
+
+    #[test]
+    fn start_and_help_return_welcome() {
+        assert!(super::command_response("/start").unwrap().contains("Agent Hyperliquid"));
+        assert!(super::command_response("/help").unwrap().contains("Example card"));
+        assert!(super::command_response("/start@MyBot").unwrap().contains("Agent Hyperliquid"));
+    }
+
+    #[test]
+    fn unknown_command_is_handled() {
+        assert!(super::command_response("/foo").unwrap().to_lowercase().contains("unknown command"));
+    }
+
+    #[test]
+    fn non_command_text_is_not_intercepted() {
+        assert!(super::command_response("Trading setup for PENDLE").is_none());
     }
 
     use crate::hyperliquid::mock::MockExchange;
