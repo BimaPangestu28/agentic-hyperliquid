@@ -2,6 +2,7 @@
 //! elsewhere; nothing here mutates exchange or journal state.
 
 pub mod auth;
+pub mod trades;
 
 use crate::hyperliquid::Exchange;
 use axum::{

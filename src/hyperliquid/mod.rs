@@ -44,6 +44,21 @@ pub struct Fill {
     pub fee: f64,
 }
 
+/// A richer fill row for the API: enough to reconstruct round-trip trades.
+/// Distinct from `Fill` so existing stats code is unaffected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FillDetail {
+    pub coin: String,
+    pub oid: u64,
+    pub dir: String, // SDK `dir`, e.g. "Open Long" / "Close Long"
+    pub px: f64,
+    pub sz: f64,
+    pub closed_pnl: f64,
+    pub fee: f64,
+    pub time_ms: i64,
+    pub start_position: f64,
+}
+
 // ── OpenPosition (live perp position snapshot) ────────────────────────────────
 
 /// A single open perp position, derived from `user_state.asset_positions`.
@@ -73,6 +88,8 @@ pub trait Exchange: Send + Sync {
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
     /// Returns all fills for the account from the exchange's fill history.
     async fn user_fills(&self) -> anyhow::Result<Vec<Fill>>;
+    /// All fills with price/size/order-id detail, oldest first.
+    async fn fills_detailed(&self) -> anyhow::Result<Vec<FillDetail>>;
     /// Open perp positions with mark price and unrealized PnL.
     async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
     /// Returns the number of resting/open orders for `coin` (case-insensitive).
@@ -126,6 +143,8 @@ pub mod mock {
         pub open_orders: Mutex<Vec<String>>,
         /// Pre-loaded open positions returned by `positions()`.
         pub positions: Mutex<Vec<super::OpenPosition>>,
+        /// Pre-loaded detailed fills returned by `fills_detailed()`.
+        pub fills_detailed: Mutex<Vec<super::FillDetail>>,
     }
 
     impl MockExchange {
@@ -145,6 +164,11 @@ pub mod mock {
         /// Seeds the open positions returned by `positions()`.
         pub fn set_positions(&self, open_positions: Vec<super::OpenPosition>) {
             *self.positions.lock().unwrap() = open_positions;
+        }
+
+        /// Seeds the detailed fills returned by `fills_detailed()`.
+        pub fn set_fills_detailed(&self, detailed_fills: Vec<super::FillDetail>) {
+            *self.fills_detailed.lock().unwrap() = detailed_fills;
         }
     }
 
@@ -209,6 +233,10 @@ pub mod mock {
 
         async fn user_fills(&self) -> anyhow::Result<Vec<super::Fill>> {
             Ok(self.fills.lock().unwrap().clone())
+        }
+
+        async fn fills_detailed(&self) -> anyhow::Result<Vec<super::FillDetail>> {
+            Ok(self.fills_detailed.lock().unwrap().clone())
         }
 
         async fn positions(&self) -> anyhow::Result<Vec<super::OpenPosition>> {
@@ -644,6 +672,42 @@ impl Exchange for HyperliquidExchange {
             })
             .collect();
         Ok(fills)
+    }
+
+    /// Returns all fills with price/size/order-id detail, oldest first.
+    ///
+    /// Mirrors `user_fills` but maps into `FillDetail`, which includes `px`, `sz`,
+    /// `oid`, `start_position`, and `dir` for round-trip trade reconstruction.
+    ///
+    /// # SDK field verification (UserFillsResponse, response_structs.rs)
+    /// - `r.coin: String`
+    /// - `r.oid: u64`
+    /// - `r.dir: String`
+    /// - `r.px: String` — price as string; parsed to f64
+    /// - `r.sz: String` — size as string; parsed to f64
+    /// - `r.closed_pnl: String` — parsed to f64
+    /// - `r.fee: String` — parsed to f64
+    /// - `r.time: u64` — millisecond timestamp; cast to i64
+    /// - `r.start_position: String` — parsed to f64
+    async fn fills_detailed(&self) -> anyhow::Result<Vec<FillDetail>> {
+        let raw_fills = self.info.user_fills(self.address).await?;
+        let mut detailed_fills: Vec<FillDetail> = raw_fills
+            .into_iter()
+            .map(|r| FillDetail {
+                coin: r.coin,
+                oid: r.oid,
+                dir: r.dir,
+                px: r.px.parse::<f64>().unwrap_or(0.0),
+                sz: r.sz.parse::<f64>().unwrap_or(0.0),
+                closed_pnl: r.closed_pnl.parse::<f64>().unwrap_or(0.0),
+                fee: r.fee.parse::<f64>().unwrap_or(0.0),
+                time_ms: r.time as i64,
+                start_position: r.start_position.parse::<f64>().unwrap_or(0.0),
+            })
+            .collect();
+        // Sort oldest first so callers receive a chronological stream.
+        detailed_fills.sort_by_key(|fill| fill.time_ms);
+        Ok(detailed_fills)
     }
 
     /// Returns all open perp positions with mark price and unrealized PnL.
