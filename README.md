@@ -1,8 +1,7 @@
-# Signal Trader
+# Agentic Hyperliquid
 
 Telegram bot that turns a pasted trading-setup card (or screenshot) into a
-long/short position with native SL/TP brackets. Currently executes on the
-Hyperliquid perpetuals DEX; built venue-agnostic for adding more venues.
+long/short position with native SL/TP brackets on the Hyperliquid perpetuals DEX.
 
 ## Prerequisites
 - Rust (stable, edition 2021)
