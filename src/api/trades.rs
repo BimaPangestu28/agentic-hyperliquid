@@ -19,87 +19,183 @@ pub struct ClosedTrade {
     pub entry_oid: Option<u64>,
 }
 
-/// Group a chronological fill stream into completed round-trip trades, one per
-/// coin position life-cycle. A trade opens on the first fill that moves the
-/// position away from flat and closes on the fill that returns it to flat
-/// (identified by a non-zero `closed_pnl`). Still-open positions emit nothing.
+/// Flat-position tolerance: a signed position whose magnitude is below this is
+/// treated as flat.
+const EPS: f64 = 1e-9;
+
+/// Signed size delta a fill applies to the running position, derived from the
+/// Hyperliquid `dir` string.
 ///
-/// # Known limitations — one-shot, full-size round trips only
+/// A fill is a BUY (increases the signed position) when it is "Open Long" or
+/// "Close Short"; it is a SELL (decreases the signed position) when it is
+/// "Open Short" or "Close Long".
 ///
-/// This implementation assumes each position is opened in a single fill and
-/// closed in a single fill. The following scenarios are **NOT** faithfully
-/// reconstructed:
+/// # Arguments
+/// * `dir` - the SDK `dir` string, e.g. `"Open Long"` / `"Close Short"`
+/// * `sz`  - absolute fill size (always > 0)
 ///
-/// 1. **Scale-ins** — when a position is built across multiple opening fills,
-///    `entry_px` is the price of the *first* opening fill, not the
-///    size-weighted average. Subsequent opening fills only accumulate `size`
-///    and `fee`; their prices are discarded.
+/// # Returns
+/// `+sz` for buys, `-sz` for sells.
+fn fill_signed_delta(dir: &str, sz: f64) -> f64 {
+    let is_buy = (dir.contains("Open") && dir.contains("Long"))
+        || (dir.contains("Close") && dir.contains("Short"));
+    if is_buy {
+        sz
+    } else {
+        -sz
+    }
+}
+
+/// In-progress accumulator for a single position leg (one flat → … → flat
+/// life-cycle). Entry/exit prices are accumulated as notional sums so they can
+/// be turned into size-weighted averages when the leg is emitted.
+struct Leg {
+    direction: String, // "long" | "short" (sign of the position while open)
+    open_size: f64,    // total absolute size opened in this leg
+    entry_notional: f64, // Σ(open_fill.px * open_fill.sz)
+    close_size: f64,   // total absolute size closed in this leg
+    exit_notional: f64, // Σ(close_fill.px * close_fill.sz)
+    realized_pnl: f64, // Σ(closed_pnl) over closing fills in this leg
+    fee: f64,          // Σ(fee) over all fills attributed to this leg
+    opened_at_ms: i64, // time of first opening fill
+    closed_at_ms: i64, // time of last closing fill
+    entry_oid: u64,    // oid of first opening fill
+}
+
+impl Leg {
+    /// Finalize the leg into a `ClosedTrade` with size-weighted entry/exit.
+    fn into_closed_trade(self, coin: &str) -> ClosedTrade {
+        ClosedTrade {
+            external_id: format!("{}:{}:{}", coin, self.entry_oid, self.closed_at_ms),
+            coin: coin.to_string(),
+            direction: self.direction,
+            size: self.open_size,
+            entry_px: self.entry_notional / self.open_size,
+            exit_px: self.exit_notional / self.close_size,
+            realized_pnl: self.realized_pnl,
+            fee: self.fee,
+            opened_at_ms: self.opened_at_ms,
+            closed_at_ms: self.closed_at_ms,
+            entry_oid: Some(self.entry_oid),
+        }
+    }
+}
+
+/// Group a chronological fill stream into completed round-trip trades by
+/// replaying a running signed position per coin.
 ///
-/// 2. **Partial closes** — the first closing fill emits a `ClosedTrade` using
-///    the full accumulated open size, and the open leg is removed from state.
-///    Any further fills that close the remainder of the position are treated
-///    as orphaned close fills (no matching open entry) and are silently
-///    dropped, producing an incomplete trade record.
+/// One `ClosedTrade` is emitted per position life-cycle: each time a coin's
+/// signed position leaves flat (0) and later returns to flat. While a leg is
+/// open, fills are classified against the running position:
 ///
-/// 3. **Single-fill position flips** — a fill whose `closed_pnl` is non-zero
-///    but that also opens a new position in the opposite direction (i.e. the
-///    fill crosses through flat) is treated as a *close only*. The new
-///    opposite leg is not recorded; it will be missed entirely unless a
-///    subsequent opening fill arrives for that coin.
+/// * **Open / scale-in** — moves further from flat. Opening fills accumulate
+///   size, notional and fee; `entry_px` is the size-weighted average.
+/// * **Reduce / close** — moves toward flat without crossing. Closing fills
+///   accumulate exit notional, realized PnL and fee; `exit_px` is the
+///   size-weighted average. A partial close keeps the leg open and emits
+///   nothing; the trade is emitted only when the position reaches flat.
+/// * **Flip (zero-crossing)** — a single fill that crosses through flat is
+///   split: the `|pos_before|` portion closes the current leg (which is emitted,
+///   with the fill's whole `closed_pnl` and `fee` attributed to it), and the
+///   `|new_pos|` portion opens a fresh leg in the opposite direction.
 ///
-/// # Future extension point
+/// A still-open leg at the end of the stream emits nothing (an open position is
+/// not a completed trade).
 ///
-/// `FillDetail.start_position` is plumbed through from the Hyperliquid API
-/// and is the intended hook for a future position-aware version that can
-/// correctly weight entry prices across scale-ins and handle partial closes
-/// by tracking the residual position size between fills.
+/// # Assumptions & limits
+/// * Side is inferred from the four standard Hyperliquid `dir` strings via
+///   [`fill_signed_delta`] ("Open Long" / "Open Short" / "Close Long" /
+///   "Close Short").
+/// * A closing fill with no matching open leg (the opening fills fell outside
+///   a windowed history query) is dropped — it cannot form a complete trade.
+/// * Flatness is detected within `EPS = 1e-9`.
 pub fn assemble_trades(fills: &[FillDetail]) -> Vec<ClosedTrade> {
     use std::collections::HashMap;
 
-    struct Open {
-        entry_oid: u64,
-        direction: String,
-        size: f64,
-        entry_px: f64,
-        opened_at_ms: i64,
-        fee: f64,
-    }
-
-    let mut open: HashMap<String, Open> = HashMap::new();
-    let mut out = Vec::new();
     let mut ordered = fills.to_vec();
     ordered.sort_by_key(|f| f.time_ms);
 
-    for f in &ordered {
-        let is_close = f.closed_pnl != 0.0 || f.dir.contains("Close");
-        if !is_close {
-            // Opening (or adding to) a position: record/extend the open leg.
-            let entry = open.entry(f.coin.clone()).or_insert(Open {
-                entry_oid: f.oid,
-                direction: if f.dir.contains("Long") { "long".into() } else { "short".into() },
-                size: 0.0,
-                entry_px: f.px,
-                opened_at_ms: f.time_ms,
+    let mut positions: HashMap<String, f64> = HashMap::new();
+    let mut legs: HashMap<String, Leg> = HashMap::new();
+    let mut out = Vec::new();
+
+    for fill in &ordered {
+        let pos_before = *positions.get(&fill.coin).unwrap_or(&0.0);
+        let delta = fill_signed_delta(&fill.dir, fill.sz);
+        let new_pos = pos_before + delta;
+
+        let before_flat = pos_before.abs() < EPS;
+        let moving_away = !before_flat && (delta > 0.0) == (pos_before > 0.0);
+
+        if before_flat || moving_away {
+            // Opening / scale-in.
+            let leg = legs.entry(fill.coin.clone()).or_insert_with(|| Leg {
+                direction: if delta > 0.0 { "long".into() } else { "short".into() },
+                open_size: 0.0,
+                entry_notional: 0.0,
+                close_size: 0.0,
+                exit_notional: 0.0,
+                realized_pnl: 0.0,
                 fee: 0.0,
+                opened_at_ms: fill.time_ms,
+                entry_oid: fill.oid,
+                closed_at_ms: fill.time_ms,
             });
-            entry.size += f.sz;
-            entry.fee += f.fee;
-        } else if let Some(o) = open.remove(&f.coin) {
-            out.push(ClosedTrade {
-                external_id: format!("{}:{}:{}", f.coin, o.entry_oid, f.time_ms),
-                coin: f.coin.clone(),
-                direction: o.direction,
-                size: o.size,
-                entry_px: o.entry_px,
-                exit_px: f.px,
-                realized_pnl: f.closed_pnl,
-                fee: o.fee + f.fee,
-                opened_at_ms: o.opened_at_ms,
-                closed_at_ms: f.time_ms,
-                entry_oid: Some(o.entry_oid),
-            });
+            leg.open_size += fill.sz;
+            leg.entry_notional += fill.px * fill.sz;
+            leg.fee += fill.fee;
+        } else if fill.sz <= pos_before.abs() + EPS {
+            // Reduction / close without zero-crossing.
+            if let Some(mut leg) = legs.remove(&fill.coin) {
+                leg.close_size += fill.sz;
+                leg.exit_notional += fill.px * fill.sz;
+                leg.realized_pnl += fill.closed_pnl;
+                leg.fee += fill.fee;
+                leg.closed_at_ms = fill.time_ms;
+
+                if new_pos.abs() < EPS {
+                    out.push(leg.into_closed_trade(&fill.coin));
+                } else {
+                    // Partial close — keep the leg open.
+                    legs.insert(fill.coin.clone(), leg);
+                }
+            }
+            // else: orphan close (no open leg) → drop.
+        } else {
+            // Flip (zero-crossing): close the existing leg, open the opposite.
+            let closing_portion = pos_before.abs();
+            let opening_portion = new_pos.abs();
+
+            if let Some(mut leg) = legs.remove(&fill.coin) {
+                leg.close_size += closing_portion;
+                leg.exit_notional += fill.px * closing_portion;
+                leg.realized_pnl += fill.closed_pnl;
+                leg.fee += fill.fee;
+                leg.closed_at_ms = fill.time_ms;
+                out.push(leg.into_closed_trade(&fill.coin));
+
+                legs.insert(
+                    fill.coin.clone(),
+                    Leg {
+                        direction: if new_pos > 0.0 { "long".into() } else { "short".into() },
+                        open_size: opening_portion,
+                        entry_notional: fill.px * opening_portion,
+                        close_size: 0.0,
+                        exit_notional: 0.0,
+                        realized_pnl: 0.0,
+                        fee: 0.0,
+                        opened_at_ms: fill.time_ms,
+                        entry_oid: fill.oid,
+                        closed_at_ms: fill.time_ms,
+                    },
+                );
+            }
+            // else: orphan oversized close (no open leg) → drop entirely.
         }
+
+        positions.insert(fill.coin.clone(), new_pos);
     }
+
     out
 }
 
@@ -139,6 +235,103 @@ mod tests {
     #[test]
     fn open_position_without_close_is_not_a_trade() {
         let fills = vec![fill("BTC", 9, "Open Short", 50000.0, 0.1, 0.0, 0.5, 1000)];
+        assert!(assemble_trades(&fills).is_empty());
+    }
+
+    #[test]
+    fn fill_signed_delta_maps_the_four_dir_strings() {
+        assert_eq!(fill_signed_delta("Open Long", 2.0), 2.0);
+        assert_eq!(fill_signed_delta("Close Short", 2.0), 2.0);
+        assert_eq!(fill_signed_delta("Open Short", 2.0), -2.0);
+        assert_eq!(fill_signed_delta("Close Long", 2.0), -2.0);
+    }
+
+    #[test]
+    fn scale_in_uses_size_weighted_entry() {
+        let fills = vec![
+            fill("ETH", 1, "Open Long", 2000.0, 1.0, 0.0, 1.0, 1000),
+            fill("ETH", 2, "Open Long", 2100.0, 1.0, 0.0, 1.0, 1500),
+            fill("ETH", 3, "Close Long", 2200.0, 2.0, 300.0, 2.0, 2000),
+        ];
+        let trades = assemble_trades(&fills);
+        assert_eq!(trades.len(), 1);
+        let t = &trades[0];
+        assert_eq!(t.direction, "long");
+        assert_eq!(t.size, 2.0);
+        assert!((t.entry_px - 2050.0).abs() < 1e-9);
+        assert!((t.exit_px - 2200.0).abs() < 1e-9);
+        assert_eq!(t.realized_pnl, 300.0);
+        assert_eq!(t.fee, 4.0);
+        assert_eq!(t.opened_at_ms, 1000);
+        assert_eq!(t.closed_at_ms, 2000);
+        assert_eq!(t.entry_oid, Some(1));
+    }
+
+    #[test]
+    fn partial_close_emits_one_trade_on_full_exit() {
+        let open = fill("ETH", 1, "Open Long", 2000.0, 2.0, 0.0, 0.0, 1000);
+        let close1 = fill("ETH", 2, "Close Long", 2100.0, 1.0, 50.0, 0.0, 2000);
+        let close2 = fill("ETH", 3, "Close Long", 2200.0, 1.0, 100.0, 0.0, 3000);
+
+        // After only the open + first partial close: no completed trade yet.
+        let partial = assemble_trades(&[open.clone(), close1.clone()]);
+        assert!(partial.is_empty());
+
+        let trades = assemble_trades(&[open, close1, close2]);
+        assert_eq!(trades.len(), 1);
+        let t = &trades[0];
+        assert_eq!(t.size, 2.0);
+        assert!((t.entry_px - 2000.0).abs() < 1e-9);
+        assert!((t.exit_px - 2150.0).abs() < 1e-9); // size-weighted (2100+2200)/2
+        assert_eq!(t.realized_pnl, 150.0);
+        assert_eq!(t.closed_at_ms, 3000);
+    }
+
+    #[test]
+    fn short_round_trip() {
+        let fills = vec![
+            fill("ETH", 1, "Open Short", 2000.0, 1.0, 0.0, 0.0, 1000),
+            fill("ETH", 2, "Close Short", 1900.0, 1.0, 100.0, 0.0, 2000),
+        ];
+        let trades = assemble_trades(&fills);
+        assert_eq!(trades.len(), 1);
+        let t = &trades[0];
+        assert_eq!(t.direction, "short");
+        assert!((t.entry_px - 2000.0).abs() < 1e-9);
+        assert!((t.exit_px - 1900.0).abs() < 1e-9);
+        assert_eq!(t.realized_pnl, 100.0);
+    }
+
+    #[test]
+    fn single_fill_flip_closes_then_opens() {
+        let mut flip = fill("ETH", 2, "Close Long", 1900.0, 3.0, -100.0, 0.0, 2000);
+        flip.start_position = 1.0;
+        let fills = vec![
+            fill("ETH", 1, "Open Long", 2000.0, 1.0, 0.0, 0.0, 1000),
+            flip,
+            fill("ETH", 3, "Close Short", 1850.0, 2.0, 100.0, 0.0, 3000),
+        ];
+        let trades = assemble_trades(&fills);
+        assert_eq!(trades.len(), 2);
+
+        let first = &trades[0];
+        assert_eq!(first.direction, "long");
+        assert!((first.size - 1.0).abs() < 1e-9);
+        assert!((first.entry_px - 2000.0).abs() < 1e-9);
+        assert!((first.exit_px - 1900.0).abs() < 1e-9);
+        assert_eq!(first.realized_pnl, -100.0);
+
+        let second = &trades[1];
+        assert_eq!(second.direction, "short");
+        assert!((second.size - 2.0).abs() < 1e-9);
+        assert!((second.entry_px - 1900.0).abs() < 1e-9);
+        assert!((second.exit_px - 1850.0).abs() < 1e-9);
+        assert_eq!(second.realized_pnl, 100.0);
+    }
+
+    #[test]
+    fn orphan_close_is_dropped() {
+        let fills = vec![fill("ETH", 1, "Close Long", 2100.0, 1.0, 50.0, 0.0, 1000)];
         assert!(assemble_trades(&fills).is_empty());
     }
 }
