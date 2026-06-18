@@ -59,6 +59,17 @@ pub struct FillDetail {
     pub start_position: f64,
 }
 
+// ── LedgerFlow (USDC deposit/withdrawal record) ───────────────────────────────
+
+/// A USDC deposit/withdrawal from the non-funding ledger.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LedgerFlow {
+    pub external_id: String, // "<hash>:<kind>"
+    pub kind: String,        // "deposit" | "withdrawal"
+    pub usdc: f64,
+    pub time_ms: i64,
+}
+
 // ── OpenPosition (live perp position snapshot) ────────────────────────────────
 
 /// A single open perp position, derived from `user_state.asset_positions`.
@@ -92,6 +103,8 @@ pub trait Exchange: Send + Sync {
     async fn fills_detailed(&self) -> anyhow::Result<Vec<FillDetail>>;
     /// Open perp positions with mark price and unrealized PnL.
     async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
+    /// USDC deposits/withdrawals from the non-funding ledger, oldest first.
+    async fn usdc_flows(&self) -> anyhow::Result<Vec<LedgerFlow>>;
     /// Returns the number of resting/open orders for `coin` (case-insensitive).
     ///
     /// Used by `process_signal` to skip a new signal when a prior limit entry
@@ -145,6 +158,8 @@ pub mod mock {
         pub positions: Mutex<Vec<super::OpenPosition>>,
         /// Pre-loaded detailed fills returned by `fills_detailed()`.
         pub fills_detailed: Mutex<Vec<super::FillDetail>>,
+        /// Pre-loaded USDC ledger flows returned by `usdc_flows()`.
+        pub flows: Mutex<Vec<super::LedgerFlow>>,
     }
 
     impl MockExchange {
@@ -169,6 +184,11 @@ pub mod mock {
         /// Seeds the detailed fills returned by `fills_detailed()`.
         pub fn set_fills_detailed(&self, detailed_fills: Vec<super::FillDetail>) {
             *self.fills_detailed.lock().unwrap() = detailed_fills;
+        }
+
+        /// Seeds the USDC ledger flows returned by `usdc_flows()`.
+        pub fn set_flows(&self, ledger_flows: Vec<super::LedgerFlow>) {
+            *self.flows.lock().unwrap() = ledger_flows;
         }
     }
 
@@ -241,6 +261,10 @@ pub mod mock {
 
         async fn positions(&self) -> anyhow::Result<Vec<super::OpenPosition>> {
             Ok(self.positions.lock().unwrap().clone())
+        }
+
+        async fn usdc_flows(&self) -> anyhow::Result<Vec<super::LedgerFlow>> {
+            Ok(self.flows.lock().unwrap().clone())
         }
 
         async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
@@ -768,5 +792,76 @@ impl Exchange for HyperliquidExchange {
             .iter()
             .filter(|order| order.coin.eq_ignore_ascii_case(coin))
             .count())
+    }
+
+    /// Returns USDC deposits/withdrawals from the non-funding ledger, oldest first.
+    ///
+    /// Posts `{"type":"userNonFundingLedgerUpdates","user":<address>}` to the
+    /// Hyperliquid info endpoint and maps rows whose `delta.type` is `"deposit"` or
+    /// `"withdraw"` into `LedgerFlow` values.
+    ///
+    /// # Base URL + address source
+    /// - Base URL: `self.info.http_client.base_url` — set during `InfoClient::new`
+    ///   from the same `BaseUrl` variant used for all other info calls.
+    /// - Address: `self.address` — the master account address resolved in `connect()`.
+    /// - HTTP client: `self.info.http_client.client` — the same `reqwest::Client`
+    ///   already used by the SDK for all info POSTs.
+    ///
+    /// # SDK field mapping
+    /// Raw ledger row fields (from Hyperliquid API):
+    /// - `hash: String` — transaction hash used as part of `external_id`
+    /// - `time: u64` — epoch milliseconds
+    /// - `delta.type: String` — `"deposit"` or `"withdraw"`; rows with other types are skipped
+    /// - `delta.usdc: String` — USDC amount as string; parsed to f64
+    async fn usdc_flows(&self) -> anyhow::Result<Vec<LedgerFlow>> {
+        // Build the raw POST body — the SDK InfoRequest enum does not cover this endpoint.
+        let address_hex = format!("{:#x}", self.address);
+        let body = serde_json::json!({
+            "type": "userNonFundingLedgerUpdates",
+            "user": address_hex,
+        })
+        .to_string();
+
+        let base_url = &self.info.http_client.base_url;
+        let response_text = self
+            .info
+            .http_client
+            .client
+            .post(format!("{base_url}/info"))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("usdc_flows request failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("usdc_flows response read failed: {e}"))?;
+
+        // Parse the response as a JSON array of ledger rows.
+        let raw_rows: Vec<serde_json::Value> = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow::anyhow!("usdc_flows JSON parse failed: {e}"))?;
+
+        let mut ledger_flows: Vec<LedgerFlow> = raw_rows
+            .into_iter()
+            .filter_map(|row| {
+                let hash = row.get("hash")?.as_str()?.to_string();
+                let time_ms = row.get("time")?.as_u64()? as i64;
+                let delta = row.get("delta")?;
+                let delta_type = delta.get("type")?.as_str()?;
+                let kind = match delta_type {
+                    "deposit" => "deposit",
+                    "withdraw" => "withdrawal",
+                    _ => return None,
+                };
+                let usdc_str = delta.get("usdc")?.as_str().unwrap_or("0");
+                let usdc = usdc_str.parse::<f64>().unwrap_or(0.0);
+                let external_id = format!("{hash}:{kind}");
+                Some(LedgerFlow { external_id, kind: kind.to_string(), usdc, time_ms })
+            })
+            .collect();
+
+        // Sort oldest first for consistent ordering.
+        ledger_flows.sort_by_key(|flow| flow.time_ms);
+        Ok(ledger_flows)
     }
 }

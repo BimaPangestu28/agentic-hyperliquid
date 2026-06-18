@@ -48,6 +48,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/balance", get(balance))
         .route("/positions", get(positions))
         .route("/trades", get(trades))
+        .route("/flows", get(flows))
         .layer(middleware::from_fn_with_state(state.clone(), require_bearer))
         .with_state(state)
 }
@@ -150,6 +151,29 @@ async fn trades(
         })
         .collect();
     Ok(Json(response_rows))
+}
+
+/// Query parameters for the `/flows` endpoint.
+#[derive(Deserialize)]
+struct FlowsQuery {
+    /// Filter to flows at or after this epoch-millisecond timestamp.
+    /// Omit to return all flows.
+    since: Option<i64>,
+}
+
+async fn flows(
+    State(state): State<ApiState>,
+    Query(query): Query<FlowsQuery>,
+) -> Result<Json<Vec<crate::hyperliquid::LedgerFlow>>, StatusCode> {
+    let mut ledger_flows = state
+        .exchange
+        .usdc_flows()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if let Some(since) = query.since {
+        ledger_flows.retain(|flow| flow.time_ms >= since);
+    }
+    Ok(Json(ledger_flows))
 }
 
 /// Returns the current time as milliseconds since the Unix epoch.
@@ -385,6 +409,100 @@ mod tests {
         // Only the valid ETH trade must appear; BTC is dropped.
         assert_eq!(trades_array.len(), 1);
         assert_eq!(trades_array[0]["coin"].as_str().unwrap(), "ETH");
+    }
+
+    fn state_with_flows(ledger_flows: Vec<crate::hyperliquid::LedgerFlow>) -> ApiState {
+        let mock = MockExchange::new_for_test();
+        mock.set_flows(ledger_flows);
+        ApiState {
+            exchange: Arc::new(mock),
+            db_path: ":memory:".into(),
+            token: "t".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn flows_requires_auth() {
+        let app = router(state_with_flows(vec![]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flows")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn flows_returns_seeded_deposit_and_withdrawal() {
+        let deposit = crate::hyperliquid::LedgerFlow {
+            external_id: "0xabc:deposit".into(),
+            kind: "deposit".into(),
+            usdc: 500.0,
+            time_ms: 1000,
+        };
+        let withdrawal = crate::hyperliquid::LedgerFlow {
+            external_id: "0xdef:withdrawal".into(),
+            kind: "withdrawal".into(),
+            usdc: 200.0,
+            time_ms: 2000,
+        };
+        let app = router(state_with_flows(vec![deposit, withdrawal]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flows")
+                    .header("authorization", "Bearer t")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let flows_array = json.as_array().unwrap();
+        assert_eq!(flows_array.len(), 2);
+        assert_eq!(flows_array[0]["kind"].as_str().unwrap(), "deposit");
+        assert_eq!(flows_array[0]["usdc"].as_f64().unwrap(), 500.0);
+        assert_eq!(flows_array[1]["kind"].as_str().unwrap(), "withdrawal");
+        assert_eq!(flows_array[1]["usdc"].as_f64().unwrap(), 200.0);
+    }
+
+    #[tokio::test]
+    async fn flows_since_filters_by_time_ms() {
+        let old_flow = crate::hyperliquid::LedgerFlow {
+            external_id: "0xold:deposit".into(),
+            kind: "deposit".into(),
+            usdc: 100.0,
+            time_ms: 1000,
+        };
+        let new_flow = crate::hyperliquid::LedgerFlow {
+            external_id: "0xnew:deposit".into(),
+            kind: "deposit".into(),
+            usdc: 300.0,
+            time_ms: 5000,
+        };
+        let app = router(state_with_flows(vec![old_flow, new_flow]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flows?since=5000")
+                    .header("authorization", "Bearer t")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let flows_array = json.as_array().unwrap();
+        assert_eq!(flows_array.len(), 1);
+        assert_eq!(flows_array[0]["usdc"].as_f64().unwrap(), 300.0);
     }
 
     #[tokio::test]
