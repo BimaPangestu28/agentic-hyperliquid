@@ -130,6 +130,31 @@ pub mod mock {
         }
     }
 
+    #[test]
+    fn usdc_total_extracts_collateral() {
+        let balances = vec![
+            hyperliquid_rust_sdk::UserTokenBalance {
+                coin: "USDC".into(),
+                hold: "0.0".into(),
+                total: "399.0".into(),
+                entry_ntl: "0.0".into(),
+            },
+            hyperliquid_rust_sdk::UserTokenBalance {
+                coin: "HYPE".into(),
+                hold: "0.0".into(),
+                total: "1.0".into(),
+                entry_ntl: "0.0".into(),
+            },
+        ];
+        assert_eq!(super::usdc_total(&balances).unwrap(), 399.0);
+    }
+
+    #[test]
+    fn usdc_total_zero_when_absent() {
+        let balances: Vec<hyperliquid_rust_sdk::UserTokenBalance> = vec![];
+        assert_eq!(super::usdc_total(&balances).unwrap(), 0.0);
+    }
+
     #[tokio::test]
     async fn mock_records_entry_and_trigger_orders() {
         let exchange = MockExchange {
@@ -213,6 +238,27 @@ fn parse_order_response(status: ExchangeResponseStatus) -> anyhow::Result<OrderR
     }
 }
 
+/// Sums the USDC spot balance used as unified-account collateral.
+///
+/// In Hyperliquid's unified-account mode, USDC from the SPOT clearinghouse
+/// backs perp positions. The perp `accountValue` reads 0; the real collateral
+/// is the USDC `total` in `user_token_balances`.
+///
+/// Returns `Ok(0.0)` when no USDC entry exists (no collateral posted).
+///
+/// # Errors
+/// Returns an error if the USDC `total` field cannot be parsed as `f64`.
+fn usdc_total(balances: &[hyperliquid_rust_sdk::UserTokenBalance]) -> anyhow::Result<f64> {
+    let usdc = balances.iter().find(|b| b.coin.eq_ignore_ascii_case("USDC"));
+    match usdc {
+        Some(b) => b
+            .total
+            .parse::<f64>()
+            .map_err(|e| anyhow::anyhow!("cannot parse USDC total {:?}: {e}", b.total)),
+        None => Ok(0.0), // no USDC balance => no collateral
+    }
+}
+
 /// Live connection to Hyperliquid via the SDK.
 ///
 /// # Deviations from the brief's SDK sketch
@@ -241,6 +287,9 @@ pub struct HyperliquidExchange {
     info: InfoClient,
     exchange: ExchangeClient,
     address: H160,
+    /// When `true`, equity is read from the spot USDC balance (unified-account mode).
+    /// When `false`, equity is read from the perp `accountValue` (standard mode).
+    unified: bool,
 }
 
 impl HyperliquidExchange {
@@ -287,6 +336,7 @@ impl HyperliquidExchange {
             info,
             exchange,
             address: query_address,
+            unified: config.unified_account,
         })
     }
 }
@@ -294,14 +344,25 @@ impl HyperliquidExchange {
 #[async_trait]
 impl Exchange for HyperliquidExchange {
     /// Returns the account's total margin-inclusive equity (USDC).
+    ///
+    /// In **unified-account mode** (`HYPERLIQUID_UNIFIED_ACCOUNT=true`), the perp
+    /// clearinghouse `accountValue` is always 0 — collateral lives in the SPOT
+    /// clearinghouse. This branch reads the spot USDC `total` via
+    /// `user_token_balances` instead.
+    ///
+    /// In **standard mode** the perp `accountValue` is used (original behaviour).
     async fn equity(&self) -> anyhow::Result<f64> {
-        let state = self.info.user_state(self.address).await?;
-        let account_value = state
-            .margin_summary
-            .account_value
-            .parse::<f64>()
-            .map_err(|e| anyhow::anyhow!("cannot parse account_value: {e}"))?;
-        Ok(account_value)
+        if self.unified {
+            let balances = self.info.user_token_balances(self.address).await?;
+            usdc_total(&balances.balances)
+        } else {
+            let state = self.info.user_state(self.address).await?;
+            state
+                .margin_summary
+                .account_value
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("cannot parse account_value: {e}"))
+        }
     }
 
     /// Returns sizing metadata for `coin`.

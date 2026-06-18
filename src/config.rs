@@ -30,6 +30,10 @@ pub struct Config {
     /// Required when `agent_key` is an API/agent wallet; if unset the bot queries
     /// the agent wallet's own address and equity will read 0.
     pub account_address: Option<String>,
+    /// When true, the bot reads equity from the spot USDC balance instead of the
+    /// perp account value. Under unified-account mode the perp `accountValue` is 0;
+    /// all collateral lives in the SPOT clearinghouse.
+    pub unified_account: bool,
 }
 
 impl Config {
@@ -117,6 +121,9 @@ pub fn from_env() -> anyhow::Result<Config> {
         deepseek_base_url: std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
         deepseek_model: std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
         account_address: std::env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok().filter(|s| !s.is_empty()),
+        unified_account: std::env::var("HYPERLIQUID_UNIFIED_ACCOUNT")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
     })
 }
 
@@ -144,6 +151,7 @@ mod tests {
             deepseek_base_url: "https://api.deepseek.com".into(),
             deepseek_model: "deepseek-chat".into(),
             account_address: None,
+            unified_account: false,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));
