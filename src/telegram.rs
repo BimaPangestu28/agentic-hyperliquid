@@ -396,6 +396,30 @@ pub async fn process_signal<E: Exchange + 'static>(
             }
         };
 
+        // Skip if we already hold a position in this coin (avoid averaging/stacking).
+        match context.exchange.position_size(&setup.coin).await {
+            Ok(size) if size > 0.0 => {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "Already holding {} (size {}) — skipped to avoid stacking. Close it first to re-enter.",
+                        setup.coin, size
+                    ),
+                )
+                .await?;
+                continue;
+            }
+            Ok(_) => {} // flat — proceed
+            Err(error) => {
+                bot.send_message(
+                    chat_id,
+                    format!("Could not verify existing position for {} ({error}) — skipped.", setup.coin),
+                )
+                .await?;
+                continue;
+            }
+        }
+
         let profile = RiskProfile::Moderate;
         let plan = match build_plan(&SizingInput {
             setup: &setup,
