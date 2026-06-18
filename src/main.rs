@@ -1,3 +1,4 @@
+mod api;
 mod config;
 mod hyperliquid;
 mod journal;
