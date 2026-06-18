@@ -555,7 +555,9 @@ async fn download_photo_as_data_url(bot: &Bot, file_id: &str) -> anyhow::Result<
     let file = bot.get_file(file_id).await?;
     // Construct the download URL using the bot token — NEVER log this URL.
     let url = format!("https://api.telegram.org/file/bot{}/{}", bot.token(), file.path);
-    let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+    let response = reqwest::get(&url).await.map_err(|e| e.without_url())?;
+    let response = response.error_for_status().map_err(|e| e.without_url())?;
+    let bytes = response.bytes().await.map_err(|e| e.without_url())?;
     Ok(format!(
         "data:image/jpeg;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(&bytes)
