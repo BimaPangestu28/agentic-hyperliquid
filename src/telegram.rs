@@ -606,20 +606,6 @@ pub async fn run<E: Exchange + 'static>(
         http,
     });
 
-    // Resolve the ingest target chat: use explicit INGEST_CHAT_ID if set,
-    // otherwise fall back to the first allowlisted Telegram user id.
-    let ingest_chat = context
-        .config
-        .ingest_chat_id
-        .or_else(|| context.config.allowed_user_ids.first().copied());
-    crate::ingest::spawn(
-        bot.clone(),
-        context.clone(),
-        context.config.ingest_port,
-        context.config.ingest_token.clone(),
-        ingest_chat,
-    );
-
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message::<E>))
         .branch(Update::filter_callback_query().endpoint(on_callback::<E>));
