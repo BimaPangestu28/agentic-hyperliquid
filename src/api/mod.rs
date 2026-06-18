@@ -119,15 +119,17 @@ async fn trades(
         assembled.retain(|trade| trade.closed_at_ms >= since_ms);
     }
     // Drop financially nonsensical trades that arose from parse failures upstream.
-    // A non-positive entry_px or size indicates a 0.0 fallback from unwrap_or(0.0).
+    // A non-positive entry_px, exit_px, or size indicates a 0.0 fallback from
+    // unwrap_or(0.0) in the fill-detail mapping layer.
     assembled.retain(|trade| {
-        if trade.entry_px <= 0.0 || trade.size <= 0.0 {
+        if trade.entry_px <= 0.0 || trade.exit_px <= 0.0 || trade.size <= 0.0 {
             tracing::warn!(
                 coin = %trade.coin,
                 external_id = %trade.external_id,
                 entry_px = trade.entry_px,
+                exit_px = trade.exit_px,
                 size = trade.size,
-                "dropping degenerate trade with non-positive entry_px or size"
+                "dropping degenerate trade with non-positive entry_px, exit_px, or size"
             );
             return false;
         }
@@ -411,6 +413,43 @@ mod tests {
         assert_eq!(trades_array[0]["coin"].as_str().unwrap(), "ETH");
     }
 
+    #[tokio::test]
+    async fn trades_excludes_degenerate_trades_with_zero_exit_px() {
+        // A trade whose closing fill parses as px=0.0 must be dropped.
+        // The valid ETH trade must remain; the SOL trade with zero exit_px must be excluded.
+        let mock = MockExchange::new_for_test();
+        mock.set_fills_detailed(vec![
+            // Valid ETH long round-trip.
+            make_fill_detail("ETH", 1, "Open Long", 2000.0, 1.0, 0.0, 1.0, 1000),
+            make_fill_detail("ETH", 2, "Close Long", 2100.0, 1.0, 100.0, 1.0, 2000),
+            // Degenerate SOL trade: exit_px (close px) is 0.0 — simulates a parse failure.
+            make_fill_detail("SOL", 3, "Open Long", 150.0, 10.0, 0.0, 0.5, 3000),
+            make_fill_detail("SOL", 4, "Close Long", 0.0, 10.0, 50.0, 0.5, 4000),
+        ]);
+        let app = router(ApiState {
+            exchange: Arc::new(mock),
+            db_path: ":memory:".into(),
+            token: "t".into(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/trades")
+                    .header("authorization", "Bearer t")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let trades_array = json.as_array().unwrap();
+        // Only the valid ETH trade must appear; SOL with zero exit_px is dropped.
+        assert_eq!(trades_array.len(), 1);
+        assert_eq!(trades_array[0]["coin"].as_str().unwrap(), "ETH");
+    }
+
     fn state_with_flows(ledger_flows: Vec<crate::hyperliquid::LedgerFlow>) -> ApiState {
         let mock = MockExchange::new_for_test();
         mock.set_flows(ledger_flows);
@@ -470,6 +509,41 @@ mod tests {
         assert_eq!(flows_array[0]["usdc"].as_f64().unwrap(), 500.0);
         assert_eq!(flows_array[1]["kind"].as_str().unwrap(), "withdrawal");
         assert_eq!(flows_array[1]["usdc"].as_f64().unwrap(), 200.0);
+    }
+
+    /// Pins the signed-usdc convention at the handler level: a withdrawal seeded
+    /// with a negative usdc value must be returned as-is — the handler must not
+    /// negate or take abs() of the value.
+    #[tokio::test]
+    async fn flows_withdrawal_usdc_is_negative() {
+        let withdrawal = crate::hyperliquid::LedgerFlow {
+            external_id: "0xwithdraw:withdrawal".into(),
+            kind: "withdrawal".into(),
+            usdc: -200.5,
+            time_ms: 1000,
+        };
+        let app = router(state_with_flows(vec![withdrawal]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/flows")
+                    .header("authorization", "Bearer t")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let flows_array = json.as_array().unwrap();
+        assert_eq!(flows_array.len(), 1);
+        assert_eq!(flows_array[0]["kind"].as_str().unwrap(), "withdrawal");
+        assert_eq!(
+            flows_array[0]["usdc"].as_f64().unwrap(),
+            -200.5,
+            "withdrawal usdc must be negative — sign must not be stripped by the handler"
+        );
     }
 
     #[tokio::test]

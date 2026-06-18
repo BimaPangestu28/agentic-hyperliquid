@@ -66,6 +66,12 @@ pub struct FillDetail {
 pub struct LedgerFlow {
     pub external_id: String, // "<hash>:<kind>"
     pub kind: String,        // "deposit" | "withdrawal"
+    /// Signed USD amount as returned by Hyperliquid — NEGATIVE for withdrawals,
+    /// positive for deposits. Direction is also given by `kind`.
+    ///
+    /// The raw value from `delta.usdc` is preserved without taking the absolute
+    /// value so callers can distinguish a withdrawal from a deposit even if they
+    /// ignore `kind`. Do NOT negate this field when displaying net capital flow.
     pub usdc: f64,
     pub time_ms: i64,
 }
@@ -350,6 +356,32 @@ pub mod mock {
         };
         mock.set_positions(vec![p.clone()]);
         assert_eq!(mock.positions().await.unwrap(), vec![p]);
+    }
+
+    /// Pins the signed-usdc convention: withdrawals carry a NEGATIVE usdc value.
+    ///
+    /// Hyperliquid returns `delta.usdc` as a negative number for withdrawals.
+    /// `usdc_flows` must preserve the sign — it must NOT call abs() or negate.
+    /// This test ensures a withdrawal row seeded with usdc = -200.5 comes back
+    /// with `kind == "withdrawal"` and `usdc == -200.5` (sign preserved).
+    #[tokio::test]
+    async fn flows_withdrawal_preserves_negative_usdc() {
+        let mock = MockExchange::new_for_test();
+        let withdrawal_flow = super::LedgerFlow {
+            external_id: "0xwithdraw:withdrawal".into(),
+            kind: "withdrawal".into(),
+            usdc: -200.5,
+            time_ms: 9000,
+        };
+        mock.set_flows(vec![withdrawal_flow]);
+        let flows = mock.usdc_flows().await.unwrap();
+        assert_eq!(flows.len(), 1);
+        let flow = &flows[0];
+        assert_eq!(flow.kind, "withdrawal", "kind must be 'withdrawal'");
+        assert_eq!(
+            flow.usdc, -200.5,
+            "usdc must be negative for withdrawals — sign must not be stripped"
+        );
     }
 }
 

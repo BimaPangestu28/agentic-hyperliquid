@@ -23,6 +23,36 @@ pub struct ClosedTrade {
 /// coin position life-cycle. A trade opens on the first fill that moves the
 /// position away from flat and closes on the fill that returns it to flat
 /// (identified by a non-zero `closed_pnl`). Still-open positions emit nothing.
+///
+/// # Known limitations — one-shot, full-size round trips only
+///
+/// This implementation assumes each position is opened in a single fill and
+/// closed in a single fill. The following scenarios are **NOT** faithfully
+/// reconstructed:
+///
+/// 1. **Scale-ins** — when a position is built across multiple opening fills,
+///    `entry_px` is the price of the *first* opening fill, not the
+///    size-weighted average. Subsequent opening fills only accumulate `size`
+///    and `fee`; their prices are discarded.
+///
+/// 2. **Partial closes** — the first closing fill emits a `ClosedTrade` using
+///    the full accumulated open size, and the open leg is removed from state.
+///    Any further fills that close the remainder of the position are treated
+///    as orphaned close fills (no matching open entry) and are silently
+///    dropped, producing an incomplete trade record.
+///
+/// 3. **Single-fill position flips** — a fill whose `closed_pnl` is non-zero
+///    but that also opens a new position in the opposite direction (i.e. the
+///    fill crosses through flat) is treated as a *close only*. The new
+///    opposite leg is not recorded; it will be missed entirely unless a
+///    subsequent opening fill arrives for that coin.
+///
+/// # Future extension point
+///
+/// `FillDetail.start_position` is plumbed through from the Hyperliquid API
+/// and is the intended hook for a future position-aware version that can
+/// correctly weight entry prices across scale-ins and handle partial closes
+/// by tracking the residual position size between fills.
 pub fn assemble_trades(fills: &[FillDetail]) -> Vec<ClosedTrade> {
     use std::collections::HashMap;
 
