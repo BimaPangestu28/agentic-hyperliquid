@@ -34,11 +34,31 @@ pub struct Config {
     /// perp account value. Under unified-account mode the perp `accountValue` is 0;
     /// all collateral lives in the SPOT clearinghouse.
     pub unified_account: bool,
+    /// Local HTTP port for the `/ingest` endpoint. Leave `None` to disable.
+    pub ingest_port: Option<u16>,
+    /// Shared token for the `/ingest` endpoint (checked via `X-Ingest-Token` header).
+    /// When `None` the endpoint refuses to start even if a port is configured.
+    pub ingest_token: Option<String>,
+    /// Telegram chat id to receive confirmation cards from ingest signals.
+    /// Defaults to the first entry in `allowed_user_ids` when `None`.
+    pub ingest_chat_id: Option<i64>,
 }
 
 impl Config {
     pub fn is_allowed(&self, user_id: i64) -> bool {
         self.allowed_user_ids.contains(&user_id)
+    }
+}
+
+/// Returns `true` when the ingest request is authorized: a token is configured
+/// and the provided token matches it. Denies when either side is missing.
+///
+/// Simple string equality is sufficient here because the endpoint is
+/// localhost-only — constant-time comparison would be overkill.
+pub fn ingest_authorized(expected: Option<&str>, provided: Option<&str>) -> bool {
+    match (expected, provided) {
+        (Some(expected_token), Some(provided_token)) => expected_token == provided_token,
+        _ => false,
     }
 }
 
@@ -124,6 +144,9 @@ pub fn from_env() -> anyhow::Result<Config> {
         unified_account: std::env::var("HYPERLIQUID_UNIFIED_ACCOUNT")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false),
+        ingest_port: std::env::var("INGEST_PORT").ok().and_then(|v| v.parse().ok()),
+        ingest_token: std::env::var("INGEST_TOKEN").ok().filter(|s| !s.is_empty()),
+        ingest_chat_id: std::env::var("INGEST_CHAT_ID").ok().and_then(|v| v.parse().ok()),
     })
 }
 
@@ -152,6 +175,9 @@ mod tests {
             deepseek_model: "deepseek-chat".into(),
             account_address: None,
             unified_account: false,
+            ingest_port: None,
+            ingest_token: None,
+            ingest_chat_id: None,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));
@@ -169,5 +195,30 @@ mod tests {
     fn parse_env_or_uses_default_when_absent() {
         std::env::remove_var("AGENT_HL_TEST_ABSENT");
         assert_eq!(parse_env_or::<f64>("AGENT_HL_TEST_ABSENT", 1.0).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn ingest_authorized_grants_access_when_tokens_match() {
+        assert!(ingest_authorized(Some("secret"), Some("secret")));
+    }
+
+    #[test]
+    fn ingest_authorized_denies_on_token_mismatch() {
+        assert!(!ingest_authorized(Some("secret"), Some("wrong")));
+    }
+
+    #[test]
+    fn ingest_authorized_denies_when_no_token_provided() {
+        assert!(!ingest_authorized(Some("secret"), None));
+    }
+
+    #[test]
+    fn ingest_authorized_denies_when_no_token_configured() {
+        assert!(!ingest_authorized(None, Some("secret")));
+    }
+
+    #[test]
+    fn ingest_authorized_denies_when_both_sides_absent() {
+        assert!(!ingest_authorized(None, None));
     }
 }

@@ -36,3 +36,31 @@ See `.env.example`. Defaults: risk 1%/trade, leverage 2/3/5x, fill timeout 300s.
 - Uses an agent wallet, never your main wallet key.
 - Only allowlisted Telegram user ids are served.
 - Every execution requires explicit confirmation.
+
+## Web signal ingest
+
+Some signal sources are web-only and cannot send Telegram messages directly.
+The bot exposes a local `POST /ingest` endpoint so a clipboard hotkey can pipe
+signals in without breaking the confirmation flow.
+
+**Setup:**
+1. Add to `.env` (see `.env.example`):
+   ```
+   INGEST_PORT=8787
+   INGEST_TOKEN=change-me-to-a-random-string
+   ```
+2. Run the bot as usual (`cargo run` or `make run`).
+3. Copy a trading-setup card on the web, then run:
+   ```
+   make signal
+   ```
+   Or bind `scripts/send-signal.sh` to a macOS hotkey via Shortcuts, Raycast, or skhd.
+
+**How it works:** the script reads the macOS clipboard (`pbpaste`) and POSTs it
+to `http://127.0.0.1:$INGEST_PORT/ingest` with `X-Ingest-Token: $INGEST_TOKEN`.
+The bot processes the signal through the exact same pipeline as a Telegram message
+and sends the confirmation card(s) to your Telegram chat — confirmation and safety
+are fully preserved; only the input channel changes.
+
+**Security:** the endpoint binds `127.0.0.1` only (never reachable from the network)
+and refuses to start if `INGEST_TOKEN` is not set. The token is never logged.

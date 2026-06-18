@@ -217,12 +217,12 @@ use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
-struct BotContext<E: Exchange + 'static> {
-    config: crate::config::Config,
-    exchange: Arc<E>,
-    store: Arc<PendingStore>,
-    journal: Arc<Journal>,
-    http: reqwest::Client,
+pub struct BotContext<E: Exchange + 'static> {
+    pub config: crate::config::Config,
+    pub exchange: Arc<E>,
+    pub store: Arc<PendingStore>,
+    pub journal: Arc<Journal>,
+    pub http: reqwest::Client,
 }
 
 /// Returns a reply for a slash-command message, or None if the text is not a
@@ -298,6 +298,25 @@ async fn on_message<E: Exchange + 'static>(
         return Ok(());
     }
 
+    process_signal(&bot, &context, message.chat.id, text).await
+}
+
+/// Parses a trading-setup card and sends confirmation cards to `chat_id`.
+///
+/// This is the core signal-processing pipeline shared by both the Telegram
+/// message handler and the local HTTP ingest endpoint.
+///
+/// @param bot - The Telegram bot instance for sending messages
+/// @param context - Shared bot state (config, exchange, store, journal)
+/// @param chat_id - The Telegram chat that will receive the confirmation cards
+/// @param text - The raw trading-setup card text to parse and process
+/// @returns `Ok(())` on success, or an error if a critical step fails
+pub async fn process_signal<E: Exchange + 'static>(
+    bot: &Bot,
+    context: &BotContext<E>,
+    chat_id: teloxide::types::ChatId,
+    text: &str,
+) -> anyhow::Result<()> {
     let parse_result = match &context.config.deepseek_api_key {
         Some(api_key) => {
             let attempt = crate::llm_parser::parse_setups_llm(
@@ -313,7 +332,7 @@ async fn on_message<E: Exchange + 'static>(
             setups
         }
         Err(error) => {
-            bot.send_message(message.chat.id, format!("Could not parse setup: {error}")).await?;
+            bot.send_message(chat_id, format!("Could not parse setup: {error}")).await?;
             return Ok(());
         }
     };
@@ -322,14 +341,14 @@ async fn on_message<E: Exchange + 'static>(
     let equity = match context.exchange.equity().await {
         Ok(value) => value,
         Err(error) => {
-            bot.send_message(message.chat.id, format!("Could not fetch account equity: {error}")).await?;
+            bot.send_message(chat_id, format!("Could not fetch account equity: {error}")).await?;
             return Ok(());
         }
     };
 
     if setups.len() > 1 {
         bot.send_message(
-            message.chat.id,
+            chat_id,
             format!(
                 "Found {} signals. Each is sized at {}% risk — confirming all = {:.1}% total risk.",
                 setups.len(),
@@ -347,7 +366,7 @@ async fn on_message<E: Exchange + 'static>(
             let passes = setup.confidence.map(|confidence| confidence >= gate).unwrap_or(false);
             if !passes {
                 bot.send_message(
-                    message.chat.id,
+                    chat_id,
                     format!("{}: confidence {:?} below gate {gate} — skipped.", setup.coin, setup.confidence),
                 )
                 .await?;
@@ -361,7 +380,7 @@ async fn on_message<E: Exchange + 'static>(
             Ok(Some(meta)) => meta,
             Ok(None) => {
                 bot.send_message(
-                    message.chat.id,
+                    chat_id,
                     format!("{} is not listed as a perp on Hyperliquid — skipped.", setup.coin),
                 )
                 .await?;
@@ -369,7 +388,7 @@ async fn on_message<E: Exchange + 'static>(
             }
             Err(error) => {
                 bot.send_message(
-                    message.chat.id,
+                    chat_id,
                     format!("Could not load market for {}: {error} — skipped.", setup.coin),
                 )
                 .await?;
@@ -389,7 +408,7 @@ async fn on_message<E: Exchange + 'static>(
             Ok(plan) => plan,
             Err(error) => {
                 bot.send_message(
-                    message.chat.id,
+                    chat_id,
                     format!("{}: cannot size — {error} — skipped.", setup.coin),
                 )
                 .await?;
@@ -400,7 +419,7 @@ async fn on_message<E: Exchange + 'static>(
         // Send a separate confirmation card per signal. Each card gets its own
         // message id as the PendingStore key → on_callback handles them independently.
         let sent = bot
-            .send_message(message.chat.id, render_summary(&plan, profile))
+            .send_message(chat_id, render_summary(&plan, profile))
             .parse_mode(ParseMode::MarkdownV2)
             .reply_markup(confirmation_keyboard(profile))
             .await?;
@@ -566,6 +585,20 @@ pub async fn run<E: Exchange + 'static>(
         journal: Arc::new(Journal::open("trades.db")?),
         http,
     });
+
+    // Resolve the ingest target chat: use explicit INGEST_CHAT_ID if set,
+    // otherwise fall back to the first allowlisted Telegram user id.
+    let ingest_chat = context
+        .config
+        .ingest_chat_id
+        .or_else(|| context.config.allowed_user_ids.first().copied());
+    crate::ingest::spawn(
+        bot.clone(),
+        context.clone(),
+        context.config.ingest_port,
+        context.config.ingest_token.clone(),
+        ingest_chat,
+    );
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message::<E>))
