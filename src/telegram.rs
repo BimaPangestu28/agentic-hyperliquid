@@ -3,7 +3,7 @@
 use crate::config::LeverageMap;
 use crate::hyperliquid::{EntryOrder, Exchange, TriggerOrder};
 use crate::parser::Direction;
-use crate::sizing::{build_plan, ExecutionPlan, RiskProfile, SizingError, SizingInput};
+use crate::sizing::{build_plan, EntryMode, ExecutionPlan, RiskProfile, SizingError, SizingInput};
 use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
@@ -114,6 +114,9 @@ pub fn recompute_plan(
         setup: &trade.setup,
         equity: trade.equity,
         risk_pct,
+        entry_mode: EntryMode::RiskBased,
+        entry_pct: 10.0,
+        entry_fixed_usd: 50.0,
         profile,
         leverage,
         asset_meta: &trade.asset_meta,
@@ -471,6 +474,9 @@ pub async fn process_setups<E: Exchange + 'static>(
             setup: &setup,
             equity,
             risk_pct: context.config.risk_pct,
+            entry_mode: EntryMode::RiskBased,
+            entry_pct: 10.0,
+            entry_fixed_usd: 50.0,
             profile,
             leverage: &context.config.leverage,
             asset_meta: &asset_meta,
