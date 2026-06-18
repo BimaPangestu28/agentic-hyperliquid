@@ -36,7 +36,7 @@ pub struct OrderResult {
 #[async_trait]
 pub trait Exchange: Send + Sync {
     async fn equity(&self) -> anyhow::Result<f64>;
-    async fn asset_meta(&self, coin: &str) -> anyhow::Result<AssetMeta>;
+    async fn asset_meta(&self, coin: &str) -> anyhow::Result<Option<AssetMeta>>;
     async fn set_leverage(&self, coin: &str, leverage: u32) -> anyhow::Result<()>;
     async fn place_entry(&self, order: &EntryOrder) -> anyhow::Result<OrderResult>;
     async fn place_trigger(&self, order: &TriggerOrder) -> anyhow::Result<OrderResult>;
@@ -76,8 +76,8 @@ pub mod mock {
             Ok(self.equity)
         }
 
-        async fn asset_meta(&self, _coin: &str) -> anyhow::Result<AssetMeta> {
-            self.meta.ok_or_else(|| anyhow::anyhow!("no meta configured"))
+        async fn asset_meta(&self, _coin: &str) -> anyhow::Result<Option<AssetMeta>> {
+            Ok(self.meta)
         }
 
         async fn set_leverage(&self, coin: &str, leverage: u32) -> anyhow::Result<()> {
@@ -365,24 +365,27 @@ impl Exchange for HyperliquidExchange {
         }
     }
 
-    /// Returns sizing metadata for `coin`.
+    /// Returns sizing metadata for `coin`, or `Ok(None)` when the coin is not
+    /// listed in the Hyperliquid perp universe.
+    ///
+    /// **Semantics:**
+    /// - `Ok(Some(meta))` — coin found in the perp universe.
+    /// - `Ok(None)` — coin not found; caller should skip gracefully (not an error).
+    /// - `Err(_)` — network or SDK failure; caller may retry.
     ///
     /// **Note:** The SDK's `meta().universe` does not expose `max_leverage`; this
     /// implementation returns `max_leverage: 0` as a sentinel meaning "unknown".
     /// Callers must treat 0 as "no SDK-enforced cap" and apply their own limits.
-    async fn asset_meta(&self, coin: &str) -> anyhow::Result<AssetMeta> {
+    async fn asset_meta(&self, coin: &str) -> anyhow::Result<Option<AssetMeta>> {
         let meta = self.info.meta().await?;
-        let sdk_asset = meta
-            .universe
-            .iter()
-            .find(|a| a.name.eq_ignore_ascii_case(coin))
-            .ok_or_else(|| anyhow::anyhow!("unknown asset: {coin}"))?;
-
-        Ok(AssetMeta {
-            sz_decimals: sdk_asset.sz_decimals,
-            // SDK AssetMeta has no max_leverage field; return 0 (unknown).
-            max_leverage: 0,
-        })
+        match meta.universe.iter().find(|a| a.name.eq_ignore_ascii_case(coin)) {
+            Some(sdk_asset) => Ok(Some(AssetMeta {
+                sz_decimals: sdk_asset.sz_decimals,
+                // SDK AssetMeta has no max_leverage field; return 0 (unknown).
+                max_leverage: 0,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Sets cross-margin leverage for `coin` using the SDK's `update_leverage`.
