@@ -1,8 +1,8 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
-use crate::config::LeverageMap;
 use crate::hyperliquid::{EntryOrder, Exchange, TriggerOrder};
 use crate::parser::Direction;
+use crate::settings::{Settings, SettingsStore};
 use crate::sizing::{build_plan, EntryMode, ExecutionPlan, RiskProfile, SizingError, SizingInput};
 use crate::state::PendingTrade;
 use std::time::Duration;
@@ -107,18 +107,17 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
 pub fn recompute_plan(
     trade: &PendingTrade,
     profile: RiskProfile,
-    risk_pct: f64,
-    leverage: &LeverageMap,
+    settings: &Settings,
 ) -> Result<ExecutionPlan, SizingError> {
     build_plan(&SizingInput {
         setup: &trade.setup,
         equity: trade.equity,
-        risk_pct,
-        entry_mode: EntryMode::RiskBased,
-        entry_pct: 10.0,
-        entry_fixed_usd: 50.0,
+        risk_pct: settings.risk_pct,
+        entry_mode: settings.entry_mode,
+        entry_pct: settings.entry_pct,
+        entry_fixed_usd: settings.entry_fixed_usd,
         profile,
-        leverage,
+        leverage: &settings.leverage,
         asset_meta: &trade.asset_meta,
     })
 }
@@ -225,6 +224,8 @@ pub struct BotContext<E: Exchange + 'static> {
     pub exchange: Arc<E>,
     pub store: Arc<PendingStore>,
     pub journal: Arc<Journal>,
+    pub settings: Arc<std::sync::Mutex<Settings>>,
+    pub settings_store: Arc<SettingsStore>,
     pub http: reqwest::Client,
 }
 
@@ -372,16 +373,22 @@ pub async fn process_setups<E: Exchange + 'static>(
     };
 
     if setups.len() > 1 {
-        bot.send_message(
-            chat_id,
-            format!(
-                "Found {} signals. Each is sized at {}% risk — confirming all = {:.1}% total risk.",
-                setups.len(),
-                context.config.risk_pct,
-                context.config.risk_pct * setups.len() as f64,
+        let settings = context.settings.lock().unwrap().clone();
+        let message = match settings.entry_mode {
+            EntryMode::RiskBased => format!(
+                "Found {} signals. Each sized at {}% risk — confirming all = {:.1}% total risk.",
+                setups.len(), settings.risk_pct, settings.risk_pct * setups.len() as f64,
             ),
-        )
-        .await?;
+            EntryMode::PercentBalance => format!(
+                "Found {} signals. Each sized at {}% of balance.",
+                setups.len(), settings.entry_pct,
+            ),
+            EntryMode::FixedUsd => format!(
+                "Found {} signals. Each sized at ${:.2} notional.",
+                setups.len(), settings.entry_fixed_usd,
+            ),
+        };
+        bot.send_message(chat_id, message).await?;
     }
 
     for setup in setups {
@@ -470,15 +477,16 @@ pub async fn process_setups<E: Exchange + 'static>(
         }
 
         let profile = RiskProfile::Moderate;
+        let settings = context.settings.lock().unwrap().clone();
         let plan = match build_plan(&SizingInput {
             setup: &setup,
             equity,
-            risk_pct: context.config.risk_pct,
-            entry_mode: EntryMode::RiskBased,
-            entry_pct: 10.0,
-            entry_fixed_usd: 50.0,
+            risk_pct: settings.risk_pct,
+            entry_mode: settings.entry_mode,
+            entry_pct: settings.entry_pct,
+            entry_fixed_usd: settings.entry_fixed_usd,
             profile,
-            leverage: &context.config.leverage,
+            leverage: &settings.leverage,
             asset_meta: &asset_meta,
         }) {
             Ok(plan) => plan,
@@ -588,7 +596,8 @@ async fn on_callback<E: Exchange + 'static>(
     // Profile switch: recompute and edit the message in place.
     if let Some(profile) = profile_from_callback(&data) {
         if let Some(mut trade) = context.store.get(key) {
-            match recompute_plan(&trade, profile, context.config.risk_pct, &context.config.leverage) {
+            let settings = context.settings.lock().unwrap().clone();
+            match recompute_plan(&trade, profile, &settings) {
                 Ok(plan) => {
                     trade.profile = profile;
                     trade.plan = plan.clone();
@@ -639,7 +648,8 @@ async fn on_callback<E: Exchange + 'static>(
     // Daily risk cap check: reject the trade if adding its risk_amount would
     // exceed max_daily_risk_pct % of equity. Must run BEFORE execute_plan and
     // BEFORE journaling so a rejected trade does not consume cap or audit log.
-    if let Some(cap_pct) = context.config.max_daily_risk_pct {
+    let cap_pct_opt = context.settings.lock().unwrap().max_daily_risk_pct;
+    if let Some(cap_pct) = cap_pct_opt {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let day_start = crate::risk::start_of_utc_day(now_secs);
@@ -736,11 +746,15 @@ pub async fn run<E: Exchange + 'static>(
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
+    let settings_store = Arc::new(SettingsStore::open("trades.db")?);
+    let seeded = settings_store.load(Settings::from_config(&config))?;
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
         store: Arc::new(PendingStore::new()),
         journal: Arc::new(Journal::open("trades.db")?),
+        settings: Arc::new(std::sync::Mutex::new(seeded)),
+        settings_store,
         http,
     });
 
