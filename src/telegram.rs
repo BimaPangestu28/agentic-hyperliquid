@@ -398,7 +398,9 @@ pub async fn run<E: Exchange + 'static>(
     exchange: Arc<E>,
 ) -> anyhow::Result<()> {
     let bot = Bot::new(&config.telegram_token);
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
