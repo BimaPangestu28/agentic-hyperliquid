@@ -281,36 +281,25 @@ async fn on_message<E: Exchange + 'static>(
 
     let parse_result = match &context.config.deepseek_api_key {
         Some(api_key) => {
-            let attempt = crate::llm_parser::parse_setup_llm(
+            let attempt = crate::llm_parser::parse_setups_llm(
                 &context.http, &context.config.deepseek_base_url, api_key, &context.config.deepseek_model, text,
             );
             crate::llm_parser::parse_with_fallback(attempt, text).await
         }
-        None => crate::parser::parse_setup(text).map(|s| (s, crate::llm_parser::ParseSource::RegexFallback)),
+        None => crate::parser::parse_setup(text).map(|s| (vec![s], crate::llm_parser::ParseSource::RegexFallback)),
     };
-    let setup = match parse_result {
-        Ok((setup, source)) => { tracing::info!(?source, "parsed setup"); setup }
+    let setups = match parse_result {
+        Ok((setups, source)) => {
+            tracing::info!(?source, count = setups.len(), "parsed setups");
+            setups
+        }
         Err(error) => {
             bot.send_message(message.chat.id, format!("Could not parse setup: {error}")).await?;
             return Ok(());
         }
     };
 
-    // Confidence gate: when a gate is configured, a missing or below-threshold
-    // confidence BOTH fail closed. unwrap_or(false) here means "no confidence
-    // value => does not pass the gate".
-    if let Some(gate) = context.config.confidence_gate {
-        let passes = setup.confidence.map(|confidence| confidence >= gate).unwrap_or(false);
-        if !passes {
-            bot.send_message(
-                message.chat.id,
-                format!("Confidence {:?} does not meet gate {gate}; skipped.", setup.confidence),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-
+    // Fetch equity once for all signals.
     let equity = match context.exchange.equity().await {
         Ok(value) => value,
         Err(error) => {
@@ -318,40 +307,90 @@ async fn on_message<E: Exchange + 'static>(
             return Ok(());
         }
     };
-    let asset_meta = match context.exchange.asset_meta(&setup.coin).await {
-        Ok(meta) => meta,
-        Err(error) => {
-            bot.send_message(message.chat.id, format!("Cannot trade {}: {error}", setup.coin)).await?;
-            return Ok(());
-        }
-    };
-    let profile = RiskProfile::Moderate;
-    let plan = match build_plan(&SizingInput {
-        setup: &setup,
-        equity,
-        risk_pct: context.config.risk_pct,
-        profile,
-        leverage: &context.config.leverage,
-        asset_meta: &asset_meta,
-    }) {
-        Ok(plan) => plan,
-        Err(error) => {
-            bot.send_message(message.chat.id, format!("Cannot size trade: {error}")).await?;
-            return Ok(());
-        }
-    };
 
-    let sent = bot
-        .send_message(message.chat.id, render_summary(&plan, profile))
-        .parse_mode(ParseMode::MarkdownV2)
-        .reply_markup(confirmation_keyboard(profile))
+    if setups.len() > 1 {
+        bot.send_message(
+            message.chat.id,
+            format!(
+                "Found {} signals. Each is sized at {}% risk — confirming all = {:.1}% total risk.",
+                setups.len(),
+                context.config.risk_pct,
+                context.config.risk_pct * setups.len() as f64,
+            ),
+        )
         .await?;
+    }
 
-    // Key by message id (i32 from MessageId(i32), cast to i64 for PendingStore)
-    context.store.insert(
-        sent.id.0 as i64,
-        PendingTrade { setup, equity, asset_meta, profile, plan },
-    );
+    for setup in setups {
+        // Confidence gate: when a gate is configured, a missing or below-threshold
+        // confidence BOTH fail closed. unwrap_or(false) means "no confidence => skip".
+        if let Some(gate) = context.config.confidence_gate {
+            let passes = setup.confidence.map(|confidence| confidence >= gate).unwrap_or(false);
+            if !passes {
+                bot.send_message(
+                    message.chat.id,
+                    format!("{}: confidence {:?} below gate {gate} — skipped.", setup.coin, setup.confidence),
+                )
+                .await?;
+                continue;
+            }
+        }
+
+        // Asset listing check: Ok(Some) = listed, Ok(None) = not listed (skip gracefully),
+        // Err = network failure (skip with note).
+        let asset_meta = match context.exchange.asset_meta(&setup.coin).await {
+            Ok(Some(meta)) => meta,
+            Ok(None) => {
+                bot.send_message(
+                    message.chat.id,
+                    format!("{} is not listed as a perp on Hyperliquid — skipped.", setup.coin),
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => {
+                bot.send_message(
+                    message.chat.id,
+                    format!("Could not load market for {}: {error} — skipped.", setup.coin),
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        let profile = RiskProfile::Moderate;
+        let plan = match build_plan(&SizingInput {
+            setup: &setup,
+            equity,
+            risk_pct: context.config.risk_pct,
+            profile,
+            leverage: &context.config.leverage,
+            asset_meta: &asset_meta,
+        }) {
+            Ok(plan) => plan,
+            Err(error) => {
+                bot.send_message(
+                    message.chat.id,
+                    format!("{}: cannot size — {error} — skipped.", setup.coin),
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        // Send a separate confirmation card per signal. Each card gets its own
+        // message id as the PendingStore key → on_callback handles them independently.
+        let sent = bot
+            .send_message(message.chat.id, render_summary(&plan, profile))
+            .parse_mode(ParseMode::MarkdownV2)
+            .reply_markup(confirmation_keyboard(profile))
+            .await?;
+
+        context.store.insert(
+            sent.id.0 as i64,
+            PendingTrade { setup, equity, asset_meta, profile, plan },
+        );
+    }
     Ok(())
 }
 

@@ -1,5 +1,9 @@
-//! DeepSeek-backed extraction of a trading-setup card into a TradeSetup,
+//! DeepSeek-backed extraction of trading-setup cards into TradeSetups,
 //! with the deterministic regex parser as fallback.
+//!
+//! The LLM is asked to return a `{"setups":[...]}` array so that one message
+//! can yield multiple signals. The regex `parser::parse_setup` remains the
+//! single-setup fallback for the original "Trading setup for X" card format.
 
 use crate::parser::{validate_setup, Direction, TakeProfit, TradeSetup};
 use serde::Deserialize;
@@ -11,8 +15,9 @@ pub enum ParseSource {
     RegexFallback,
 }
 
-/// JSON shape we ask DeepSeek to return. Kept separate from TradeSetup so the
-/// model contract is explicit and lenient (strings tolerated for the enum).
+/// JSON shape we ask DeepSeek to return for each individual setup. Kept
+/// separate from `TradeSetup` so the model contract is explicit and lenient
+/// (strings tolerated for the enum).
 #[derive(Debug, Deserialize)]
 struct LlmSetup {
     coin: String,
@@ -37,8 +42,15 @@ struct LlmTakeProfit {
 
 fn default_allocation() -> f64 { 100.0 }
 
+/// Top-level wrapper for the `{"setups":[...]}` array the LLM returns.
+#[derive(Debug, Deserialize)]
+struct LlmSetupList {
+    #[serde(default)]
+    setups: Vec<LlmSetup>,
+}
+
 impl LlmSetup {
-    /// Maps the LLM JSON into a validated TradeSetup, reusing parser validation.
+    /// Maps the LLM JSON into a validated `TradeSetup`, reusing parser validation.
     fn into_trade_setup(self) -> anyhow::Result<TradeSetup> {
         let direction = match self.direction.trim().to_ascii_uppercase().as_str() {
             "LONG" => Direction::Long,
@@ -62,29 +74,48 @@ impl LlmSetup {
     }
 }
 
-/// Extracts the JSON object the model returned (its message content) and maps it.
-/// Exposed for unit testing without network.
-pub fn parse_llm_content(content: &str) -> anyhow::Result<TradeSetup> {
-    // DeepSeek with response_format=json_object returns a JSON object as content.
-    let llm: LlmSetup = serde_json::from_str(content.trim())?;
-    llm.into_trade_setup()
+/// Parses the LLM JSON object `{"setups":[...]}` into validated `TradeSetup`s.
+///
+/// Invalid individual setups are skipped with a warning; returns `Err` only
+/// when NONE of the setups are valid (including the case of an empty array).
+pub fn parse_llm_content_multi(content: &str) -> anyhow::Result<Vec<TradeSetup>> {
+    let list: LlmSetupList = serde_json::from_str(content.trim())?;
+    let mut setups = Vec::new();
+    for raw in list.setups {
+        match raw.into_trade_setup() {
+            Ok(setup) => setups.push(setup),
+            Err(e) => tracing::warn!("skipping invalid LLM setup: {e}"),
+        }
+    }
+    if setups.is_empty() {
+        anyhow::bail!("LLM returned no valid setups");
+    }
+    Ok(setups)
 }
 
-const SYSTEM_PROMPT: &str = "You extract crypto perp trading setups from a pasted card into STRICT JSON. \
-Return ONLY a JSON object with keys: coin (string ticker, e.g. \"PENDLE\"), direction (\"LONG\" or \"SHORT\"), \
-timeframe (string or null), risk_reward (number or null, the left side of the R:R ratio), confidence (integer 0-10 or null), \
-entry (number), stop_loss (number), take_profits (array of {price: number, allocation_pct: number}). \
-Strip currency symbols. allocation_pct is the position fraction to close at that TP (e.g. 60), NOT the price-change percent. \
-If only one TP and no allocation is given, use 100. Do not invent values that are not in the card.";
+const SYSTEM_PROMPT: &str = "You extract crypto perp trading setups from a pasted message into STRICT JSON. \
+Return ONLY a JSON object: {\"setups\": [ {coin, direction, timeframe, risk_reward, confidence, entry, stop_loss, take_profits:[{price, allocation_pct}]}, ... ]}. \
+Extract EVERY distinct trade signal in the message into its own array element. \
+Use the ticker symbol for coin (e.g. BITCOIN/$BTC → \"BTC\", SOLANA/$SOL → \"SOL\", HYPERLIQUID/$HYPE → \"HYPE\"). \
+direction is \"LONG\" or \"SHORT\". Strip currency symbols and thousands separators ($64,000 → 64000). \
+allocation_pct is the fraction of the position to close at that TP. \
+If allocations are NOT given and there are multiple TPs, DISTRIBUTE EQUALLY so they sum to 100 (e.g. 2 TPs → 50 and 50; 3 TPs → 34, 33, 33). \
+If a single TP with no allocation, use 100. \
+timeframe is a string or null. risk_reward is a number or null. confidence is an integer 0-10 or null. \
+Do not invent values that are not in the message. \
+If the message contains no trade setups, return {\"setups\": []}.";
 
-/// Calls the DeepSeek chat API and returns the parsed TradeSetup.
-pub async fn parse_setup_llm(
+/// Calls the DeepSeek chat API and returns the parsed `Vec<TradeSetup>`.
+///
+/// The LLM is instructed to return a `{"setups":[...]}` array so multiple
+/// signals in one message are all captured.
+pub async fn parse_setups_llm(
     http: &reqwest::Client,
     base_url: &str,
     api_key: &str,
     model: &str,
     card_text: &str,
-) -> anyhow::Result<TradeSetup> {
+) -> anyhow::Result<Vec<TradeSetup>> {
     let body = serde_json::json!({
         "model": model,
         "messages": [
@@ -110,23 +141,25 @@ pub async fn parse_setup_llm(
     let content = value["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("DeepSeek response missing message content"))?;
-    parse_llm_content(content)
+    parse_llm_content_multi(content)
 }
 
-/// Tries the LLM future first; on ANY error, falls back to the regex parser.
-/// Returns the setup and which source produced it.
+/// Tries the LLM (multi) future first; on ANY error, falls back to the regex
+/// parser (single setup wrapped in a `Vec`).
+///
+/// Returns the setups and which source produced them.
 pub async fn parse_with_fallback<F>(
     llm_attempt: F,
     card_text: &str,
-) -> Result<(TradeSetup, ParseSource), crate::parser::ParseError>
+) -> Result<(Vec<TradeSetup>, ParseSource), crate::parser::ParseError>
 where
-    F: std::future::Future<Output = anyhow::Result<TradeSetup>>,
+    F: std::future::Future<Output = anyhow::Result<Vec<TradeSetup>>>,
 {
     match llm_attempt.await {
-        Ok(setup) => Ok((setup, ParseSource::Llm)),
+        Ok(setups) => Ok((setups, ParseSource::Llm)),
         Err(error) => {
             tracing::warn!("LLM parse failed, falling back to regex: {error}");
-            crate::parser::parse_setup(card_text).map(|setup| (setup, ParseSource::RegexFallback))
+            crate::parser::parse_setup(card_text).map(|s| (vec![s], ParseSource::RegexFallback))
         }
     }
 }
@@ -136,40 +169,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_valid_llm_json_to_trade_setup() {
-        let content = r#"{"coin":"PENDLE","direction":"LONG","timeframe":"swing","risk_reward":2.8,"confidence":8,"entry":1.40,"stop_loss":1.25,"take_profits":[{"price":1.70,"allocation_pct":60},{"price":2.00,"allocation_pct":40}]}"#;
-        let setup = parse_llm_content(content).unwrap();
-        assert_eq!(setup.coin, "PENDLE");
-        assert_eq!(setup.direction, Direction::Long);
-        assert_eq!(setup.entry, 1.40);
-        assert_eq!(setup.take_profits.len(), 2);
-        assert_eq!(setup.take_profits[0].allocation_pct, 60.0);
+    fn parses_multiple_setups_from_array() {
+        let content = r#"{"setups":[
+          {"coin":"BTC","direction":"LONG","entry":64000,"stop_loss":62500,"take_profits":[{"price":65800,"allocation_pct":50},{"price":67000,"allocation_pct":50}]},
+          {"coin":"SOL","direction":"LONG","entry":71,"stop_loss":68.5,"take_profits":[{"price":74.5,"allocation_pct":50},{"price":76.3,"allocation_pct":50}]},
+          {"coin":"HYPE","direction":"LONG","entry":70.5,"stop_loss":66.5,"take_profits":[{"price":75.5,"allocation_pct":50},{"price":76.7,"allocation_pct":50}]}
+        ]}"#;
+        let setups = parse_llm_content_multi(content).unwrap();
+        assert_eq!(setups.len(), 3);
+        assert_eq!(setups[0].coin, "BTC");
+        assert_eq!(setups[2].coin, "HYPE");
     }
 
     #[test]
-    fn rejects_llm_json_with_nonpositive_price() {
-        let content = r#"{"coin":"BTC","direction":"LONG","entry":0,"stop_loss":0,"take_profits":[{"price":80000,"allocation_pct":100}]}"#;
-        assert!(parse_llm_content(content).is_err());
+    fn skips_invalid_setup_keeps_valid() {
+        let content = r#"{"setups":[
+          {"coin":"BTC","direction":"LONG","entry":0,"stop_loss":62500,"take_profits":[{"price":65800,"allocation_pct":100}]},
+          {"coin":"SOL","direction":"LONG","entry":71,"stop_loss":68.5,"take_profits":[{"price":74.5,"allocation_pct":100}]}
+        ]}"#;
+        let setups = parse_llm_content_multi(content).unwrap();
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].coin, "SOL");
+    }
+
+    #[test]
+    fn empty_setups_is_error() {
+        assert!(parse_llm_content_multi(r#"{"setups":[]}"#).is_err());
     }
 
     #[tokio::test]
-    async fn falls_back_to_regex_when_llm_errors() {
+    async fn falls_back_to_regex_single() {
         let card = "Trading setup for PENDLE\nDirection\nLONG\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n100%";
-        let failing = async { anyhow::bail!("simulated LLM outage") };
-        let (setup, source) = parse_with_fallback(failing, card).await.unwrap();
+        let failing = async { anyhow::bail!("simulated outage") };
+        let (setups, source) = parse_with_fallback(failing, card).await.unwrap();
         assert_eq!(source, ParseSource::RegexFallback);
-        assert_eq!(setup.coin, "PENDLE");
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].coin, "PENDLE");
     }
 
     #[tokio::test]
-    async fn uses_llm_result_when_it_succeeds() {
-        let card = "irrelevant — regex would also work but LLM wins";
-        let good = async {
-            parse_llm_content(r#"{"coin":"ETH","direction":"SHORT","entry":3000,"stop_loss":3100,"take_profits":[{"price":2800,"allocation_pct":100}]}"#)
-        };
-        let (setup, source) = parse_with_fallback(good, card).await.unwrap();
+    async fn uses_llm_array_when_it_succeeds() {
+        let good = async { parse_llm_content_multi(r#"{"setups":[{"coin":"ETH","direction":"SHORT","entry":3000,"stop_loss":3100,"take_profits":[{"price":2800,"allocation_pct":100}]}]}"#) };
+        let (setups, source) = parse_with_fallback(good, "x").await.unwrap();
         assert_eq!(source, ParseSource::Llm);
-        assert_eq!(setup.coin, "ETH");
-        assert_eq!(setup.direction, Direction::Short);
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].coin, "ETH");
     }
 }
