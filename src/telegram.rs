@@ -303,8 +303,8 @@ async fn on_message<E: Exchange + 'static>(
 
 /// Parses a trading-setup card and sends confirmation cards to `chat_id`.
 ///
-/// This is the core signal-processing pipeline shared by both the Telegram
-/// message handler and the local HTTP ingest endpoint.
+/// This is the core signal-processing pipeline used by the Telegram message
+/// handler (parse → size → confirmation cards).
 ///
 /// @param bot - The Telegram bot instance for sending messages
 /// @param context - Shared bot state (config, exchange, store, journal)
