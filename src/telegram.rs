@@ -1,6 +1,6 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
-use crate::hyperliquid::{EntryOrder, Exchange, TriggerOrder};
+use crate::hyperliquid::{EntryOrder, Exchange, OpenPosition, TriggerOrder};
 use crate::parser::Direction;
 use crate::settings::{Settings, SettingsStore};
 use crate::sizing::{build_plan, EntryMode, ExecutionPlan, RiskProfile, SizingError, SizingInput};
@@ -8,7 +8,7 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /settings, /set <key> <value>";
+const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /settings, /set <key> <value>";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -103,6 +103,49 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
         ],
         vec![InlineKeyboardButton::callback("❌ Cancel", CB_CANCEL)],
     ])
+}
+
+/// Plain-text account card (no parse_mode). The daily-risk line is omitted
+/// when the cap is disabled (`cap_pct` is `None`).
+pub fn render_account(
+    equity: f64,
+    positions: &[OpenPosition],
+    used_today: f64,
+    cap_pct: Option<f64>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("💰 Account\n");
+    out.push_str(&format!("Equity: ${:.2}\n", equity));
+    if let Some(cap) = cap_pct {
+        let cap_amount = equity * cap / 100.0;
+        out.push_str(&format!(
+            "Daily risk used: ${:.2} / ${:.2} ({}%)\n",
+            used_today, cap_amount, cap
+        ));
+    }
+    if positions.is_empty() {
+        out.push_str("\nFlat — no open positions.\n");
+        return out;
+    }
+    out.push_str(&format!("\nOpen positions ({}):\n", positions.len()));
+    for position in positions {
+        let direction = if position.is_long { "LONG" } else { "SHORT" };
+        let liquidation = match position.liquidation_px {
+            Some(price) => format!("${:.2}", price),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "  {:<6} {:<5} {} @ ${:.2}  uPnL ${:+.2}  {}x  liq {}\n",
+            position.coin,
+            direction,
+            position.size,
+            position.entry_px,
+            position.unrealized_pnl,
+            position.leverage,
+            liquidation,
+        ));
+    }
+    out
 }
 
 /// Plain-text settings card (no MarkdownV2 — sent without parse_mode).
@@ -399,6 +442,42 @@ async fn on_message<E: Exchange + 'static>(
         let stats = crate::stats::compute_stats(&fills, &trades);
         // Plain text — no parse_mode — so no MarkdownV2 escaping needed.
         bot.send_message(message.chat.id, crate::stats::render_stats(&stats))
+            .await?;
+        return Ok(());
+    }
+
+    // /account — live equity + open positions + daily-risk-used. Like /stats,
+    // it needs the async exchange + journal + settings, so it is handled here.
+    if text
+        .split_whitespace()
+        .next()
+        .map(|w| w.split('@').next().unwrap_or("").eq_ignore_ascii_case("/account"))
+        .unwrap_or(false)
+    {
+        let equity = match context.exchange.equity().await {
+            Ok(value) => value,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch account state: {error}")).await?;
+                return Ok(());
+            }
+        };
+        let positions = match context.exchange.open_positions().await {
+            Ok(value) => value,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch account state: {error}")).await?;
+                return Ok(());
+            }
+        };
+        let cap_pct = context.settings.lock().unwrap().max_daily_risk_pct;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let used_today = context
+            .journal
+            .risk_used_since(crate::risk::start_of_utc_day(now_secs))
+            .unwrap_or(0.0);
+        bot.send_message(message.chat.id, render_account(equity, &positions, used_today, cap_pct))
             .await?;
         return Ok(());
     }
@@ -1003,6 +1082,47 @@ mod tests {
     fn entry_mode_callback_parses() {
         assert_eq!(super::entry_mode_from_callback(super::CB_MODE_PERCENT), Some(EntryMode::PercentBalance));
         assert_eq!(super::entry_mode_from_callback("nope"), None);
+    }
+
+    fn sample_positions() -> Vec<crate::hyperliquid::OpenPosition> {
+        vec![
+            crate::hyperliquid::OpenPosition {
+                coin: "BTC".into(), is_long: true, size: 0.05, entry_px: 61200.0,
+                unrealized_pnl: 45.2, leverage: 3, liquidation_px: Some(52100.0),
+            },
+            crate::hyperliquid::OpenPosition {
+                coin: "ETH".into(), is_long: false, size: 1.2, entry_px: 3410.0,
+                unrealized_pnl: -12.8, leverage: 2, liquidation_px: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn account_card_lists_positions_and_cap() {
+        let text = super::render_account(1234.56, &sample_positions(), 12.3, Some(5.0));
+        assert!(text.contains("Equity: $1234.56"));
+        assert!(text.contains("Daily risk used:"));
+        assert!(text.contains("Open positions (2):"));
+        assert!(text.contains("BTC"));
+        assert!(text.contains("LONG"));
+        assert!(text.contains("SHORT"));
+        assert!(text.contains("uPnL $+45.20")); // positive sign
+        assert!(text.contains("uPnL $-12.80")); // negative sign
+        assert!(text.contains("liq $52100.00"));
+        assert!(text.contains("liq -")); // ETH has no liquidation price
+    }
+
+    #[test]
+    fn account_card_flat_when_no_positions() {
+        let text = super::render_account(1000.0, &[], 0.0, Some(5.0));
+        assert!(text.contains("Flat"));
+        assert!(!text.contains("Open positions"));
+    }
+
+    #[test]
+    fn account_card_omits_daily_risk_when_cap_disabled() {
+        let text = super::render_account(1000.0, &sample_positions(), 0.0, None);
+        assert!(!text.contains("Daily risk used"));
     }
 
     use crate::hyperliquid::mock::MockExchange;
