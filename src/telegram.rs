@@ -1,14 +1,14 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
-use crate::config::LeverageMap;
-use crate::hyperliquid::{EntryOrder, Exchange, TriggerOrder};
+use crate::hyperliquid::{EntryOrder, Exchange, OpenPosition, TriggerOrder};
 use crate::parser::Direction;
-use crate::sizing::{build_plan, ExecutionPlan, RiskProfile, SizingError, SizingInput};
+use crate::settings::{Settings, SettingsStore};
+use crate::sizing::{build_plan, EntryMode, ExecutionPlan, RiskProfile, SizingError, SizingInput};
 use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats";
+const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /settings, /set <key> <value>";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -16,6 +16,9 @@ pub const CB_AGGRESSIVE: &str = "profile:aggressive";
 pub const CB_LIMIT: &str = "confirm:limit";
 pub const CB_MARKET: &str = "confirm:market";
 pub const CB_CANCEL: &str = "cancel";
+pub const CB_MODE_RISK: &str = "entry_mode:risk";
+pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
+pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
 
 /// Escapes text for Telegram MarkdownV2 (every reserved char gets a backslash).
 fn escape_markdown_v2(text: &str) -> String {
@@ -102,20 +105,116 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
     ])
 }
 
+/// Plain-text account card (no parse_mode). The daily-risk line is omitted
+/// when the cap is disabled (`cap_pct` is `None`).
+pub fn render_account(
+    equity: f64,
+    positions: &[OpenPosition],
+    used_today: f64,
+    cap_pct: Option<f64>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("💰 Account\n");
+    out.push_str(&format!("Equity: ${:.2}\n", equity));
+    if let Some(cap) = cap_pct {
+        let cap_amount = equity * cap / 100.0;
+        out.push_str(&format!(
+            "Daily risk used: ${:.2} / ${:.2} ({}%)\n",
+            used_today, cap_amount, cap
+        ));
+    }
+    if positions.is_empty() {
+        out.push_str("\nFlat — no open positions.\n");
+        return out;
+    }
+    out.push_str(&format!("\nOpen positions ({}):\n", positions.len()));
+    for position in positions {
+        let direction = if position.is_long { "LONG" } else { "SHORT" };
+        let liquidation = match position.liquidation_px {
+            Some(price) => format!("${:.2}", price),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "  {:<6} {:<5} {} @ ${:.2}  uPnL ${:+.2}  {}x  liq {}\n",
+            position.coin,
+            direction,
+            position.size,
+            position.entry_px,
+            position.unrealized_pnl,
+            position.leverage,
+            liquidation,
+        ));
+    }
+    out
+}
+
+/// Plain-text settings card (no MarkdownV2 — sent without parse_mode).
+pub fn render_settings(settings: &Settings) -> String {
+    let cap = match settings.max_daily_risk_pct {
+        Some(value) => format!("{value}%"),
+        None => "disabled".to_string(),
+    };
+    format!(
+        "⚙️ Settings\n\n\
+         Entry mode: {}\n\
+         risk_pct: {}%\n\
+         entry_pct: {}%\n\
+         entry_fixed_usd: ${}\n\
+         max_daily_risk_pct: {}\n\
+         leverage_conservative: {}x\n\
+         leverage_moderate: {}x\n\
+         leverage_aggressive: {}x\n\n\
+         Change a number:  /set <key> <value>\n\
+         e.g.  /set entry_pct 10\n\
+         Switch entry mode with the buttons below.",
+        settings.entry_mode.label(),
+        settings.risk_pct,
+        settings.entry_pct,
+        settings.entry_fixed_usd,
+        cap,
+        settings.leverage.conservative,
+        settings.leverage.moderate,
+        settings.leverage.aggressive,
+    )
+}
+
+/// Inline keyboard with the three entry-mode buttons, ✓ on the active one.
+pub fn settings_keyboard(active: EntryMode) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(
+            label("Risk-based", active == EntryMode::RiskBased), CB_MODE_RISK),
+        InlineKeyboardButton::callback(
+            label("% Balance", active == EntryMode::PercentBalance), CB_MODE_PERCENT),
+        InlineKeyboardButton::callback(
+            label("Fixed USD", active == EntryMode::FixedUsd), CB_MODE_FIXED),
+    ]])
+}
+
+fn entry_mode_from_callback(data: &str) -> Option<EntryMode> {
+    match data {
+        CB_MODE_RISK => Some(EntryMode::RiskBased),
+        CB_MODE_PERCENT => Some(EntryMode::PercentBalance),
+        CB_MODE_FIXED => Some(EntryMode::FixedUsd),
+        _ => None,
+    }
+}
+
 /// Recomputes the plan for a different risk profile, reusing the cached equity
 /// and asset metadata captured when the card was first parsed.
 pub fn recompute_plan(
     trade: &PendingTrade,
     profile: RiskProfile,
-    risk_pct: f64,
-    leverage: &LeverageMap,
+    settings: &Settings,
 ) -> Result<ExecutionPlan, SizingError> {
     build_plan(&SizingInput {
         setup: &trade.setup,
         equity: trade.equity,
-        risk_pct,
+        risk_pct: settings.risk_pct,
+        entry_mode: settings.entry_mode,
+        entry_pct: settings.entry_pct,
+        entry_fixed_usd: settings.entry_fixed_usd,
         profile,
-        leverage,
+        leverage: &settings.leverage,
         asset_meta: &trade.asset_meta,
     })
 }
@@ -222,7 +321,21 @@ pub struct BotContext<E: Exchange + 'static> {
     pub exchange: Arc<E>,
     pub store: Arc<PendingStore>,
     pub journal: Arc<Journal>,
+    pub settings: Arc<std::sync::Mutex<Settings>>,
+    pub settings_store: Arc<SettingsStore>,
     pub http: reqwest::Client,
+}
+
+/// First whitespace-separated token of `text`, lowercased, with any @botname
+/// suffix stripped. Returns "" when there is no token.
+fn first_command_word(text: &str) -> String {
+    text.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 /// Returns a reply for a slash-command message, or None if the text is not a
@@ -233,7 +346,7 @@ fn command_response(text: &str) -> Option<String> {
         return None;
     }
     // Take the command word without args, strip a possible @botname suffix, lowercase.
-    let command = trimmed
+    let command = text
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -319,7 +432,6 @@ async fn on_message<E: Exchange + 'static>(
     // pure command_response function. Intercept before command_response so it
     // does not fall through to the "unknown command" branch.
     if text
-        .trim()
         .split_whitespace()
         .next()
         .map(|w| w.split('@').next().unwrap_or("").eq_ignore_ascii_case("/stats"))
@@ -331,6 +443,83 @@ async fn on_message<E: Exchange + 'static>(
         // Plain text — no parse_mode — so no MarkdownV2 escaping needed.
         bot.send_message(message.chat.id, crate::stats::render_stats(&stats))
             .await?;
+        return Ok(());
+    }
+
+    // /account — live equity + open positions + daily-risk-used. Like /stats,
+    // it needs the async exchange + journal + settings, so it is handled here.
+    if text
+        .split_whitespace()
+        .next()
+        .map(|w| w.split('@').next().unwrap_or("").eq_ignore_ascii_case("/account"))
+        .unwrap_or(false)
+    {
+        let equity = match context.exchange.equity().await {
+            Ok(value) => value,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch account state: {error}")).await?;
+                return Ok(());
+            }
+        };
+        let positions = match context.exchange.open_positions().await {
+            Ok(value) => value,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch account state: {error}")).await?;
+                return Ok(());
+            }
+        };
+        let cap_pct = context.settings.lock().unwrap().max_daily_risk_pct;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let used_today = context
+            .journal
+            .risk_used_since(crate::risk::start_of_utc_day(now_secs))
+            .unwrap_or(0.0);
+        bot.send_message(message.chat.id, render_account(equity, &positions, used_today, cap_pct))
+            .await?;
+        return Ok(());
+    }
+
+    // /settings — show current values + entry-mode buttons.
+    if first_command_word(text) == "/settings" {
+        let settings = context.settings.lock().unwrap().clone();
+        bot.send_message(message.chat.id, render_settings(&settings))
+            .reply_markup(settings_keyboard(settings.entry_mode))
+            .await?;
+        return Ok(());
+    }
+
+    // /set <key> <value> — validate, persist, confirm.
+    if first_command_word(text) == "/set" {
+        let mut parts = text.split_whitespace();
+        parts.next(); // skip "/set"
+        let key = parts.next();
+        let value = parts.collect::<Vec<_>>().join(" ");
+        match key {
+            None => {
+                bot.send_message(message.chat.id,
+                    "Usage: /set <key> <value> — send /settings to see the keys.").await?;
+            }
+            Some(key) => {
+                let current = context.settings.lock().unwrap().clone();
+                match crate::settings::apply_setting(&current, key, &value) {
+                    Ok(next) => {
+                        if let Err(error) = context.settings_store.persist(&next) {
+                            bot.send_message(message.chat.id,
+                                format!("Could not save setting: {error}")).await?;
+                            return Ok(());
+                        }
+                        *context.settings.lock().unwrap() = next.clone();
+                        bot.send_message(message.chat.id, render_settings(&next)).await?;
+                    }
+                    Err(error_message) => {
+                        bot.send_message(message.chat.id, error_message).await?;
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -369,16 +558,22 @@ pub async fn process_setups<E: Exchange + 'static>(
     };
 
     if setups.len() > 1 {
-        bot.send_message(
-            chat_id,
-            format!(
-                "Found {} signals. Each is sized at {}% risk — confirming all = {:.1}% total risk.",
-                setups.len(),
-                context.config.risk_pct,
-                context.config.risk_pct * setups.len() as f64,
+        let settings = context.settings.lock().unwrap().clone();
+        let message = match settings.entry_mode {
+            EntryMode::RiskBased => format!(
+                "Found {} signals. Each sized at {}% risk — confirming all = {:.1}% total risk.",
+                setups.len(), settings.risk_pct, settings.risk_pct * setups.len() as f64,
             ),
-        )
-        .await?;
+            EntryMode::PercentBalance => format!(
+                "Found {} signals. Each sized at {}% of balance.",
+                setups.len(), settings.entry_pct,
+            ),
+            EntryMode::FixedUsd => format!(
+                "Found {} signals. Each sized at ${:.2} notional.",
+                setups.len(), settings.entry_fixed_usd,
+            ),
+        };
+        bot.send_message(chat_id, message).await?;
     }
 
     for setup in setups {
@@ -467,12 +662,16 @@ pub async fn process_setups<E: Exchange + 'static>(
         }
 
         let profile = RiskProfile::Moderate;
+        let settings = context.settings.lock().unwrap().clone();
         let plan = match build_plan(&SizingInput {
             setup: &setup,
             equity,
-            risk_pct: context.config.risk_pct,
+            risk_pct: settings.risk_pct,
+            entry_mode: settings.entry_mode,
+            entry_pct: settings.entry_pct,
+            entry_fixed_usd: settings.entry_fixed_usd,
             profile,
-            leverage: &context.config.leverage,
+            leverage: &settings.leverage,
             asset_meta: &asset_meta,
         }) {
             Ok(plan) => plan,
@@ -579,10 +778,28 @@ async fn on_callback<E: Exchange + 'static>(
     let key = message.id.0 as i64;
     let data = query.data.clone().unwrap_or_default();
 
+    // Entry-mode switch from the /settings keyboard.
+    if let Some(mode) = entry_mode_from_callback(&data) {
+        let next = {
+            let mut guard = context.settings.lock().unwrap();
+            guard.entry_mode = mode;
+            guard.clone()
+        };
+        if let Err(error) = context.settings_store.persist(&next) {
+            tracing::warn!(%error, "failed to persist entry_mode change");
+        }
+        bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
+            .reply_markup(settings_keyboard(mode))
+            .await?;
+        bot.answer_callback_query(&query.id).await?;
+        return Ok(());
+    }
+
     // Profile switch: recompute and edit the message in place.
     if let Some(profile) = profile_from_callback(&data) {
         if let Some(mut trade) = context.store.get(key) {
-            match recompute_plan(&trade, profile, context.config.risk_pct, &context.config.leverage) {
+            let settings = context.settings.lock().unwrap().clone();
+            match recompute_plan(&trade, profile, &settings) {
                 Ok(plan) => {
                     trade.profile = profile;
                     trade.plan = plan.clone();
@@ -633,7 +850,8 @@ async fn on_callback<E: Exchange + 'static>(
     // Daily risk cap check: reject the trade if adding its risk_amount would
     // exceed max_daily_risk_pct % of equity. Must run BEFORE execute_plan and
     // BEFORE journaling so a rejected trade does not consume cap or audit log.
-    if let Some(cap_pct) = context.config.max_daily_risk_pct {
+    let cap_pct_opt = context.settings.lock().unwrap().max_daily_risk_pct;
+    if let Some(cap_pct) = cap_pct_opt {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let day_start = crate::risk::start_of_utc_day(now_secs);
@@ -730,11 +948,15 @@ pub async fn run<E: Exchange + 'static>(
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
+    let settings_store = Arc::new(SettingsStore::open("trades.db")?);
+    let seeded = settings_store.load(Settings::from_config(&config))?;
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
         store: Arc::new(PendingStore::new()),
         journal: Arc::new(Journal::open("trades.db")?),
+        settings: Arc::new(std::sync::Mutex::new(seeded)),
+        settings_store,
         http,
     });
 
@@ -819,6 +1041,88 @@ mod tests {
     #[test]
     fn non_command_text_is_not_intercepted() {
         assert!(super::command_response("Trading setup for PENDLE").is_none());
+    }
+
+    #[test]
+    fn settings_card_lists_keys_and_mode() {
+        let settings = crate::settings::Settings {
+            entry_mode: EntryMode::PercentBalance,
+            risk_pct: 1.0,
+            entry_pct: 10.0,
+            entry_fixed_usd: 50.0,
+            max_daily_risk_pct: Some(5.0),
+            leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+        };
+        let text = super::render_settings(&settings);
+        assert!(text.contains("% Balance"));
+        assert!(text.contains("entry_pct"));
+        assert!(text.contains("max_daily_risk_pct"));
+    }
+
+    #[test]
+    fn disabled_cap_renders_as_disabled() {
+        let settings = crate::settings::Settings {
+            entry_mode: EntryMode::RiskBased,
+            risk_pct: 1.0, entry_pct: 10.0, entry_fixed_usd: 50.0,
+            max_daily_risk_pct: None,
+            leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+        };
+        assert!(super::render_settings(&settings).contains("disabled"));
+    }
+
+    #[test]
+    fn settings_keyboard_marks_active_mode() {
+        let markup = super::settings_keyboard(EntryMode::FixedUsd);
+        let row = &markup.inline_keyboard[0];
+        assert!(row[2].text.contains('✓')); // Fixed USD marked
+        assert!(!row[0].text.contains('✓'));
+    }
+
+    #[test]
+    fn entry_mode_callback_parses() {
+        assert_eq!(super::entry_mode_from_callback(super::CB_MODE_PERCENT), Some(EntryMode::PercentBalance));
+        assert_eq!(super::entry_mode_from_callback("nope"), None);
+    }
+
+    fn sample_positions() -> Vec<crate::hyperliquid::OpenPosition> {
+        vec![
+            crate::hyperliquid::OpenPosition {
+                coin: "BTC".into(), is_long: true, size: 0.05, entry_px: 61200.0,
+                unrealized_pnl: 45.2, leverage: 3, liquidation_px: Some(52100.0),
+            },
+            crate::hyperliquid::OpenPosition {
+                coin: "ETH".into(), is_long: false, size: 1.2, entry_px: 3410.0,
+                unrealized_pnl: -12.8, leverage: 2, liquidation_px: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn account_card_lists_positions_and_cap() {
+        let text = super::render_account(1234.56, &sample_positions(), 12.3, Some(5.0));
+        assert!(text.contains("Equity: $1234.56"));
+        assert!(text.contains("Daily risk used:"));
+        assert!(text.contains("Open positions (2):"));
+        assert!(text.contains("BTC"));
+        assert!(text.contains("LONG"));
+        assert!(text.contains("SHORT"));
+        assert!(text.contains("uPnL $+45.20")); // positive sign
+        assert!(text.contains("uPnL $-12.80")); // negative sign
+        assert!(text.contains("liq $52100.00"));
+        assert!(text.contains("liq -")); // ETH has no liquidation price
+    }
+
+    #[test]
+    fn account_card_flat_when_no_positions() {
+        let text = super::render_account(1000.0, &[], 0.0, Some(5.0));
+        assert!(text.contains("Flat"));
+        assert!(!text.contains("Open positions"));
+    }
+
+    #[test]
+    fn account_card_omits_daily_risk_when_cap_disabled() {
+        let text = super::render_account(1000.0, &sample_positions(), 0.0, None);
+        assert!(!text.contains("Daily risk used"));
     }
 
     use crate::hyperliquid::mock::MockExchange;

@@ -44,6 +44,50 @@ pub struct Fill {
     pub fee: f64,
 }
 
+// ── Open position (live account state) ───────────────────────────────────────
+
+/// A currently-open perp position, read from `user_state().asset_positions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenPosition {
+    pub coin: String,
+    pub is_long: bool,
+    pub size: f64,            // absolute size in coin units
+    pub entry_px: f64,        // 0.0 when the exchange reports none
+    pub unrealized_pnl: f64,
+    pub leverage: u32,
+    pub liquidation_px: Option<f64>,
+}
+
+/// Maps raw position fields (as strings from the SDK) into an `OpenPosition`.
+/// Returns `Ok(None)` for a zero-size position (caller skips it). Errors only
+/// when `szi` — the field that defines the position — is malformed; the
+/// display-only fields fall back (`entry_px`/`unrealized_pnl` → 0.0,
+/// `liquidation_px` → None) rather than failing the whole report.
+pub(crate) fn build_open_position(
+    coin: &str,
+    szi: &str,
+    entry_px: Option<&str>,
+    unrealized_pnl: &str,
+    leverage: u32,
+    liquidation_px: Option<&str>,
+) -> anyhow::Result<Option<OpenPosition>> {
+    let signed = szi
+        .parse::<f64>()
+        .map_err(|e| anyhow::anyhow!("cannot parse position szi {szi:?}: {e}"))?;
+    if signed == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(OpenPosition {
+        coin: coin.to_string(),
+        is_long: signed > 0.0,
+        size: signed.abs(),
+        entry_px: entry_px.and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        unrealized_pnl: unrealized_pnl.parse().unwrap_or(0.0),
+        leverage,
+        liquidation_px: liquidation_px.and_then(|s| s.parse().ok()),
+    }))
+}
+
 // ── Exchange trait ────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -63,6 +107,9 @@ pub trait Exchange: Send + Sync {
     /// Used by `process_signal` to skip a new signal when a prior limit entry
     /// for the same coin is still sitting unfilled in the order book.
     async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize>;
+    /// Returns all currently-open perp positions (zero-size entries skipped).
+    /// Reads `user_state().asset_positions`; identical in unified/non-unified modes.
+    async fn open_positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
 }
 
 // ── Mock (test-only) ──────────────────────────────────────────────────────────
@@ -94,6 +141,8 @@ pub mod mock {
         /// Coins that have resting/open orders; each entry is a coin name.
         /// `open_order_count` counts entries matching the queried coin (case-insensitive).
         pub open_orders: Mutex<Vec<String>>,
+        /// Positions returned verbatim by `open_positions`.
+        pub positions: Mutex<Vec<super::OpenPosition>>,
     }
 
     #[async_trait]
@@ -168,6 +217,64 @@ pub mod mock {
                 .filter(|c| c.eq_ignore_ascii_case(coin))
                 .count())
         }
+
+        async fn open_positions(&self) -> anyhow::Result<Vec<super::OpenPosition>> {
+            Ok(self.positions.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn build_open_position_maps_long() {
+        let op = super::build_open_position("BTC", "0.05", Some("61200.0"), "45.2", 3, Some("52100.0"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(op, super::OpenPosition {
+            coin: "BTC".into(), is_long: true, size: 0.05,
+            entry_px: 61200.0, unrealized_pnl: 45.2, leverage: 3,
+            liquidation_px: Some(52100.0),
+        });
+    }
+
+    #[test]
+    fn build_open_position_maps_short_from_negative_szi() {
+        let op = super::build_open_position("ETH", "-1.2", Some("3410.0"), "-12.8", 2, None)
+            .unwrap()
+            .unwrap();
+        assert!(!op.is_long);
+        assert_eq!(op.size, 1.2);
+        assert_eq!(op.liquidation_px, None);
+    }
+
+    #[test]
+    fn build_open_position_skips_zero_size() {
+        assert_eq!(super::build_open_position("BTC", "0", None, "0", 1, None).unwrap(), None);
+    }
+
+    #[test]
+    fn build_open_position_defaults_missing_entry_and_bad_pnl() {
+        let op = super::build_open_position("SOL", "10", None, "not-a-number", 5, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(op.entry_px, 0.0);
+        assert_eq!(op.unrealized_pnl, 0.0);
+    }
+
+    #[test]
+    fn build_open_position_errors_on_bad_szi() {
+        assert!(super::build_open_position("BTC", "xyz", None, "0", 1, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn mock_returns_preset_positions() {
+        use crate::hyperliquid::mock::MockExchange;
+        let exchange = MockExchange::default();
+        exchange.positions.lock().unwrap().push(super::OpenPosition {
+            coin: "BTC".into(), is_long: true, size: 0.05, entry_px: 61200.0,
+            unrealized_pnl: 45.2, leverage: 3, liquidation_px: Some(52100.0),
+        });
+        let positions = super::Exchange::open_positions(&exchange).await.unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].coin, "BTC");
     }
 
     #[test]
@@ -584,5 +691,24 @@ impl Exchange for HyperliquidExchange {
             .iter()
             .filter(|order| order.coin.eq_ignore_ascii_case(coin))
             .count())
+    }
+
+    async fn open_positions(&self) -> anyhow::Result<Vec<OpenPosition>> {
+        let state = self.info.user_state(self.address).await?;
+        let mut positions = Vec::new();
+        for asset_position in &state.asset_positions {
+            let position = &asset_position.position;
+            if let Some(open_position) = build_open_position(
+                &position.coin,
+                &position.szi,
+                position.entry_px.as_deref(),
+                &position.unrealized_pnl,
+                position.leverage.value,
+                position.liquidation_px.as_deref(),
+            )? {
+                positions.push(open_position);
+            }
+        }
+        Ok(positions)
     }
 }

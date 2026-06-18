@@ -4,6 +4,7 @@ mod journal;
 mod llm_parser;
 mod parser;
 mod risk;
+mod settings;
 mod sizing;
 mod state;
 mod stats;
