@@ -23,6 +23,3 @@ clippy:         ## Lint with clippy
 
 equity:         ## Check how much collateral the bot will see (read-only API call)
 	@bash scripts/check-equity.sh
-
-signal:         ## Send clipboard signal to the bot
-	@bash scripts/send-signal.sh

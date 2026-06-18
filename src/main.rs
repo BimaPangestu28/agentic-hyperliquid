@@ -1,6 +1,5 @@
 mod config;
 mod hyperliquid;
-mod ingest;
 mod journal;
 mod llm_parser;
 mod parser;
