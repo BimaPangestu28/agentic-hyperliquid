@@ -269,6 +269,47 @@ async fn on_message<E: Exchange + 'static>(
     if !context.config.is_allowed(user_id) {
         return Ok(()); // ignore non-allowlisted users
     }
+
+    // Photo messages: parse the screenshot via OpenAI vision.
+    // Must run BEFORE the text extraction early-return — photos have no `.text()`.
+    if let Some(photos) = message.photo() {
+        // Take the last (largest) photo size.
+        let Some(photo) = photos.last() else {
+            return Ok(());
+        };
+        let data_url = match download_photo_as_data_url(&bot, &photo.file.id).await {
+            Ok(url) => url,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not download image: {error}")).await?;
+                return Ok(());
+            }
+        };
+        let api_key = match &context.config.openai_api_key {
+            Some(key) => key,
+            None => {
+                bot.send_message(message.chat.id, "Image parsing needs OPENAI_API_KEY set in .env.").await?;
+                return Ok(());
+            }
+        };
+        match crate::llm_parser::parse_setups_llm_image(
+            &context.http,
+            &context.config.openai_base_url,
+            api_key,
+            &context.config.openai_vision_model,
+            &data_url,
+        )
+        .await
+        {
+            Ok(setups) => {
+                process_setups(&bot, &context, message.chat.id, setups).await?;
+            }
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not read signal from image: {error}")).await?;
+            }
+        }
+        return Ok(());
+    }
+
     let text = match message.text() {
         Some(text) => text,
         None => return Ok(()),
@@ -301,42 +342,23 @@ async fn on_message<E: Exchange + 'static>(
     process_signal(&bot, &context, message.chat.id, text).await
 }
 
-/// Parses a trading-setup card and sends confirmation cards to `chat_id`.
+/// Processes a list of already-parsed `TradeSetup`s: fetches equity once, then
+/// sends a sized confirmation card to `chat_id` for each valid setup.
 ///
-/// This is the core signal-processing pipeline used by the Telegram message
-/// handler (parse → size → confirmation cards).
+/// This is factored out of `process_signal` so it can be shared with the
+/// image-parsing path (which calls the OpenAI vision API instead of DeepSeek).
 ///
 /// @param bot - The Telegram bot instance for sending messages
 /// @param context - Shared bot state (config, exchange, store, journal)
 /// @param chat_id - The Telegram chat that will receive the confirmation cards
-/// @param text - The raw trading-setup card text to parse and process
+/// @param setups - Pre-parsed and validated trade setups to process
 /// @returns `Ok(())` on success, or an error if a critical step fails
-pub async fn process_signal<E: Exchange + 'static>(
+pub async fn process_setups<E: Exchange + 'static>(
     bot: &Bot,
     context: &BotContext<E>,
     chat_id: teloxide::types::ChatId,
-    text: &str,
+    setups: Vec<crate::parser::TradeSetup>,
 ) -> anyhow::Result<()> {
-    let parse_result = match &context.config.deepseek_api_key {
-        Some(api_key) => {
-            let attempt = crate::llm_parser::parse_setups_llm(
-                &context.http, &context.config.deepseek_base_url, api_key, &context.config.deepseek_model, text,
-            );
-            crate::llm_parser::parse_with_fallback(attempt, text).await
-        }
-        None => crate::parser::parse_setup(text).map(|s| (vec![s], crate::llm_parser::ParseSource::RegexFallback)),
-    };
-    let setups = match parse_result {
-        Ok((setups, source)) => {
-            tracing::info!(?source, count = setups.len(), "parsed setups");
-            setups
-        }
-        Err(error) => {
-            bot.send_message(chat_id, format!("Could not parse setup: {error}")).await?;
-            return Ok(());
-        }
-    };
-
     // Fetch equity once for all signals.
     let equity = match context.exchange.equity().await {
         Ok(value) => value,
@@ -478,6 +500,66 @@ pub async fn process_signal<E: Exchange + 'static>(
         );
     }
     Ok(())
+}
+
+/// Parses a trading-setup card and sends confirmation cards to `chat_id`.
+///
+/// This is the core signal-processing pipeline used by the Telegram message
+/// handler (parse → size → confirmation cards).
+///
+/// @param bot - The Telegram bot instance for sending messages
+/// @param context - Shared bot state (config, exchange, store, journal)
+/// @param chat_id - The Telegram chat that will receive the confirmation cards
+/// @param text - The raw trading-setup card text to parse and process
+/// @returns `Ok(())` on success, or an error if a critical step fails
+pub async fn process_signal<E: Exchange + 'static>(
+    bot: &Bot,
+    context: &BotContext<E>,
+    chat_id: teloxide::types::ChatId,
+    text: &str,
+) -> anyhow::Result<()> {
+    let parse_result = match &context.config.deepseek_api_key {
+        Some(api_key) => {
+            let attempt = crate::llm_parser::parse_setups_llm(
+                &context.http, &context.config.deepseek_base_url, api_key, &context.config.deepseek_model, text,
+            );
+            crate::llm_parser::parse_with_fallback(attempt, text).await
+        }
+        None => crate::parser::parse_setup(text).map(|s| (vec![s], crate::llm_parser::ParseSource::RegexFallback)),
+    };
+    let setups = match parse_result {
+        Ok((setups, source)) => {
+            tracing::info!(?source, count = setups.len(), "parsed setups");
+            setups
+        }
+        Err(error) => {
+            bot.send_message(chat_id, format!("Could not parse setup: {error}")).await?;
+            return Ok(());
+        }
+    };
+
+    process_setups(bot, context, chat_id, setups).await
+}
+
+/// Downloads a Telegram photo by file ID and returns it as a base64 data URL.
+///
+/// IMPORTANT: The file download URL contains the bot token and MUST NOT be
+/// logged. This function intentionally avoids any tracing/logging of the URL.
+///
+/// @param bot - The Telegram bot instance (used to call getFile and for the token)
+/// @param file_id - The `file_id` string from the `FileMeta` of the chosen `PhotoSize`
+/// @returns A `data:image/jpeg;base64,...` string on success
+/// @throws anyhow::Error - When the Telegram API or download fails
+async fn download_photo_as_data_url(bot: &Bot, file_id: &str) -> anyhow::Result<String> {
+    use base64::Engine;
+    let file = bot.get_file(file_id).await?;
+    // Construct the download URL using the bot token — NEVER log this URL.
+    let url = format!("https://api.telegram.org/file/bot{}/{}", bot.token(), file.path);
+    let bytes = reqwest::get(&url).await?.error_for_status()?.bytes().await?;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
 }
 
 async fn on_callback<E: Exchange + 'static>(

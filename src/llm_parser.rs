@@ -144,6 +144,55 @@ pub async fn parse_setups_llm(
     parse_llm_content_multi(content)
 }
 
+/// Builds the OpenAI-compatible chat request body for a vision (image) parse.
+/// `image_data_url` is a `data:image/...;base64,...` string.
+pub fn build_vision_body(model: &str, image_data_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Extract all trading setups visible in this image as the specified JSON."},
+                {"type": "image_url", "image_url": {"url": image_data_url}}
+            ]}
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "stream": false
+    })
+}
+
+/// Sends an image to an OpenAI-compatible vision model and returns parsed setups.
+///
+/// @param http - The HTTP client to use for the request
+/// @param base_url - Base URL for the OpenAI-compatible API (e.g. `https://api.openai.com/v1`)
+/// @param api_key - OpenAI API key for bearer auth
+/// @param vision_model - Vision model identifier (e.g. `gpt-4o-mini`)
+/// @param image_data_url - A `data:image/...;base64,...` string with the encoded image
+/// @returns Parsed `TradeSetup` list on success
+/// @throws anyhow::Error - When the API returns an error or the response is malformed
+pub async fn parse_setups_llm_image(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    vision_model: &str,
+    image_data_url: &str,
+) -> anyhow::Result<Vec<crate::parser::TradeSetup>> {
+    let body = build_vision_body(vision_model, image_data_url);
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let response = http.post(&url).bearer_auth(api_key).json(&body).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("OpenAI vision API error {status}: {text}");
+    }
+    let value: serde_json::Value = response.json().await?;
+    let content = value["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("OpenAI vision response missing message content"))?;
+    parse_llm_content_multi(content)
+}
+
 /// Tries the LLM (multi) future first; on ANY error, falls back to the regex
 /// parser (single setup wrapped in a `Vec`).
 ///
@@ -214,5 +263,15 @@ mod tests {
         assert_eq!(source, ParseSource::Llm);
         assert_eq!(setups.len(), 1);
         assert_eq!(setups[0].coin, "ETH");
+    }
+
+    #[test]
+    fn vision_body_includes_image_and_model() {
+        let body = build_vision_body("gpt-4o-mini", "data:image/png;base64,AAAA");
+        assert_eq!(body["model"], "gpt-4o-mini");
+        let serialized = body.to_string();
+        assert!(serialized.contains("image_url"));
+        assert!(serialized.contains("data:image/png;base64,AAAA"));
+        assert!(serialized.contains("json_object"));
     }
 }

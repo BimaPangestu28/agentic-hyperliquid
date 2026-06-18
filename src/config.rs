@@ -38,6 +38,13 @@ pub struct Config {
     /// of equity (e.g. `5.0` = 5%). Confirmed trades that would exceed this cap
     /// are rejected without executing. `None` disables the cap.
     pub max_daily_risk_pct: Option<f64>,
+    /// API key for OpenAI (used for vision/image parsing). When `None`, image
+    /// parsing is disabled and the bot will prompt the user to set it.
+    pub openai_api_key: Option<String>,
+    /// Base URL for the OpenAI-compatible vision API.
+    pub openai_base_url: String,
+    /// Vision model to use (e.g. `gpt-4o-mini`).
+    pub openai_vision_model: String,
 }
 
 impl Config {
@@ -129,6 +136,9 @@ pub fn from_env() -> anyhow::Result<Config> {
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false),
         max_daily_risk_pct: std::env::var("MAX_DAILY_RISK_PCT").ok().and_then(|v| v.parse().ok()),
+        openai_api_key: std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()),
+        openai_base_url: std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+        openai_vision_model: std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
     })
 }
 
@@ -158,6 +168,9 @@ mod tests {
             account_address: None,
             unified_account: false,
             max_daily_risk_pct: None,
+            openai_api_key: None,
+            openai_base_url: "https://api.openai.com/v1".into(),
+            openai_vision_model: "gpt-4o-mini".into(),
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));
