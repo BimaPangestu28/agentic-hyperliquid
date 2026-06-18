@@ -29,6 +29,8 @@ unreachable, or the response is invalid for any reason, the bot automatically fa
 back to the built-in deterministic regex parser. Trade sizing, risk management, and
 execution logic are always deterministic regardless of which parser is used.
 
+Send a screenshot of a signal and the bot reads it via OpenAI vision (`OPENAI_VISION_MODEL`, default gpt-4o-mini); requires `OPENAI_API_KEY`. Text paste still works (DeepSeek + regex).
+
 ## Configuration
 See `.env.example`. Defaults: risk 1%/trade, leverage 2/3/5x, fill timeout 300s.
 `MAX_DAILY_RISK_PCT` caps cumulative daily risk (% equity); confirmed trades exceeding it are skipped.
