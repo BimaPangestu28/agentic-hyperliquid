@@ -7,6 +7,7 @@ with native SL/TP brackets on the Hyperliquid perpetuals DEX.
 - Rust (stable, edition 2021)
 - A Hyperliquid **API/agent wallet** private key
 - A Telegram bot token (from @BotFather) and your numeric Telegram user id
+- When using an API/agent wallet, set `HYPERLIQUID_ACCOUNT_ADDRESS` to your master account address (the one that holds funds); the agent key only signs — it holds no balance of its own.
 
 ## Setup
 1. `cp .env.example .env` and fill in the values.

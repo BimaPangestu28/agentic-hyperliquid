@@ -26,6 +26,10 @@ pub struct Config {
     pub deepseek_api_key: Option<String>,
     pub deepseek_base_url: String,
     pub deepseek_model: String,
+    /// Master account address (0x…) that holds funds and positions.
+    /// Required when `agent_key` is an API/agent wallet; if unset the bot queries
+    /// the agent wallet's own address and equity will read 0.
+    pub account_address: Option<String>,
 }
 
 impl Config {
@@ -112,6 +116,7 @@ pub fn from_env() -> anyhow::Result<Config> {
         deepseek_api_key: std::env::var("DEEPSEEK_API_KEY").ok().filter(|s| !s.is_empty()),
         deepseek_base_url: std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
         deepseek_model: std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
+        account_address: std::env::var("HYPERLIQUID_ACCOUNT_ADDRESS").ok().filter(|s| !s.is_empty()),
     })
 }
 
@@ -138,6 +143,7 @@ mod tests {
             deepseek_api_key: None,
             deepseek_base_url: "https://api.deepseek.com".into(),
             deepseek_model: "deepseek-chat".into(),
+            account_address: None,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));

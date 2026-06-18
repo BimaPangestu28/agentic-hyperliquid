@@ -261,7 +261,23 @@ impl HyperliquidExchange {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid HYPERLIQUID_AGENT_KEY: {e}"))?;
 
-        let address: H160 = wallet.address();
+        // Derive signing address before wallet is moved into ExchangeClient.
+        let signing_address: H160 = wallet.address();
+
+        // Use the master account address for info queries (equity, positions).
+        // Agent/API wallets hold no balance; funds live on the master account.
+        let query_address: H160 = match &config.account_address {
+            Some(addr) => addr
+                .parse::<H160>()
+                .map_err(|e| anyhow::anyhow!("invalid HYPERLIQUID_ACCOUNT_ADDRESS: {e}"))?,
+            None => {
+                tracing::warn!(
+                    "HYPERLIQUID_ACCOUNT_ADDRESS unset; querying the agent wallet's own address \
+                     — equity/positions will be 0 if you use an API/agent wallet"
+                );
+                signing_address
+            }
+        };
 
         let info = InfoClient::new(None, Some(base_url)).await?;
         let exchange =
@@ -270,7 +286,7 @@ impl HyperliquidExchange {
         Ok(Self {
             info,
             exchange,
-            address,
+            address: query_address,
         })
     }
 }
