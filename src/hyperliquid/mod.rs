@@ -65,6 +65,18 @@ pub trait Exchange: Send + Sync {
     async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize>;
 }
 
+// ── Test utilities ────────────────────────────────────────────────────────────
+
+/// Re-export of [`mock::MockExchange`] under a stable path so sibling modules
+/// (e.g. `api::tests`) can reach it without depending on the internal `mock`
+/// module layout.
+///
+/// Gated on `test` builds only — never compiled into production binaries.
+#[cfg(test)]
+pub mod testing {
+    pub use super::mock::MockExchange;
+}
+
 // ── Mock (test-only) ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -94,6 +106,15 @@ pub mod mock {
         /// Coins that have resting/open orders; each entry is a coin name.
         /// `open_order_count` counts entries matching the queried coin (case-insensitive).
         pub open_orders: Mutex<Vec<String>>,
+    }
+
+    impl MockExchange {
+        /// Constructs a `MockExchange` that returns `equity` from [`Exchange::equity`].
+        ///
+        /// All other fields default to their zero/empty values via [`Default`].
+        pub fn with_equity(equity: f64) -> Self {
+            Self { equity, ..Self::default() }
+        }
     }
 
     #[async_trait]

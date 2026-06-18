@@ -23,4 +23,5 @@ tower-http = { version = "0.6", features = ["trace"] }
 base64 = "0.22"
 
 [dev-dependencies]
-# (unit tests use std only)
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
