@@ -114,6 +114,18 @@ impl Journal {
         Ok(())
     }
 
+    /// Sum of `risk_amount` over trades opened at or after `since_ts` (unix seconds).
+    /// Used to enforce the daily risk cap. NULL/absent risk_amount counts as 0.
+    pub fn risk_used_since(&self, since_ts: i64) -> anyhow::Result<f64> {
+        let connection = self.connection.lock().unwrap();
+        let total: f64 = connection.query_row(
+            "SELECT COALESCE(SUM(risk_amount), 0.0) FROM trades WHERE opened_at >= ?1",
+            rusqlite::params![since_ts],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+
     /// Returns all journaled trade records ordered by entry time, for stats attribution.
     pub fn all_trades(&self) -> anyhow::Result<Vec<TradeRecord>> {
         let connection = self.connection.lock().unwrap();
@@ -163,5 +175,45 @@ mod tests {
         };
         journal.record(&plan, Some(42), Some(8), Some("swing"), Some(2.8), "Moderate", 1_700_000_000).unwrap();
         assert_eq!(journal.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn risk_used_since_sums_only_trades_at_or_after_cutoff() {
+        let journal = Journal::open_in_memory().unwrap();
+
+        // Build a helper closure so we can easily vary risk_amount and opened_at.
+        let make_plan = |coin: &str, risk_amount: f64| ExecutionPlan {
+            coin: coin.into(),
+            direction: Direction::Long,
+            size: 10.0,
+            entry: 1.0,
+            leverage: 3,
+            notional: 10.0,
+            margin: 3.33,
+            risk_amount,
+            liquidation_price: 0.66,
+            stop_loss: BracketLeg { price: 0.90, size: 10.0 },
+            take_profits: vec![],
+            warnings: vec![],
+        };
+
+        let cutoff: i64 = 1_700_000_000;
+
+        // Trade BEFORE the cutoff — should NOT be counted.
+        let plan_before = make_plan("BTC", 25.0);
+        journal.record(&plan_before, None, None, None, None, "Moderate", cutoff - 1).unwrap();
+
+        // Two trades AT and AFTER the cutoff — both should be counted.
+        let plan_at = make_plan("ETH", 30.0);
+        journal.record(&plan_at, None, None, None, None, "Moderate", cutoff).unwrap();
+
+        let plan_after = make_plan("SOL", 15.0);
+        journal.record(&plan_after, None, None, None, None, "Moderate", cutoff + 3600).unwrap();
+
+        let risk_used = journal.risk_used_since(cutoff).unwrap();
+        assert!(
+            (risk_used - 45.0).abs() < 1e-9,
+            "expected 45.0 but got {risk_used}"
+        );
     }
 }

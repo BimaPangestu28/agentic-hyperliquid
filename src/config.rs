@@ -42,6 +42,10 @@ pub struct Config {
     /// Telegram chat id to receive confirmation cards from ingest signals.
     /// Defaults to the first entry in `allowed_user_ids` when `None`.
     pub ingest_chat_id: Option<i64>,
+    /// Maximum cumulative risk to commit per UTC day, expressed as a percentage
+    /// of equity (e.g. `5.0` = 5%). Confirmed trades that would exceed this cap
+    /// are rejected without executing. `None` disables the cap.
+    pub max_daily_risk_pct: Option<f64>,
 }
 
 impl Config {
@@ -147,6 +151,7 @@ pub fn from_env() -> anyhow::Result<Config> {
         ingest_port: std::env::var("INGEST_PORT").ok().and_then(|v| v.parse().ok()),
         ingest_token: std::env::var("INGEST_TOKEN").ok().filter(|s| !s.is_empty()),
         ingest_chat_id: std::env::var("INGEST_CHAT_ID").ok().and_then(|v| v.parse().ok()),
+        max_daily_risk_pct: std::env::var("MAX_DAILY_RISK_PCT").ok().and_then(|v| v.parse().ok()),
     })
 }
 
@@ -178,6 +183,7 @@ mod tests {
             ingest_port: None,
             ingest_token: None,
             ingest_chat_id: None,
+            max_daily_risk_pct: None,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));

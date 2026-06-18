@@ -31,6 +31,7 @@ execution logic are always deterministic regardless of which parser is used.
 
 ## Configuration
 See `.env.example`. Defaults: risk 1%/trade, leverage 2/3/5x, fill timeout 300s.
+`MAX_DAILY_RISK_PCT` caps cumulative daily risk (% equity); confirmed trades exceeding it are skipped.
 
 ## Safety
 - Uses an agent wallet, never your main wallet key.
