@@ -5,6 +5,8 @@
 
 use crate::config::LeverageMap;
 use crate::sizing::EntryMode;
+use rusqlite::Connection;
+use std::sync::Mutex;
 
 /// The full set of runtime-tunable trading parameters. Cloned out of the
 /// shared lock before use; never mutated in place across an await.
@@ -78,6 +80,103 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
     Ok(next)
 }
 
+const SETTINGS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)";
+
+/// SQLite-backed key-value store for `Settings`, sharing the `trades.db` file
+/// with the trade journal (separate connection). One row per field.
+pub struct SettingsStore {
+    connection: Mutex<Connection>,
+}
+
+impl SettingsStore {
+    fn from_connection(connection: Connection) -> anyhow::Result<Self> {
+        connection.execute(SETTINGS_SCHEMA, [])?;
+        Ok(Self { connection: Mutex::new(connection) })
+    }
+
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn put(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.connection.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let mut rows = statement.query(rusqlite::params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes every field of `settings` to the table (INSERT OR REPLACE).
+    pub fn persist(&self, settings: &Settings) -> anyhow::Result<()> {
+        self.put("entry_mode", settings.entry_mode.as_str())?;
+        self.put("risk_pct", &settings.risk_pct.to_string())?;
+        self.put("entry_pct", &settings.entry_pct.to_string())?;
+        self.put("entry_fixed_usd", &settings.entry_fixed_usd.to_string())?;
+        let cap = match settings.max_daily_risk_pct {
+            Some(value) => value.to_string(),
+            None => String::new(),
+        };
+        self.put("max_daily_risk_pct", &cap)?;
+        self.put("leverage_conservative", &settings.leverage.conservative.to_string())?;
+        self.put("leverage_moderate", &settings.leverage.moderate.to_string())?;
+        self.put("leverage_aggressive", &settings.leverage.aggressive.to_string())?;
+        Ok(())
+    }
+
+    /// Returns the persisted settings, falling back to `seed` for any missing
+    /// key. Missing keys are written back so the table becomes fully populated
+    /// (first-boot seeding). After this, the DB is the source of truth.
+    pub fn load(&self, seed: Settings) -> anyhow::Result<Settings> {
+        let mut resolved = seed;
+        if let Some(raw) = self.get("entry_mode")? {
+            if let Some(mode) = EntryMode::from_str_opt(&raw) {
+                resolved.entry_mode = mode;
+            }
+        }
+        if let Some(raw) = self.get("risk_pct")? {
+            if let Ok(value) = raw.parse() { resolved.risk_pct = value; }
+        }
+        if let Some(raw) = self.get("entry_pct")? {
+            if let Ok(value) = raw.parse() { resolved.entry_pct = value; }
+        }
+        if let Some(raw) = self.get("entry_fixed_usd")? {
+            if let Ok(value) = raw.parse() { resolved.entry_fixed_usd = value; }
+        }
+        if let Some(raw) = self.get("max_daily_risk_pct")? {
+            resolved.max_daily_risk_pct = if raw.trim().is_empty() { None } else { raw.parse().ok() };
+        }
+        if let Some(raw) = self.get("leverage_conservative")? {
+            if let Ok(value) = raw.parse() { resolved.leverage.conservative = value; }
+        }
+        if let Some(raw) = self.get("leverage_moderate")? {
+            if let Ok(value) = raw.parse() { resolved.leverage.moderate = value; }
+        }
+        if let Some(raw) = self.get("leverage_aggressive")? {
+            if let Ok(value) = raw.parse() { resolved.leverage.aggressive = value; }
+        }
+        // Seed any missing keys and normalize storage.
+        self.persist(&resolved)?;
+        Ok(resolved)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +230,40 @@ mod tests {
     #[test]
     fn rejects_leverage_below_one() {
         assert!(apply_setting(&sample(), "leverage_moderate", "0").is_err());
+    }
+
+    #[test]
+    fn load_seeds_from_defaults_when_empty() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        let resolved = store.load(sample()).unwrap();
+        assert_eq!(resolved.risk_pct, 1.0);
+        // Seeding wrote the row back.
+        assert_eq!(store.get("risk_pct").unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn persisted_value_overrides_seed_on_reload() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        store.load(sample()).unwrap(); // seed
+        let mut changed = sample();
+        changed.entry_pct = 25.0;
+        changed.entry_mode = EntryMode::PercentBalance;
+        store.persist(&changed).unwrap();
+
+        // A reload with a *different* seed must still return the persisted values.
+        let mut other_seed = sample();
+        other_seed.entry_pct = 99.0;
+        let resolved = store.load(other_seed).unwrap();
+        assert_eq!(resolved.entry_pct, 25.0);
+        assert_eq!(resolved.entry_mode, EntryMode::PercentBalance);
+    }
+
+    #[test]
+    fn disabled_cap_round_trips_as_none() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        let mut seed = sample();
+        seed.max_daily_risk_pct = None;
+        store.persist(&seed).unwrap();
+        assert_eq!(store.load(sample()).unwrap().max_daily_risk_pct, None);
     }
 }
