@@ -20,6 +20,20 @@ pub struct Settings {
     pub leverage: LeverageMap,
 }
 
+impl Settings {
+    /// Builds the seed settings from the startup `Config` (env-derived values).
+    pub fn from_config(config: &crate::config::Config) -> Settings {
+        Settings {
+            entry_mode: config.entry_mode,
+            risk_pct: config.risk_pct,
+            entry_pct: config.entry_pct,
+            entry_fixed_usd: config.entry_fixed_usd,
+            max_daily_risk_pct: config.max_daily_risk_pct,
+            leverage: config.leverage,
+        }
+    }
+}
+
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
 max_daily_risk_pct, leverage_conservative, leverage_moderate, leverage_aggressive";

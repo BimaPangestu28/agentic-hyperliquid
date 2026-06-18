@@ -1,5 +1,7 @@
 //! Loads runtime configuration from environment variables.
 
+use crate::sizing::EntryMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Testnet,
@@ -20,6 +22,12 @@ pub struct Config {
     pub agent_key: String,
     pub network: Network,
     pub risk_pct: f64,
+    /// Default entry sizing mode; seeds the runtime Settings on first boot.
+    pub entry_mode: EntryMode,
+    /// Percent-of-equity notional for `EntryMode::PercentBalance` (seed).
+    pub entry_pct: f64,
+    /// Fixed USD notional for `EntryMode::FixedUsd` (seed).
+    pub entry_fixed_usd: f64,
     pub leverage: LeverageMap,
     pub entry_fill_timeout_secs: u64,
     pub confidence_gate: Option<u8>,
@@ -121,6 +129,13 @@ pub fn from_env() -> anyhow::Result<Config> {
         agent_key,
         network,
         risk_pct: parse_env_or("RISK_PCT", 1.0_f64)?,
+        entry_mode: match std::env::var("ENTRY_MODE").as_deref() {
+            Ok("percent") => EntryMode::PercentBalance,
+            Ok("fixed") => EntryMode::FixedUsd,
+            _ => EntryMode::RiskBased,
+        },
+        entry_pct: parse_env_or("ENTRY_PCT", 10.0_f64)?,
+        entry_fixed_usd: parse_env_or("ENTRY_FIXED_USD", 50.0_f64)?,
         leverage: LeverageMap {
             conservative: parse_env_or("LEVERAGE_CONSERVATIVE", 2_u32)?,
             moderate: parse_env_or("LEVERAGE_MODERATE", 3_u32)?,
@@ -159,6 +174,9 @@ mod tests {
             agent_key: "k".into(),
             network: Network::Testnet,
             risk_pct: 1.0,
+            entry_mode: crate::sizing::EntryMode::RiskBased,
+            entry_pct: 10.0,
+            entry_fixed_usd: 50.0,
             leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
             confidence_gate: None,
