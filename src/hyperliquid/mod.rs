@@ -44,6 +44,21 @@ pub struct Fill {
     pub fee: f64,
 }
 
+// ── OpenPosition (live perp position snapshot) ────────────────────────────────
+
+/// A single open perp position, derived from `user_state.asset_positions`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OpenPosition {
+    pub coin: String,
+    pub direction: String, // "long" | "short"
+    pub size: f64,         // absolute size
+    pub entry_px: f64,
+    pub mark_px: f64,
+    pub unrealized_pnl: f64,
+    pub leverage: f64,
+    pub notional: f64, // position value in USD
+}
+
 // ── Exchange trait ────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -58,6 +73,8 @@ pub trait Exchange: Send + Sync {
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
     /// Returns all fills for the account from the exchange's fill history.
     async fn user_fills(&self) -> anyhow::Result<Vec<Fill>>;
+    /// Open perp positions with mark price and unrealized PnL.
+    async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
     /// Returns the number of resting/open orders for `coin` (case-insensitive).
     ///
     /// Used by `process_signal` to skip a new signal when a prior limit entry
@@ -90,6 +107,7 @@ pub mod mock {
     /// - `simulated_position` overrides `position_size` when `Some`; otherwise
     ///   the size is derived by summing recorded entry orders for the coin.
     /// - `fills` is returned verbatim by `user_fills`.
+    /// - `positions` is returned verbatim by `positions()`; seed via `set_positions`.
     #[derive(Default)]
     pub struct MockExchange {
         pub equity: f64,
@@ -106,6 +124,8 @@ pub mod mock {
         /// Coins that have resting/open orders; each entry is a coin name.
         /// `open_order_count` counts entries matching the queried coin (case-insensitive).
         pub open_orders: Mutex<Vec<String>>,
+        /// Pre-loaded open positions returned by `positions()`.
+        pub positions: Mutex<Vec<super::OpenPosition>>,
     }
 
     impl MockExchange {
@@ -114,6 +134,17 @@ pub mod mock {
         /// All other fields default to their zero/empty values via [`Default`].
         pub fn with_equity(equity: f64) -> Self {
             Self { equity, ..Self::default() }
+        }
+
+        /// Constructs a `MockExchange` with all-default fields, suitable for
+        /// general-purpose tests that do not need a specific equity value.
+        pub fn new_for_test() -> Self {
+            Self::default()
+        }
+
+        /// Seeds the open positions returned by `positions()`.
+        pub fn set_positions(&self, open_positions: Vec<super::OpenPosition>) {
+            *self.positions.lock().unwrap() = open_positions;
         }
     }
 
@@ -178,6 +209,10 @@ pub mod mock {
 
         async fn user_fills(&self) -> anyhow::Result<Vec<super::Fill>> {
             Ok(self.fills.lock().unwrap().clone())
+        }
+
+        async fn positions(&self) -> anyhow::Result<Vec<super::OpenPosition>> {
+            Ok(self.positions.lock().unwrap().clone())
         }
 
         async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
@@ -246,6 +281,23 @@ pub mod mock {
         exchange.open_orders.lock().unwrap().push("ETH".to_string());
         assert_eq!(exchange.open_order_count("BTC").await.unwrap(), 2);
         assert_eq!(exchange.open_order_count("SOL").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mock_returns_seeded_positions() {
+        let mock = MockExchange::new_for_test();
+        let p = super::OpenPosition {
+            coin: "ETH".into(),
+            direction: "long".into(),
+            size: 1.0,
+            entry_px: 2000.0,
+            mark_px: 2100.0,
+            unrealized_pnl: 100.0,
+            leverage: 5.0,
+            notional: 2100.0,
+        };
+        mock.set_positions(vec![p.clone()]);
+        assert_eq!(mock.positions().await.unwrap(), vec![p]);
     }
 }
 
@@ -592,6 +644,53 @@ impl Exchange for HyperliquidExchange {
             })
             .collect();
         Ok(fills)
+    }
+
+    /// Returns all open perp positions with mark price and unrealized PnL.
+    ///
+    /// Reads `asset_positions` from `user_state`, skips flat positions (`szi == 0`),
+    /// and derives `mark_px` as `position_value / |szi|` since the SDK does not
+    /// expose a dedicated mark-price field on the position snapshot.
+    ///
+    /// # SDK field verification
+    /// Fields confirmed from `hyperliquid_rust_sdk-0.6.0/src/info/sub_structs.rs`:
+    /// - `PositionData::szi: String`
+    /// - `PositionData::entry_px: Option<String>`
+    /// - `PositionData::position_value: String`
+    /// - `PositionData::unrealized_pnl: String`
+    /// - `PositionData::leverage: Leverage { value: u32, .. }`
+    /// - `PositionData::coin: String`
+    async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>> {
+        let state = self.info.user_state(self.address).await?;
+        let mut open_positions = Vec::new();
+        for asset_position in state.asset_positions.iter() {
+            let position_data = &asset_position.position;
+            let signed_size: f64 = position_data.szi.parse().unwrap_or(0.0);
+            if signed_size == 0.0 {
+                continue;
+            }
+            let entry_px = position_data
+                .entry_px
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let notional: f64 = position_data.position_value.parse().unwrap_or(0.0);
+            let unrealized_pnl: f64 = position_data.unrealized_pnl.parse().unwrap_or(0.0);
+            let leverage: f64 = position_data.leverage.value as f64;
+            let size = signed_size.abs();
+            let mark_px = if size > 0.0 { notional / size } else { 0.0 };
+            open_positions.push(OpenPosition {
+                coin: position_data.coin.clone(),
+                direction: if signed_size >= 0.0 { "long".into() } else { "short".into() },
+                size,
+                entry_px,
+                mark_px,
+                unrealized_pnl,
+                leverage,
+                notional,
+            });
+        }
+        Ok(open_positions)
     }
 
     /// Returns the number of resting/open orders for `coin` (case-insensitive).
