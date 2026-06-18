@@ -58,6 +58,11 @@ pub trait Exchange: Send + Sync {
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
     /// Returns all fills for the account from the exchange's fill history.
     async fn user_fills(&self) -> anyhow::Result<Vec<Fill>>;
+    /// Returns the number of resting/open orders for `coin` (case-insensitive).
+    ///
+    /// Used by `process_signal` to skip a new signal when a prior limit entry
+    /// for the same coin is still sitting unfilled in the order book.
+    async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize>;
 }
 
 // ── Mock (test-only) ──────────────────────────────────────────────────────────
@@ -86,6 +91,9 @@ pub mod mock {
         pub simulated_position: Mutex<Option<f64>>,
         /// Pre-loaded fills returned by `user_fills`.
         pub fills: Mutex<Vec<super::Fill>>,
+        /// Coins that have resting/open orders; each entry is a coin name.
+        /// `open_order_count` counts entries matching the queried coin (case-insensitive).
+        pub open_orders: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -150,6 +158,16 @@ pub mod mock {
         async fn user_fills(&self) -> anyhow::Result<Vec<super::Fill>> {
             Ok(self.fills.lock().unwrap().clone())
         }
+
+        async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
+            Ok(self
+                .open_orders
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.eq_ignore_ascii_case(coin))
+                .count())
+        }
     }
 
     #[test]
@@ -198,6 +216,16 @@ pub mod mock {
         assert_eq!(exchange.entries.lock().unwrap().len(), 1);
         assert_eq!(exchange.position_size("PENDLE").await.unwrap(), 10.0);
     }
+
+    #[tokio::test]
+    async fn mock_open_order_count_filters_by_coin() {
+        let exchange = MockExchange::default();
+        exchange.open_orders.lock().unwrap().push("BTC".to_string());
+        exchange.open_orders.lock().unwrap().push("btc".to_string());
+        exchange.open_orders.lock().unwrap().push("ETH".to_string());
+        assert_eq!(exchange.open_order_count("BTC").await.unwrap(), 2);
+        assert_eq!(exchange.open_order_count("SOL").await.unwrap(), 0);
+    }
 }
 
 // ── Real Hyperliquid implementation ───────────────────────────────────────────
@@ -208,6 +236,7 @@ use ethers::types::H160;
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
     ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketOrderParams,
+    OpenOrdersResponse,
 };
 
 /// Parses an `ExchangeResponseStatus` returned by the SDK's `order` / `market_open`
@@ -542,5 +571,18 @@ impl Exchange for HyperliquidExchange {
             })
             .collect();
         Ok(fills)
+    }
+
+    /// Returns the number of resting/open orders for `coin` (case-insensitive).
+    ///
+    /// Queries the account's full open-order list and filters by coin name so
+    /// `process_signal` can skip a new signal when an unfilled limit entry for
+    /// the same coin is already sitting in the book.
+    async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
+        let orders: Vec<OpenOrdersResponse> = self.info.open_orders(self.address).await?;
+        Ok(orders
+            .iter()
+            .filter(|order| order.coin.eq_ignore_ascii_case(coin))
+            .count())
     }
 }
