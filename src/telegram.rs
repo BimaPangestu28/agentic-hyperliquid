@@ -286,8 +286,7 @@ pub struct BotContext<E: Exchange + 'static> {
 /// First whitespace-separated token of `text`, lowercased, with any @botname
 /// suffix stripped. Returns "" when there is no token.
 fn first_command_word(text: &str) -> String {
-    text.trim()
-        .split_whitespace()
+    text.split_whitespace()
         .next()
         .unwrap_or("")
         .split('@')
@@ -304,7 +303,7 @@ fn command_response(text: &str) -> Option<String> {
         return None;
     }
     // Take the command word without args, strip a possible @botname suffix, lowercase.
-    let command = trimmed
+    let command = text
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -390,7 +389,6 @@ async fn on_message<E: Exchange + 'static>(
     // pure command_response function. Intercept before command_response so it
     // does not fall through to the "unknown command" branch.
     if text
-        .trim()
         .split_whitespace()
         .next()
         .map(|w| w.split('@').next().unwrap_or("").eq_ignore_ascii_case("/stats"))
@@ -416,7 +414,7 @@ async fn on_message<E: Exchange + 'static>(
 
     // /set <key> <value> — validate, persist, confirm.
     if first_command_word(text) == "/set" {
-        let mut parts = text.trim().split_whitespace();
+        let mut parts = text.split_whitespace();
         parts.next(); // skip "/set"
         let key = parts.next();
         let value = parts.collect::<Vec<_>>().join(" ");
@@ -708,7 +706,9 @@ async fn on_callback<E: Exchange + 'static>(
             guard.entry_mode = mode;
             guard.clone()
         };
-        context.settings_store.persist(&next).ok();
+        if let Err(error) = context.settings_store.persist(&next) {
+            tracing::warn!(%error, "failed to persist entry_mode change");
+        }
         bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
             .reply_markup(settings_keyboard(mode))
             .await?;

@@ -104,6 +104,8 @@ pub enum SizingError {
     BelowMinSize(f64),
     #[error("leverage {requested}x exceeds asset cap {cap}x")]
     LeverageTooHigh { requested: u32, cap: u32 },
+    #[error("required margin ${required:.2} exceeds available equity ${available:.2}")]
+    MarginExceedsEquity { required: f64, available: f64 },
 }
 
 impl LeverageMap {
@@ -167,6 +169,9 @@ pub fn build_plan(input: &SizingInput) -> Result<ExecutionPlan, SizingError> {
     let risk_amount = size * stop_distance;
 
     let margin = notional / leverage as f64;
+    if margin > input.equity {
+        return Err(SizingError::MarginExceedsEquity { required: margin, available: input.equity });
+    }
     let liquidation_price = estimate_liquidation(setup.direction, setup.entry, leverage);
 
     let take_profits = setup
@@ -381,5 +386,26 @@ mod tests {
             assert_eq!(EntryMode::from_str_opt(mode.as_str()), Some(mode));
         }
         assert_eq!(EntryMode::from_str_opt("nope"), None);
+    }
+
+    #[test]
+    fn rejects_when_margin_exceeds_equity() {
+        let setup = pendle_setup(); // entry 1.40
+        let meta = AssetMeta { sz_decimals: 1, max_leverage: 10 };
+        let input = SizingInput {
+            setup: &setup,
+            equity: 100.0,
+            risk_pct: 1.0,
+            entry_mode: EntryMode::FixedUsd,
+            entry_pct: 10.0,
+            entry_fixed_usd: 1000.0, // notional ~1000, margin ~333 > equity 100
+            profile: RiskProfile::Moderate, // leverage 3
+            leverage: &leverage(),
+            asset_meta: &meta,
+        };
+        match build_plan(&input).unwrap_err() {
+            SizingError::MarginExceedsEquity { .. } => {}
+            other => panic!("expected MarginExceedsEquity, got {other:?}"),
+        }
     }
 }

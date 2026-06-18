@@ -115,6 +115,7 @@ impl SettingsStore {
         Self::from_connection(Connection::open(path)?)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
@@ -165,25 +166,50 @@ impl SettingsStore {
             }
         }
         if let Some(raw) = self.get("risk_pct")? {
-            if let Ok(value) = raw.parse() { resolved.risk_pct = value; }
+            match raw.parse() {
+                Ok(value) => resolved.risk_pct = value,
+                Err(_) => tracing::warn!(key = "risk_pct", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
         }
         if let Some(raw) = self.get("entry_pct")? {
-            if let Ok(value) = raw.parse() { resolved.entry_pct = value; }
+            match raw.parse() {
+                Ok(value) => resolved.entry_pct = value,
+                Err(_) => tracing::warn!(key = "entry_pct", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
         }
         if let Some(raw) = self.get("entry_fixed_usd")? {
-            if let Ok(value) = raw.parse() { resolved.entry_fixed_usd = value; }
+            match raw.parse() {
+                Ok(value) => resolved.entry_fixed_usd = value,
+                Err(_) => tracing::warn!(key = "entry_fixed_usd", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
         }
         if let Some(raw) = self.get("max_daily_risk_pct")? {
-            resolved.max_daily_risk_pct = if raw.trim().is_empty() { None } else { raw.parse().ok() };
+            if raw.trim().is_empty() {
+                resolved.max_daily_risk_pct = None;
+            } else {
+                match raw.parse() {
+                    Ok(value) => resolved.max_daily_risk_pct = Some(value),
+                    Err(_) => tracing::warn!(key = "max_daily_risk_pct", value = %raw, "failed to parse stored setting; keeping seed value"),
+                }
+            }
         }
         if let Some(raw) = self.get("leverage_conservative")? {
-            if let Ok(value) = raw.parse() { resolved.leverage.conservative = value; }
+            match raw.parse() {
+                Ok(value) => resolved.leverage.conservative = value,
+                Err(_) => tracing::warn!(key = "leverage_conservative", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
         }
         if let Some(raw) = self.get("leverage_moderate")? {
-            if let Ok(value) = raw.parse() { resolved.leverage.moderate = value; }
+            match raw.parse() {
+                Ok(value) => resolved.leverage.moderate = value,
+                Err(_) => tracing::warn!(key = "leverage_moderate", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
         }
         if let Some(raw) = self.get("leverage_aggressive")? {
-            if let Ok(value) = raw.parse() { resolved.leverage.aggressive = value; }
+            match raw.parse() {
+                Ok(value) => resolved.leverage.aggressive = value,
+                Err(_) => tracing::warn!(key = "leverage_aggressive", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
         }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
