@@ -420,6 +420,30 @@ pub async fn process_signal<E: Exchange + 'static>(
             }
         }
 
+        // Skip if there's already a resting/open order for this coin (e.g. an unfilled limit entry).
+        match context.exchange.open_order_count(&setup.coin).await {
+            Ok(count) if count > 0 => {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "Already have {} open order(s) for {} — skipped. Cancel them first to re-enter.",
+                        count, setup.coin
+                    ),
+                )
+                .await?;
+                continue;
+            }
+            Ok(_) => {} // no resting orders — proceed
+            Err(error) => {
+                bot.send_message(
+                    chat_id,
+                    format!("Could not verify open orders for {} ({error}) — skipped.", setup.coin),
+                )
+                .await?;
+                continue;
+            }
+        }
+
         let profile = RiskProfile::Moderate;
         let plan = match build_plan(&SizingInput {
             setup: &setup,
