@@ -15,38 +15,68 @@ pub const CB_LIMIT: &str = "confirm:limit";
 pub const CB_MARKET: &str = "confirm:market";
 pub const CB_CANCEL: &str = "cancel";
 
+/// Escapes text for Telegram MarkdownV2 (every reserved char gets a backslash).
+fn escape_markdown_v2(text: &str) -> String {
+    const RESERVED: &[char] = &['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if RESERVED.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub fn render_summary(plan: &ExecutionPlan, profile: RiskProfile) -> String {
     let direction = match plan.direction {
         Direction::Long => "LONG",
         Direction::Short => "SHORT",
     };
-    let mut text = format!(
-        "*{coin}* {direction}  ({profile:?})\n\
-         Size: {size} (notional ${notional:.2})\n\
-         Entry: ${entry:.4}  Leverage: {leverage}x\n\
-         Margin: ${margin:.2}  Risk: ${risk:.2}\n\
-         SL: ${sl:.4} (100%)  est. liq ${liq:.4}\n",
-        coin = plan.coin,
-        size = plan.size,
-        notional = plan.notional,
-        entry = plan.entry,
-        leverage = plan.leverage,
-        margin = plan.margin,
-        risk = plan.risk_amount,
-        sl = plan.stop_loss.price,
-        liq = plan.liquidation_price,
-    );
+
+    // Bold header: escape inner content, wrap with literal * delimiters.
+    let header_inner = escape_markdown_v2(&format!("{} {}  ({:?})", plan.coin, direction, profile));
+    let mut text = format!("*{}*\n", header_inner);
+
+    text.push_str(&escape_markdown_v2(&format!(
+        "Size: {} (notional ${:.2})",
+        plan.size, plan.notional,
+    )));
+    text.push('\n');
+
+    text.push_str(&escape_markdown_v2(&format!(
+        "Entry: ${:.4}  Leverage: {}x",
+        plan.entry, plan.leverage,
+    )));
+    text.push('\n');
+
+    text.push_str(&escape_markdown_v2(&format!(
+        "Margin: ${:.2}  Risk: ${:.2}",
+        plan.margin, plan.risk_amount,
+    )));
+    text.push('\n');
+
+    text.push_str(&escape_markdown_v2(&format!(
+        "SL: ${:.4} (100%)  est. liq ${:.4}",
+        plan.stop_loss.price, plan.liquidation_price,
+    )));
+    text.push('\n');
+
     for (index, take_profit) in plan.take_profits.iter().enumerate() {
-        text.push_str(&format!(
-            "TP{}: ${:.4} ({})\n",
+        text.push_str(&escape_markdown_v2(&format!(
+            "TP{}: ${:.4} ({})",
             index + 1,
             take_profit.price,
             take_profit.size,
-        ));
+        )));
+        text.push('\n');
     }
+
     for warning in &plan.warnings {
-        text.push_str(&format!("⚠️ {warning}\n"));
+        // Emoji is not a reserved char — concatenate it raw, escape only the warning text.
+        text.push_str(&format!("⚠️ {}\n", escape_markdown_v2(warning)));
     }
+
     text
 }
 
@@ -272,7 +302,7 @@ async fn on_message<E: Exchange + 'static>(
 
     let sent = bot
         .send_message(message.chat.id, render_summary(&plan, profile))
-        .parse_mode(ParseMode::Markdown)
+        .parse_mode(ParseMode::MarkdownV2)
         .reply_markup(confirmation_keyboard(profile))
         .await?;
 
@@ -312,7 +342,7 @@ async fn on_callback<E: Exchange + 'static>(
                         message.id,
                         render_summary(&plan, profile),
                     )
-                    .parse_mode(ParseMode::Markdown)
+                    .parse_mode(ParseMode::MarkdownV2)
                     .reply_markup(confirmation_keyboard(profile))
                     .await?;
                     bot.answer_callback_query(&query.id).await?;
@@ -465,6 +495,14 @@ mod tests {
         let first_row = &markup.inline_keyboard[0];
         assert!(first_row[2].text.contains('✓')); // Aggressive marked
         assert!(!first_row[0].text.contains('✓'));
+    }
+
+    #[test]
+    fn summary_escapes_markdown_v2_special_chars() {
+        let text = render_summary(&plan(), RiskProfile::Moderate);
+        // prices contain '.', notional/TP lines contain '(' — both must be backslash-escaped for MarkdownV2
+        assert!(text.contains("\\."), "decimal points must be escaped");
+        assert!(text.contains("\\("), "parentheses must be escaped");
     }
 
     use crate::hyperliquid::mock::MockExchange;
