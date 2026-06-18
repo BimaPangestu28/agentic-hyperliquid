@@ -129,6 +129,17 @@ pub fn assemble_trades(fills: &[FillDetail]) -> Vec<ClosedTrade> {
 
         if before_flat || moving_away {
             // Opening / scale-in.
+            //
+            // Guard: when starting from a flat position with no existing leg,
+            // only create a new leg for actual OPEN fills. A "Close …" fill that
+            // arrives while the position is flat and has no open leg is an
+            // orphan close (its opening fills are outside the query window) and
+            // must be dropped — do not fabricate a phantom position.
+            let has_existing_leg = legs.contains_key(&fill.coin);
+            if before_flat && !has_existing_leg && !fill.dir.contains("Open") {
+                // Orphan close from flat: skip entirely so `pos` stays flat.
+                continue;
+            }
             let leg = legs.entry(fill.coin.clone()).or_insert_with(|| Leg {
                 direction: if delta > 0.0 { "long".into() } else { "short".into() },
                 open_size: 0.0,
@@ -333,5 +344,41 @@ mod tests {
     fn orphan_close_is_dropped() {
         let fills = vec![fill("ETH", 1, "Close Long", 2100.0, 1.0, 50.0, 0.0, 1000)];
         assert!(assemble_trades(&fills).is_empty());
+    }
+
+    /// Two consecutive orphan "Close Long" fills arriving while the position is
+    /// flat (no open leg) must produce zero trades. Before the fix they would
+    /// fabricate a phantom short leg and emit a spurious short trade.
+    #[test]
+    fn orphan_close_sequence_is_dropped() {
+        let fills = vec![
+            fill("ETH", 10, "Close Long", 2100.0, 1.0, 50.0, 1.0, 1000),
+            fill("ETH", 11, "Close Long", 2050.0, 1.0, 30.0, 1.0, 2000),
+        ];
+        assert!(
+            assemble_trades(&fills).is_empty(),
+            "orphan close fills from flat must not produce any trades"
+        );
+    }
+
+    /// A normal "Open Short" from flat must still open a leg and a subsequent
+    /// "Close Short" must emit a correct short trade — the orphan gate must not
+    /// block legitimate opens.
+    #[test]
+    fn open_short_from_flat_after_orphan_close_is_not_blocked() {
+        let fills = vec![
+            // Orphan close that must be dropped (no open leg).
+            fill("ETH", 10, "Close Long", 2100.0, 1.0, 50.0, 1.0, 1000),
+            // Real short round-trip that must still work.
+            fill("ETH", 20, "Open Short", 2000.0, 1.0, 0.0, 1.0, 2000),
+            fill("ETH", 21, "Close Short", 1900.0, 1.0, 100.0, 1.0, 3000),
+        ];
+        let trades = assemble_trades(&fills);
+        assert_eq!(trades.len(), 1, "exactly one short trade expected");
+        let trade = &trades[0];
+        assert_eq!(trade.direction, "short");
+        assert!((trade.entry_px - 2000.0).abs() < 1e-9);
+        assert!((trade.exit_px - 1900.0).abs() < 1e-9);
+        assert_eq!(trade.realized_pnl, 100.0);
     }
 }
