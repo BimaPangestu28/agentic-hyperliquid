@@ -498,6 +498,26 @@ async fn on_callback<E: Exchange + 'static>(
         }
     };
 
+    // Daily risk cap check: reject the trade if adding its risk_amount would
+    // exceed max_daily_risk_pct % of equity. Must run BEFORE execute_plan and
+    // BEFORE journaling so a rejected trade does not consume cap or audit log.
+    if let Some(cap_pct) = context.config.max_daily_risk_pct {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let day_start = crate::risk::start_of_utc_day(now_secs);
+        let used_today = context.journal.risk_used_since(day_start).unwrap_or(0.0);
+        let cap_amount = trade.equity * cap_pct / 100.0;
+        if !crate::risk::within_daily_cap(used_today, trade.plan.risk_amount, cap_amount) {
+            bot.answer_callback_query(&query.id).await.ok();
+            bot.edit_message_text(
+                message.chat.id, message.id,
+                format!("Daily risk cap reached: ${:.2} used + ${:.2} new > ${:.2} cap ({}%). {} skipped.",
+                    used_today, trade.plan.risk_amount, cap_amount, cap_pct, trade.plan.coin),
+            ).await?;
+            return Ok(());
+        }
+    }
+
     bot.answer_callback_query(&query.id).await?;
     bot.edit_message_text(
         message.chat.id,
