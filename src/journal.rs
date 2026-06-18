@@ -2,6 +2,7 @@
 
 use crate::sizing::ExecutionPlan;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub struct Journal {
@@ -49,6 +50,16 @@ pub struct TradeRecord {
     pub confidence: Option<u8>,
     pub timeframe: Option<String>,
     pub opened_at: i64,
+}
+
+/// Strategy metadata for one journaled entry, used to enrich exchange-derived
+/// round-trip trades. Keyed by the entry order id recorded at submission time.
+#[derive(Debug, Clone)]
+pub struct TradeMeta {
+    pub confidence: Option<u8>,
+    pub timeframe: Option<String>,
+    pub profile: Option<String>,
+    pub leverage: i64,
 }
 
 impl Journal {
@@ -114,6 +125,38 @@ impl Journal {
         Ok(())
     }
 
+    /// Returns a map of `entry_order_id -> TradeMeta` for every journaled entry
+    /// that has a non-null order id. Used to enrich exchange-derived round-trip
+    /// trades with strategy metadata recorded at submission time.
+    ///
+    /// # Errors
+    /// Returns an error if the SQL query fails or a row cannot be decoded.
+    pub fn metadata_by_order_id(&self) -> anyhow::Result<HashMap<u64, TradeMeta>> {
+        let connection = self.connection.lock().unwrap();
+        let mut stmt = connection.prepare(
+            "SELECT entry_order_id, confidence, timeframe, profile, leverage
+             FROM trades WHERE entry_order_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let order_id: i64 = row.get(0)?;
+            Ok((
+                order_id as u64,
+                TradeMeta {
+                    confidence: row.get::<_, Option<i64>>(1)?.map(|v| v as u8),
+                    timeframe: row.get(2)?,
+                    profile: row.get(3)?,
+                    leverage: row.get(4)?,
+                },
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row_result in rows {
+            let (order_id, trade_meta) = row_result?;
+            map.insert(order_id, trade_meta);
+        }
+        Ok(map)
+    }
+
     /// Sum of `risk_amount` over trades opened at or after `since_ts` (unix seconds).
     /// Used to enforce the daily risk cap. NULL/absent risk_amount counts as 0.
     pub fn risk_used_since(&self, since_ts: i64) -> anyhow::Result<f64> {
@@ -155,6 +198,34 @@ mod tests {
     use super::*;
     use crate::parser::Direction;
     use crate::sizing::BracketLeg;
+
+    #[test]
+    fn metadata_by_order_id_maps_entry_orders() {
+        use crate::sizing::BracketLeg;
+
+        let journal = Journal::open_in_memory().unwrap();
+        let plan = ExecutionPlan {
+            coin: "ETH".into(),
+            direction: Direction::Long,
+            size: 1.0,
+            entry: 2000.0,
+            leverage: 5,
+            notional: 2000.0,
+            margin: 400.0,
+            risk_amount: 100.0,
+            liquidation_price: 1600.0,
+            stop_loss: BracketLeg { price: 1900.0, size: 1.0 },
+            take_profits: vec![],
+            warnings: vec![],
+        };
+        // record with entry_order_id = Some(42) and leverage 5
+        journal
+            .record(&plan, Some(42), None, None, None, "Moderate", 1_700_000_000)
+            .unwrap();
+        let map = journal.metadata_by_order_id().unwrap();
+        let trade_meta = map.get(&42).expect("entry 42 must be present");
+        assert_eq!(trade_meta.leverage, 5);
+    }
 
     #[test]
     fn records_a_trade_row() {

@@ -730,11 +730,13 @@ pub async fn run<E: Exchange + 'static>(
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
+    // Extract journal_path before `config` is moved into BotContext.
+    let journal_path = config.journal_path.clone();
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
         store: Arc::new(PendingStore::new()),
-        journal: Arc::new(Journal::open("trades.db")?),
+        journal: Arc::new(Journal::open(&journal_path)?),
         http,
     });
 
