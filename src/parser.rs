@@ -58,6 +58,25 @@ fn find_value_after<'a>(lines: &'a [&'a str], label: &str) -> Option<&'a str> {
         .map(|line| line.trim())
 }
 
+/// Validates a parsed/extracted setup: prices strictly positive, at least one TP.
+pub fn validate_setup(setup: &TradeSetup) -> Result<(), ParseError> {
+    if setup.entry <= 0.0 {
+        return Err(ParseError::InvalidValue("entry must be positive".into()));
+    }
+    if setup.stop_loss <= 0.0 {
+        return Err(ParseError::InvalidValue("stop_loss must be positive".into()));
+    }
+    if setup.take_profits.is_empty() {
+        return Err(ParseError::MissingFields("take_profits".into()));
+    }
+    for (index, tp) in setup.take_profits.iter().enumerate() {
+        if tp.price <= 0.0 {
+            return Err(ParseError::InvalidValue(format!("TP{} price must be positive", index + 1)));
+        }
+    }
+    Ok(())
+}
+
 /// Parses a "Trading setup for X" card. Lines are label/value pairs; price
 /// lines look like `$1.40`, allocation lines like `60%`.
 pub fn parse_setup(text: &str) -> Result<TradeSetup, ParseError> {
@@ -88,16 +107,10 @@ pub fn parse_setup(text: &str) -> Result<TradeSetup, ParseError> {
     let stop_loss = find_value_after(&lines, "SL")
         .and_then(parse_money)
         .ok_or_else(|| ParseError::MissingFields("stop_loss".into()))?;
-    if stop_loss <= 0.0 {
-        return Err(ParseError::InvalidValue("stop_loss must be positive".into()));
-    }
 
     let entry = find_value_after(&lines, "Entry")
         .and_then(parse_money)
         .ok_or_else(|| ParseError::MissingFields("entry".into()))?;
-    if entry <= 0.0 {
-        return Err(ParseError::InvalidValue("entry must be positive".into()));
-    }
 
     // Take-profits: for each TPn label, the next price line is the price; the
     // first subsequent line ending in `%` that is not a +/- price-change is the
@@ -130,11 +143,9 @@ pub fn parse_setup(text: &str) -> Result<TradeSetup, ParseError> {
         take_profits.push(TakeProfit { price, allocation_pct });
     }
 
-    if take_profits.is_empty() {
-        return Err(ParseError::MissingFields("take_profits".into()));
-    }
-
-    Ok(TradeSetup { coin, direction, timeframe, risk_reward, confidence, entry, stop_loss, take_profits })
+    let setup = TradeSetup { coin, direction, timeframe, risk_reward, confidence, entry, stop_loss, take_profits };
+    validate_setup(&setup)?;
+    Ok(setup)
 }
 
 #[cfg(test)]
@@ -202,6 +213,25 @@ $2.00
     fn rejects_non_positive_entry() {
         let text = "Trading setup for BTC\nDirection\nLONG\nSL\n$0\nEntry\n$0\nTP1\n$80000\n100%";
         let err = parse_setup(text).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidValue(_)));
+    }
+
+    #[test]
+    fn validate_setup_rejects_negative_tp_price() {
+        let setup = TradeSetup {
+            coin: "BTC".into(),
+            direction: Direction::Long,
+            timeframe: None,
+            risk_reward: None,
+            confidence: None,
+            entry: 68000.0,
+            stop_loss: 65000.0,
+            take_profits: vec![
+                TakeProfit { price: 72000.0, allocation_pct: 50.0 },
+                TakeProfit { price: -1.0, allocation_pct: 50.0 },
+            ],
+        };
+        let err = validate_setup(&setup).unwrap_err();
         assert!(matches!(err, ParseError::InvalidValue(_)));
     }
 }

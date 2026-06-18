@@ -23,6 +23,9 @@ pub struct Config {
     pub leverage: LeverageMap,
     pub entry_fill_timeout_secs: u64,
     pub confidence_gate: Option<u8>,
+    pub deepseek_api_key: Option<String>,
+    pub deepseek_base_url: String,
+    pub deepseek_model: String,
 }
 
 impl Config {
@@ -106,6 +109,9 @@ pub fn from_env() -> anyhow::Result<Config> {
         },
         entry_fill_timeout_secs: parse_env_or("ENTRY_FILL_TIMEOUT_SECS", 300_u64)?,
         confidence_gate,
+        deepseek_api_key: std::env::var("DEEPSEEK_API_KEY").ok().filter(|s| !s.is_empty()),
+        deepseek_base_url: std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
+        deepseek_model: std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string()),
     })
 }
 
@@ -129,6 +135,9 @@ mod tests {
             leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
             confidence_gate: None,
+            deepseek_api_key: None,
+            deepseek_base_url: "https://api.deepseek.com".into(),
+            deepseek_model: "deepseek-chat".into(),
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));

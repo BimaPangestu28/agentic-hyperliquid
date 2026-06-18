@@ -180,7 +180,6 @@ pub async fn execute_plan<E: Exchange>(
 // ── Dispatcher wiring ─────────────────────────────────────────────────────────
 
 use crate::journal::Journal;
-use crate::parser::parse_setup;
 use crate::state::PendingStore;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -191,6 +190,7 @@ struct BotContext<E: Exchange + 'static> {
     exchange: Arc<E>,
     store: Arc<PendingStore>,
     journal: Arc<Journal>,
+    http: reqwest::Client,
 }
 
 fn profile_from_callback(data: &str) -> Option<RiskProfile> {
@@ -220,8 +220,17 @@ async fn on_message<E: Exchange + 'static>(
         None => return Ok(()),
     };
 
-    let setup = match parse_setup(text) {
-        Ok(setup) => setup,
+    let parse_result = match &context.config.deepseek_api_key {
+        Some(api_key) => {
+            let attempt = crate::llm_parser::parse_setup_llm(
+                &context.http, &context.config.deepseek_base_url, api_key, &context.config.deepseek_model, text,
+            );
+            crate::llm_parser::parse_with_fallback(attempt, text).await
+        }
+        None => crate::parser::parse_setup(text).map(|s| (s, crate::llm_parser::ParseSource::RegexFallback)),
+    };
+    let setup = match parse_result {
+        Ok((setup, source)) => { tracing::info!(?source, "parsed setup"); setup }
         Err(error) => {
             bot.send_message(message.chat.id, format!("Could not parse setup: {error}")).await?;
             return Ok(());
@@ -389,11 +398,13 @@ pub async fn run<E: Exchange + 'static>(
     exchange: Arc<E>,
 ) -> anyhow::Result<()> {
     let bot = Bot::new(&config.telegram_token);
+    let http = reqwest::Client::new();
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
         store: Arc::new(PendingStore::new()),
         journal: Arc::new(Journal::open("trades.db")?),
+        http,
     });
 
     let handler = dptree::entry()
