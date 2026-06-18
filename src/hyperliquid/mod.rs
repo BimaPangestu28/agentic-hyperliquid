@@ -41,6 +41,8 @@ pub trait Exchange: Send + Sync {
     async fn place_entry(&self, order: &EntryOrder) -> anyhow::Result<OrderResult>;
     async fn place_trigger(&self, order: &TriggerOrder) -> anyhow::Result<OrderResult>;
     async fn position_size(&self, coin: &str) -> anyhow::Result<f64>;
+    /// Cancels a resting order by its exchange-assigned order id.
+    async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
 }
 
 // ── Mock (test-only) ──────────────────────────────────────────────────────────
@@ -50,6 +52,11 @@ pub mod mock {
     use super::*;
     use std::sync::Mutex;
 
+    /// Test double for the Exchange trait.
+    ///
+    /// - `cancels` records every `cancel_order` call as `(coin, order_id)`.
+    /// - `simulated_position` overrides `position_size` when `Some`; otherwise
+    ///   the size is derived by summing recorded entry orders for the coin.
     #[derive(Default)]
     pub struct MockExchange {
         pub equity: f64,
@@ -57,6 +64,10 @@ pub mod mock {
         pub entries: Mutex<Vec<EntryOrder>>,
         pub triggers: Mutex<Vec<TriggerOrder>>,
         pub leverage_calls: Mutex<Vec<(String, u32)>>,
+        pub cancels: Mutex<Vec<(String, u64)>>,
+        /// When `Some(value)`, `position_size` returns that value for every coin,
+        /// allowing tests to simulate a partial fill without placing real entries.
+        pub simulated_position: Mutex<Option<f64>>,
     }
 
     #[async_trait]
@@ -96,7 +107,26 @@ pub mod mock {
         }
 
         async fn position_size(&self, coin: &str) -> anyhow::Result<f64> {
-            Ok(self.entries.lock().unwrap().iter().filter(|e| e.coin.eq_ignore_ascii_case(coin)).map(|e| e.size).sum())
+            // If a simulated position is configured, use it (supports partial-fill testing).
+            if let Some(size) = *self.simulated_position.lock().unwrap() {
+                return Ok(size);
+            }
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.coin.eq_ignore_ascii_case(coin))
+                .map(|e| e.size)
+                .sum())
+        }
+
+        async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()> {
+            self.cancels
+                .lock()
+                .unwrap()
+                .push((coin.to_string(), order_id));
+            Ok(())
         }
     }
 
@@ -129,8 +159,8 @@ use crate::config::{Config, Network};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{
-    BaseUrl, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger, ExchangeClient,
-    InfoClient,
+    BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
+    ExchangeClient, InfoClient,
 };
 
 /// Live connection to Hyperliquid via the SDK.
@@ -318,5 +348,22 @@ impl Exchange for HyperliquidExchange {
                 .abs()),
             None => Ok(0.0),
         }
+    }
+
+    /// Cancels a resting order by its exchange-assigned order id.
+    ///
+    /// Uses the SDK's `ExchangeClient::cancel` with `ClientCancelRequest { asset, oid }`.
+    async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()> {
+        self.exchange
+            .cancel(
+                ClientCancelRequest {
+                    asset: coin.to_string(),
+                    oid: order_id,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("cancel_order failed: {e}"))?;
+        Ok(())
     }
 }

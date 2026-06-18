@@ -89,7 +89,12 @@ pub fn recompute_plan(
 }
 
 /// Sets leverage, places the entry order, waits for fill (limit only), then
-/// places the reduce-only bracket. Bracket side is opposite the position.
+/// places the reduce-only bracket sized to the ACTUAL held position.
+///
+/// On a fill-wait timeout the resting order is cancelled (best-effort). If
+/// any size was partially filled the bracket is armed on that partial size so
+/// the position is never left without a stop-loss. Only when zero size was
+/// filled does the function bail without placing any bracket.
 pub async fn execute_plan<E: Exchange>(
     exchange: &E,
     plan: &ExecutionPlan,
@@ -107,30 +112,53 @@ pub async fn execute_plan<E: Exchange>(
     };
     let entry_result = exchange.place_entry(&entry).await?;
 
-    // For a limit order, wait until the position actually exists before
-    // arming the bracket; otherwise the triggers would have nothing to reduce.
-    if use_limit && !entry_result.filled {
-        let deadline = fill_timeout_secs;
-        let mut elapsed = 0;
+    // Determine the size we actually hold before arming the bracket.
+    // For market orders (or an immediately-filled limit) this is plan.size.
+    // For a resting limit we poll until full, or handle the timeout safely.
+    let effective_size = if use_limit && !entry_result.filled {
+        let mut elapsed = 0u64;
         loop {
-            if exchange.position_size(&plan.coin).await? >= plan.size * 0.99 {
-                break;
+            let held = exchange.position_size(&plan.coin).await?;
+            if held >= plan.size * 0.99 {
+                // Treat ~full fill as full.
+                break plan.size;
             }
-            if elapsed >= deadline {
-                anyhow::bail!("entry limit order not filled within {deadline}s; bracket not placed");
+            if elapsed >= fill_timeout_secs {
+                // Timed out: cancel any resting remainder, then decide.
+                if let Some(oid) = entry_result.order_id {
+                    // best-effort cancel — ignore errors to avoid masking the
+                    // partial-fill handling below.
+                    let _ = exchange.cancel_order(&plan.coin, oid).await;
+                }
+                let held = exchange.position_size(&plan.coin).await?;
+                if held <= 0.0 {
+                    anyhow::bail!(
+                        "entry limit order not filled within {fill_timeout_secs}s; \
+                         order cancelled, no position opened"
+                    );
+                }
+                // Partial fill: arm the bracket on exactly what we hold.
+                break held;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             elapsed += 1;
         }
-    }
+    } else {
+        plan.size
+    };
 
-    // Bracket: SL (full size) + each TP. Closing side is opposite the entry.
+    // Scale factor: for a partial fill, TP sizes shrink proportionally so the
+    // total closing volume never exceeds the actual position size.
+    let scale = if plan.size > 0.0 { effective_size / plan.size } else { 0.0 };
+
+    // Bracket: SL covers the full held position; each TP is scaled.
+    // Closing side is always opposite the entry direction.
     let close_is_buy = !is_buy;
     exchange
         .place_trigger(&TriggerOrder {
             coin: plan.coin.clone(),
             is_buy: close_is_buy,
-            size: plan.stop_loss.size,
+            size: effective_size,
             trigger_price: plan.stop_loss.price,
             is_take_profit: false,
         })
@@ -140,7 +168,7 @@ pub async fn execute_plan<E: Exchange>(
             .place_trigger(&TriggerOrder {
                 coin: plan.coin.clone(),
                 is_buy: close_is_buy,
-                size: take_profit.size,
+                size: take_profit.size * scale,
                 trigger_price: take_profit.price,
                 is_take_profit: true,
             })
@@ -200,11 +228,15 @@ async fn on_message<E: Exchange + 'static>(
         }
     };
 
+    // Confidence gate: when a gate is configured, a missing or below-threshold
+    // confidence BOTH fail closed. unwrap_or(false) here means "no confidence
+    // value => does not pass the gate".
     if let Some(gate) = context.config.confidence_gate {
-        if setup.confidence.map(|confidence| confidence < gate).unwrap_or(false) {
+        let passes = setup.confidence.map(|confidence| confidence >= gate).unwrap_or(false);
+        if !passes {
             bot.send_message(
                 message.chat.id,
-                format!("Confidence {:?} below gate {gate}; skipped.", setup.confidence),
+                format!("Confidence {:?} does not meet gate {gate}; skipped.", setup.confidence),
             )
             .await?;
             return Ok(());
@@ -326,6 +358,10 @@ async fn on_callback<E: Exchange + 'static>(
     .await
     {
         Ok(()) => {
+            // Journal every attempt so a position that was opened is always
+            // auditable — even when subsequent steps (e.g. bracket placement)
+            // returned Ok. execute_plan signature is kept as Result<()>; order
+            // id is journalled as None here (thread-out is a future task).
             let _ = context.journal.record(&trade.plan, None);
             bot.send_message(
                 message.chat.id,
@@ -334,6 +370,10 @@ async fn on_callback<E: Exchange + 'static>(
             .await?;
         }
         Err(error) => {
+            // Journal on failure too: a partial fill may have opened a position
+            // even when execute_plan returns Err, so we must leave an audit
+            // trail before sending the error message.
+            let _ = context.journal.record(&trade.plan, None);
             bot.send_message(
                 message.chat.id,
                 format!("❌ Execution failed: {error}"),
@@ -435,5 +475,52 @@ mod tests {
         assert!(triggers.iter().all(|t| !t.is_buy)); // closing a long => sell
         assert_eq!(triggers.iter().filter(|t| t.is_take_profit).count(), 2);
         assert_eq!(triggers.iter().filter(|t| !t.is_take_profit).count(), 1);
+    }
+
+    /// When a limit entry is placed and the fill-wait times out with a partial
+    /// fill (400 of 666.6), the resting remainder must be cancelled and the
+    /// bracket must be sized to the ACTUAL held position, not the planned size.
+    #[tokio::test]
+    async fn partial_fill_timeout_cancels_remainder_and_brackets_actual_size() {
+        // Simulate holding 400 units — a partial fill of the 666.6 plan size.
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            simulated_position: std::sync::Mutex::new(Some(400.0)),
+            ..Default::default()
+        };
+        let plan = plan(); // long, size 666.6, SL + 2 TPs
+        // use_limit=true so a limit entry is placed; fill_timeout_secs=0 so the
+        // loop times out immediately on the first iteration (400 < 666.6 * 0.99).
+        super::execute_plan(&exchange, &plan, true, 0).await.unwrap();
+
+        // The resting order (id=1 from MockExchange) must have been cancelled.
+        let cancels = exchange.cancels.lock().unwrap();
+        assert_eq!(cancels.len(), 1, "expected exactly one cancel call");
+
+        // All three bracket legs must be sized to the actual 400 held.
+        let triggers = exchange.triggers.lock().unwrap();
+        assert_eq!(triggers.len(), 3);
+
+        // SL covers the entire held position.
+        let stop_loss = triggers.iter().find(|t| !t.is_take_profit).unwrap();
+        assert!(
+            (stop_loss.size - 400.0).abs() < 1e-6,
+            "SL size should be 400.0 but was {}",
+            stop_loss.size
+        );
+
+        // Each TP is scaled proportionally (scale = 400 / 666.6 ≈ 0.6001).
+        let scale = 400.0_f64 / 666.6_f64;
+        let take_profits: Vec<_> = triggers.iter().filter(|t| t.is_take_profit).collect();
+        assert_eq!(take_profits.len(), 2);
+        for (take_profit, original) in take_profits.iter().zip(plan.take_profits.iter()) {
+            let expected = original.size * scale;
+            assert!(
+                (take_profit.size - expected).abs() < 1e-6,
+                "TP size should be {expected:.6} but was {}",
+                take_profit.size
+            );
+        }
     }
 }
