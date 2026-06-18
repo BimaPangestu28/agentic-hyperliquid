@@ -50,16 +50,16 @@ jobs:
     steps:
       - name: Pin deployment to the new image and wait for rollout
         env:
-          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          # Password auth via sshpass. SSHPASS is read by `sshpass -e` (keeps the
+          # password out of process args). Prefer SSH keys; rotate if it leaks.
+          SSHPASS: ${{ secrets.DEPLOY_SSH_PASSWORD }}
           SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
           SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
           # Pin the immutable :sha (not :latest) so what runs is exactly what this
           # workflow built; rollback is a one-line `set image` to an older sha.
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
+          sshpass -e ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
             set -euo pipefail
             kubectl -n agentic-hyperliquid set image deploy/bot bot=ghcr.io/bimapangestu28/agentic-hyperliquid:$GITHUB_SHA
             kubectl -n agentic-hyperliquid rollout status deploy/bot --timeout=300s

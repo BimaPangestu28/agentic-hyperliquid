@@ -8,8 +8,8 @@ manual (below). The bot is outbound-only — no Service/Ingress/domain.
 ## One-time setup
 
 ### 1. GitHub repo secrets (Settings → Secrets and variables → Actions)
-Same values as the portfolio-tracker repo (same VPS):
-- `DEPLOY_SSH_KEY` — private key authorized on the VPS
+The deploy job uses password SSH (`sshpass`):
+- `DEPLOY_SSH_PASSWORD` — SSH password for the deploy user (rotate if leaked; SSH keys preferred)
 - `DEPLOY_SSH_USER` — ssh user
 - `DEPLOY_SSH_HOST` — VPS host/IP (kept only here, never committed)
 
