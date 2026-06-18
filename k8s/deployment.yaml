@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bot
+  namespace: agentic-hyperliquid
+  labels:
+    app: agentic-hyperliquid
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # singleton: never run two bots (Telegram getUpdates conflict)
+  selector:
+    matchLabels:
+      app: agentic-hyperliquid
+  template:
+    metadata:
+      labels:
+        app: agentic-hyperliquid
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull     # remove this line if the GHCR package is made public
+      containers:
+        - name: bot
+          image: ghcr.io/bimapangestu28/agentic-hyperliquid:latest   # CI re-pins to :sha
+          envFrom:
+            - secretRef:
+                name: agentic-hyperliquid-env
+          env:
+            - name: RUST_LOG
+              value: "info,agentic_hyperliquid=debug"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
