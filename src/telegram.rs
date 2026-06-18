@@ -8,7 +8,7 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats";
+const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /settings, /set <key> <value>";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -16,6 +16,9 @@ pub const CB_AGGRESSIVE: &str = "profile:aggressive";
 pub const CB_LIMIT: &str = "confirm:limit";
 pub const CB_MARKET: &str = "confirm:market";
 pub const CB_CANCEL: &str = "cancel";
+pub const CB_MODE_RISK: &str = "entry_mode:risk";
+pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
+pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
 
 /// Escapes text for Telegram MarkdownV2 (every reserved char gets a backslash).
 fn escape_markdown_v2(text: &str) -> String {
@@ -100,6 +103,57 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
         ],
         vec![InlineKeyboardButton::callback("❌ Cancel", CB_CANCEL)],
     ])
+}
+
+/// Plain-text settings card (no MarkdownV2 — sent without parse_mode).
+pub fn render_settings(settings: &Settings) -> String {
+    let cap = match settings.max_daily_risk_pct {
+        Some(value) => format!("{value}%"),
+        None => "disabled".to_string(),
+    };
+    format!(
+        "⚙️ Settings\n\n\
+         Entry mode: {}\n\
+         risk_pct: {}%\n\
+         entry_pct: {}%\n\
+         entry_fixed_usd: ${}\n\
+         max_daily_risk_pct: {}\n\
+         leverage_conservative: {}x\n\
+         leverage_moderate: {}x\n\
+         leverage_aggressive: {}x\n\n\
+         Change a number:  /set <key> <value>\n\
+         e.g.  /set entry_pct 10\n\
+         Switch entry mode with the buttons below.",
+        settings.entry_mode.label(),
+        settings.risk_pct,
+        settings.entry_pct,
+        settings.entry_fixed_usd,
+        cap,
+        settings.leverage.conservative,
+        settings.leverage.moderate,
+        settings.leverage.aggressive,
+    )
+}
+
+/// Inline keyboard with the three entry-mode buttons, ✓ on the active one.
+pub fn settings_keyboard(active: EntryMode) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(
+            label("Risk-based", active == EntryMode::RiskBased), CB_MODE_RISK),
+        InlineKeyboardButton::callback(
+            label("% Balance", active == EntryMode::PercentBalance), CB_MODE_PERCENT),
+        InlineKeyboardButton::callback(
+            label("Fixed USD", active == EntryMode::FixedUsd), CB_MODE_FIXED),
+    ]])
+}
+
+fn entry_mode_from_callback(data: &str) -> Option<EntryMode> {
+    match data {
+        CB_MODE_RISK => Some(EntryMode::RiskBased),
+        CB_MODE_PERCENT => Some(EntryMode::PercentBalance),
+        CB_MODE_FIXED => Some(EntryMode::FixedUsd),
+        _ => None,
+    }
 }
 
 /// Recomputes the plan for a different risk profile, reusing the cached equity
@@ -229,6 +283,19 @@ pub struct BotContext<E: Exchange + 'static> {
     pub http: reqwest::Client,
 }
 
+/// First whitespace-separated token of `text`, lowercased, with any @botname
+/// suffix stripped. Returns "" when there is no token.
+fn first_command_word(text: &str) -> String {
+    text.trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 /// Returns a reply for a slash-command message, or None if the text is not a
 /// command (and should be parsed as a trading-setup card).
 fn command_response(text: &str) -> Option<String> {
@@ -335,6 +402,47 @@ async fn on_message<E: Exchange + 'static>(
         // Plain text — no parse_mode — so no MarkdownV2 escaping needed.
         bot.send_message(message.chat.id, crate::stats::render_stats(&stats))
             .await?;
+        return Ok(());
+    }
+
+    // /settings — show current values + entry-mode buttons.
+    if first_command_word(text) == "/settings" {
+        let settings = context.settings.lock().unwrap().clone();
+        bot.send_message(message.chat.id, render_settings(&settings))
+            .reply_markup(settings_keyboard(settings.entry_mode))
+            .await?;
+        return Ok(());
+    }
+
+    // /set <key> <value> — validate, persist, confirm.
+    if first_command_word(text) == "/set" {
+        let mut parts = text.trim().split_whitespace();
+        parts.next(); // skip "/set"
+        let key = parts.next();
+        let value = parts.collect::<Vec<_>>().join(" ");
+        match key {
+            None => {
+                bot.send_message(message.chat.id,
+                    "Usage: /set <key> <value> — send /settings to see the keys.").await?;
+            }
+            Some(key) => {
+                let current = context.settings.lock().unwrap().clone();
+                match crate::settings::apply_setting(&current, key, &value) {
+                    Ok(next) => {
+                        if let Err(error) = context.settings_store.persist(&next) {
+                            bot.send_message(message.chat.id,
+                                format!("Could not save setting: {error}")).await?;
+                            return Ok(());
+                        }
+                        *context.settings.lock().unwrap() = next.clone();
+                        bot.send_message(message.chat.id, render_settings(&next)).await?;
+                    }
+                    Err(error_message) => {
+                        bot.send_message(message.chat.id, error_message).await?;
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -593,6 +701,21 @@ async fn on_callback<E: Exchange + 'static>(
     let key = message.id.0 as i64;
     let data = query.data.clone().unwrap_or_default();
 
+    // Entry-mode switch from the /settings keyboard.
+    if let Some(mode) = entry_mode_from_callback(&data) {
+        let next = {
+            let mut guard = context.settings.lock().unwrap();
+            guard.entry_mode = mode;
+            guard.clone()
+        };
+        context.settings_store.persist(&next).ok();
+        bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
+            .reply_markup(settings_keyboard(mode))
+            .await?;
+        bot.answer_callback_query(&query.id).await?;
+        return Ok(());
+    }
+
     // Profile switch: recompute and edit the message in place.
     if let Some(profile) = profile_from_callback(&data) {
         if let Some(mut trade) = context.store.get(key) {
@@ -839,6 +962,47 @@ mod tests {
     #[test]
     fn non_command_text_is_not_intercepted() {
         assert!(super::command_response("Trading setup for PENDLE").is_none());
+    }
+
+    #[test]
+    fn settings_card_lists_keys_and_mode() {
+        let settings = crate::settings::Settings {
+            entry_mode: EntryMode::PercentBalance,
+            risk_pct: 1.0,
+            entry_pct: 10.0,
+            entry_fixed_usd: 50.0,
+            max_daily_risk_pct: Some(5.0),
+            leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+        };
+        let text = super::render_settings(&settings);
+        assert!(text.contains("% Balance"));
+        assert!(text.contains("entry_pct"));
+        assert!(text.contains("max_daily_risk_pct"));
+    }
+
+    #[test]
+    fn disabled_cap_renders_as_disabled() {
+        let settings = crate::settings::Settings {
+            entry_mode: EntryMode::RiskBased,
+            risk_pct: 1.0, entry_pct: 10.0, entry_fixed_usd: 50.0,
+            max_daily_risk_pct: None,
+            leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+        };
+        assert!(super::render_settings(&settings).contains("disabled"));
+    }
+
+    #[test]
+    fn settings_keyboard_marks_active_mode() {
+        let markup = super::settings_keyboard(EntryMode::FixedUsd);
+        let row = &markup.inline_keyboard[0];
+        assert!(row[2].text.contains('✓')); // Fixed USD marked
+        assert!(!row[0].text.contains('✓'));
+    }
+
+    #[test]
+    fn entry_mode_callback_parses() {
+        assert_eq!(super::entry_mode_from_callback(super::CB_MODE_PERCENT), Some(EntryMode::PercentBalance));
+        assert_eq!(super::entry_mode_from_callback("nope"), None);
     }
 
     use crate::hyperliquid::mock::MockExchange;
