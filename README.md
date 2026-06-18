@@ -35,6 +35,13 @@ Send a screenshot of a signal and the bot reads it via OpenAI vision (`OPENAI_VI
 See `.env.example`. Defaults: risk 1%/trade, leverage 2/3/5x, fill timeout 300s.
 `MAX_DAILY_RISK_PCT` caps cumulative daily risk (% equity); confirmed trades exceeding it are skipped.
 
+## Deploy (k3s)
+
+CI/CD builds the bot to GHCR and rolls it out to the production k3s cluster on
+every push to `main` (`.github/workflows/deploy.yml`). It runs as a singleton
+daemon (no inbound traffic). See [`k8s/README.md`](k8s/README.md) for one-time
+cluster setup (secrets, image pull, PVC).
+
 ## Safety
 - Uses an agent wallet, never your main wallet key.
 - Only allowlisted Telegram user ids are served.
