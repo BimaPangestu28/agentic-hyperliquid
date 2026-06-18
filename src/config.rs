@@ -45,6 +45,15 @@ pub struct Config {
     pub openai_base_url: String,
     /// Vision model to use (e.g. `gpt-4o-mini`).
     pub openai_vision_model: String,
+    /// TCP address the read-only portfolio HTTP API binds to.
+    /// Set via `HTTP_BIND_ADDR` (default `127.0.0.1:8088`).
+    pub http_bind_addr: String,
+    /// Bearer token that protects the portfolio API.
+    /// Set via `PORTFOLIO_API_TOKEN`. When absent or empty the API is disabled.
+    pub api_token: Option<String>,
+    /// Path to the SQLite trade journal shared by the bot and the API server.
+    /// Set via `JOURNAL_DB_PATH` (default `trades.db`).
+    pub journal_path: String,
 }
 
 impl Config {
@@ -139,6 +148,10 @@ pub fn from_env() -> anyhow::Result<Config> {
         openai_api_key: std::env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty()),
         openai_base_url: std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
         openai_vision_model: std::env::var("OPENAI_VISION_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+        http_bind_addr: std::env::var("HTTP_BIND_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8088".to_string()),
+        api_token: std::env::var("PORTFOLIO_API_TOKEN").ok().filter(|s| !s.is_empty()),
+        journal_path: std::env::var("JOURNAL_DB_PATH").unwrap_or_else(|_| "trades.db".to_string()),
     })
 }
 
@@ -171,6 +184,9 @@ mod tests {
             openai_api_key: None,
             openai_base_url: "https://api.openai.com/v1".into(),
             openai_vision_model: "gpt-4o-mini".into(),
+            http_bind_addr: "127.0.0.1:8088".into(),
+            api_token: None,
+            journal_path: "trades.db".into(),
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));
