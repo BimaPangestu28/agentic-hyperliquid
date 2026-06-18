@@ -160,8 +160,58 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
-    ExchangeClient, InfoClient,
+    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketOrderParams,
 };
+
+/// Parses an `ExchangeResponseStatus` returned by the SDK's `order` / `market_open`
+/// calls and maps it to our domain `OrderResult`.
+///
+/// - `Resting` → order sitting in the book; `filled: false`, `order_id: Some(oid)`.
+/// - `Filled`  → order fully filled; `filled: true`, `avg_price` from `avg_px`.
+/// - `Error`   → exchange rejected the order; returns `Err`.
+/// - Other statuses (Success, WaitingForFill, WaitingForTrigger) are treated as
+///   "submitted but not yet filled" with whatever oid is available (none for those).
+fn parse_order_response(status: ExchangeResponseStatus) -> anyhow::Result<OrderResult> {
+    match status {
+        ExchangeResponseStatus::Err(message) => {
+            Err(anyhow::anyhow!("exchange returned error: {message}"))
+        }
+        ExchangeResponseStatus::Ok(response) => {
+            // Pull the first status out of the statuses array (we always send one order at a time).
+            let first_status = response
+                .data
+                .as_ref()
+                .and_then(|d| d.statuses.first())
+                .cloned();
+
+            match first_status {
+                Some(ExchangeDataStatus::Resting(resting)) => Ok(OrderResult {
+                    order_id: Some(resting.oid),
+                    filled: false,
+                    avg_price: None,
+                }),
+                Some(ExchangeDataStatus::Filled(filled)) => {
+                    let avg_price = filled.avg_px.parse::<f64>().ok();
+                    Ok(OrderResult {
+                        order_id: Some(filled.oid),
+                        filled: true,
+                        avg_price,
+                    })
+                }
+                Some(ExchangeDataStatus::Error(message)) => {
+                    Err(anyhow::anyhow!("order rejected: {message}"))
+                }
+                // Success / WaitingForFill / WaitingForTrigger / None — order submitted
+                // but no oid available from these variants; treat as "not yet filled".
+                _ => Ok(OrderResult {
+                    order_id: None,
+                    filled: false,
+                    avg_price: None,
+                }),
+            }
+        }
+    }
+}
 
 /// Live connection to Hyperliquid via the SDK.
 ///
@@ -270,43 +320,51 @@ impl Exchange for HyperliquidExchange {
         Ok(())
     }
 
-    /// Places an entry order (market when `limit_price` is `None`, GTC limit otherwise).
+    /// Places an entry order.
     ///
-    /// Market orders are implemented as aggressive IOC limits: buy at `f64::MAX`,
-    /// sell at `0.0` — the exchange fills what it can immediately.
+    /// - **Market order** (`limit_price: None`): delegates to `ExchangeClient::market_open`
+    ///   with 1% slippage, which fetches the current mid-price and sends an IOC limit with
+    ///   proper slippage applied — no extreme-price hacks.
+    /// - **Limit order** (`limit_price: Some(px)`): sends a GTC limit via `ExchangeClient::order`.
+    ///
+    /// In both cases the response is parsed and the resting/filled oid is surfaced.
     async fn place_entry(&self, order: &EntryOrder) -> anyhow::Result<OrderResult> {
-        let (limit_px, tif) = match order.limit_price {
-            Some(px) => (px, "Gtc"),
+        let response = match order.limit_price {
             None => {
-                // TODO(before mainnet): replace this IOC-at-extreme-price hack with ExchangeClient::market_open + slippage params.
-                // f64::MAX (buy) / 1e-8 (sell) are aggressive sentinels intended to cross the book immediately under IOC.
-                let px = if order.is_buy { f64::MAX } else { 1e-8 };
-                (px, "Ioc")
+                // Use the SDK's proper market_open with 1% slippage.
+                self.exchange
+                    .market_open(MarketOrderParams {
+                        asset: &order.coin,
+                        is_buy: order.is_buy,
+                        sz: order.size,
+                        px: None,
+                        slippage: Some(0.01),
+                        cloid: None,
+                        wallet: None,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("place_entry (market) failed: {e}"))?
+            }
+            Some(limit_px) => {
+                let request = ClientOrderRequest {
+                    asset: order.coin.clone(),
+                    is_buy: order.is_buy,
+                    reduce_only: false,
+                    limit_px,
+                    sz: order.size,
+                    cloid: None,
+                    order_type: ClientOrder::Limit(ClientLimit {
+                        tif: "Gtc".to_string(),
+                    }),
+                };
+                self.exchange
+                    .order(request, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("place_entry (limit) failed: {e}"))?
             }
         };
 
-        let request = ClientOrderRequest {
-            asset: order.coin.clone(),
-            is_buy: order.is_buy,
-            reduce_only: false,
-            limit_px,
-            sz: order.size,
-            cloid: None,
-            order_type: ClientOrder::Limit(ClientLimit {
-                tif: tif.to_string(),
-            }),
-        };
-
-        self.exchange
-            .order(request, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("place_entry failed: {e}"))?;
-
-        Ok(OrderResult {
-            order_id: None,
-            filled: order.limit_price.is_none(),
-            avg_price: order.limit_price,
-        })
+        parse_order_response(response)
     }
 
     /// Places a TP or SL trigger order (reduce-only).
@@ -327,16 +385,13 @@ impl Exchange for HyperliquidExchange {
             }),
         };
 
-        self.exchange
+        let response = self
+            .exchange
             .order(request, None)
             .await
             .map_err(|e| anyhow::anyhow!("place_trigger failed: {e}"))?;
 
-        Ok(OrderResult {
-            order_id: None,
-            filled: false,
-            avg_price: None,
-        })
+        parse_order_response(response)
     }
 
     /// Returns the absolute size of the open position for `coin` (0.0 if flat).
