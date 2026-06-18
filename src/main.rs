@@ -5,6 +5,7 @@ mod llm_parser;
 mod parser;
 mod sizing;
 mod state;
+mod stats;
 mod telegram;
 
 use std::sync::Arc;

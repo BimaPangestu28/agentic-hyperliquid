@@ -31,6 +31,19 @@ pub struct OrderResult {
     pub avg_price: Option<f64>,
 }
 
+// ── Fill (realized-PnL record from exchange history) ─────────────────────────
+
+/// A single fill from Hyperliquid's `userFills` endpoint. Closing fills carry
+/// a non-zero `closed_pnl`; opening fills report 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fill {
+    pub coin: String,
+    pub closed_pnl: f64,
+    pub dir: String,
+    pub time_ms: u64,
+    pub fee: f64,
+}
+
 // ── Exchange trait ────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -43,6 +56,8 @@ pub trait Exchange: Send + Sync {
     async fn position_size(&self, coin: &str) -> anyhow::Result<f64>;
     /// Cancels a resting order by its exchange-assigned order id.
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
+    /// Returns all fills for the account from the exchange's fill history.
+    async fn user_fills(&self) -> anyhow::Result<Vec<Fill>>;
 }
 
 // ── Mock (test-only) ──────────────────────────────────────────────────────────
@@ -57,6 +72,7 @@ pub mod mock {
     /// - `cancels` records every `cancel_order` call as `(coin, order_id)`.
     /// - `simulated_position` overrides `position_size` when `Some`; otherwise
     ///   the size is derived by summing recorded entry orders for the coin.
+    /// - `fills` is returned verbatim by `user_fills`.
     #[derive(Default)]
     pub struct MockExchange {
         pub equity: f64,
@@ -68,6 +84,8 @@ pub mod mock {
         /// When `Some(value)`, `position_size` returns that value for every coin,
         /// allowing tests to simulate a partial fill without placing real entries.
         pub simulated_position: Mutex<Option<f64>>,
+        /// Pre-loaded fills returned by `user_fills`.
+        pub fills: Mutex<Vec<super::Fill>>,
     }
 
     #[async_trait]
@@ -127,6 +145,10 @@ pub mod mock {
                 .unwrap()
                 .push((coin.to_string(), order_id));
             Ok(())
+        }
+
+        async fn user_fills(&self) -> anyhow::Result<Vec<super::Fill>> {
+            Ok(self.fills.lock().unwrap().clone())
         }
     }
 
@@ -500,5 +522,25 @@ impl Exchange for HyperliquidExchange {
             .await
             .map_err(|e| anyhow::anyhow!("cancel_order failed: {e}"))?;
         Ok(())
+    }
+
+    /// Returns all fills for the master account from Hyperliquid's `userFills` endpoint.
+    ///
+    /// Each `UserFillsResponse` is mapped to a `Fill`. The `closed_pnl` and `fee`
+    /// fields are display/analytics strings — parse failures fall back to `0.0`
+    /// rather than failing the whole report.
+    async fn user_fills(&self) -> anyhow::Result<Vec<Fill>> {
+        let raw_fills = self.info.user_fills(self.address).await?;
+        let fills = raw_fills
+            .into_iter()
+            .map(|r| Fill {
+                coin: r.coin,
+                closed_pnl: r.closed_pnl.parse::<f64>().unwrap_or(0.0),
+                dir: r.dir,
+                time_ms: r.time,
+                fee: r.fee.parse::<f64>().unwrap_or(0.0),
+            })
+            .collect();
+        Ok(fills)
     }
 }
