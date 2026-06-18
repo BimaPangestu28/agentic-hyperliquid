@@ -29,6 +29,7 @@ impl Journal {
         Self::from_connection(Connection::open(path)?)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
