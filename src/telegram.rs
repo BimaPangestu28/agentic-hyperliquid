@@ -311,8 +311,20 @@ async fn on_message<E: Exchange + 'static>(
         }
     }
 
-    let equity = context.exchange.equity().await?;
-    let asset_meta = context.exchange.asset_meta(&setup.coin).await?;
+    let equity = match context.exchange.equity().await {
+        Ok(value) => value,
+        Err(error) => {
+            bot.send_message(message.chat.id, format!("Could not fetch account equity: {error}")).await?;
+            return Ok(());
+        }
+    };
+    let asset_meta = match context.exchange.asset_meta(&setup.coin).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            bot.send_message(message.chat.id, format!("Cannot trade {}: {error}", setup.coin)).await?;
+            return Ok(());
+        }
+    };
     let profile = RiskProfile::Moderate;
     let plan = match build_plan(&SizingInput {
         setup: &setup,
