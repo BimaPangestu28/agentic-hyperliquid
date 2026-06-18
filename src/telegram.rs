@@ -129,20 +129,15 @@ pub fn render_account(
     }
     out.push_str(&format!("\nOpen positions ({}):\n", positions.len()));
     for position in positions {
-        let direction = if position.is_long { "LONG" } else { "SHORT" };
-        let liquidation = match position.liquidation_px {
-            Some(price) => format!("${:.2}", price),
-            None => "-".to_string(),
-        };
         out.push_str(&format!(
-            "  {:<6} {:<5} {} @ ${:.2}  uPnL ${:+.2}  {}x  liq {}\n",
+            "  {:<6} {:<5} {} @ ${:.2}  mark ${:.2}  uPnL ${:+.2}  {:.0}x\n",
             position.coin,
-            direction,
+            position.direction.to_uppercase(),
             position.size,
             position.entry_px,
+            position.mark_px,
             position.unrealized_pnl,
             position.leverage,
-            liquidation,
         ));
     }
     out
@@ -461,7 +456,7 @@ async fn on_message<E: Exchange + 'static>(
                 return Ok(());
             }
         };
-        let positions = match context.exchange.open_positions().await {
+        let positions = match context.exchange.positions().await {
             Ok(value) => value,
             Err(error) => {
                 bot.send_message(message.chat.id, format!("Could not fetch account state: {error}")).await?;
@@ -948,13 +943,16 @@ pub async fn run<E: Exchange + 'static>(
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
-    let settings_store = Arc::new(SettingsStore::open("trades.db")?);
+    // Extract journal_path before `config` is moved into BotContext. Settings
+    // share the same SQLite file as the journal (separate connection + tables).
+    let journal_path = config.journal_path.clone();
+    let settings_store = Arc::new(SettingsStore::open(&journal_path)?);
     let seeded = settings_store.load(Settings::from_config(&config))?;
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
         store: Arc::new(PendingStore::new()),
-        journal: Arc::new(Journal::open("trades.db")?),
+        journal: Arc::new(Journal::open(&journal_path)?),
         settings: Arc::new(std::sync::Mutex::new(seeded)),
         settings_store,
         http,
@@ -1087,12 +1085,12 @@ mod tests {
     fn sample_positions() -> Vec<crate::hyperliquid::OpenPosition> {
         vec![
             crate::hyperliquid::OpenPosition {
-                coin: "BTC".into(), is_long: true, size: 0.05, entry_px: 61200.0,
-                unrealized_pnl: 45.2, leverage: 3, liquidation_px: Some(52100.0),
+                coin: "BTC".into(), direction: "long".into(), size: 0.05, entry_px: 61200.0,
+                mark_px: 61500.0, unrealized_pnl: 45.2, leverage: 3.0, notional: 3075.0,
             },
             crate::hyperliquid::OpenPosition {
-                coin: "ETH".into(), is_long: false, size: 1.2, entry_px: 3410.0,
-                unrealized_pnl: -12.8, leverage: 2, liquidation_px: None,
+                coin: "ETH".into(), direction: "short".into(), size: 1.2, entry_px: 3410.0,
+                mark_px: 3400.0, unrealized_pnl: -12.8, leverage: 2.0, notional: 4080.0,
             },
         ]
     }
@@ -1108,8 +1106,8 @@ mod tests {
         assert!(text.contains("SHORT"));
         assert!(text.contains("uPnL $+45.20")); // positive sign
         assert!(text.contains("uPnL $-12.80")); // negative sign
-        assert!(text.contains("liq $52100.00"));
-        assert!(text.contains("liq -")); // ETH has no liquidation price
+        assert!(text.contains("mark $61500.00")); // mark price shown
+        assert!(text.contains("3x")); // leverage rendered without decimals
     }
 
     #[test]

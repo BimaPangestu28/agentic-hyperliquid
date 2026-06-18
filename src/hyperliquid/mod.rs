@@ -44,48 +44,51 @@ pub struct Fill {
     pub fee: f64,
 }
 
-// ── Open position (live account state) ───────────────────────────────────────
-
-/// A currently-open perp position, read from `user_state().asset_positions`.
+/// A richer fill row for the API: enough to reconstruct round-trip trades.
+/// Distinct from `Fill` so existing stats code is unaffected.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OpenPosition {
+pub struct FillDetail {
     pub coin: String,
-    pub is_long: bool,
-    pub size: f64,            // absolute size in coin units
-    pub entry_px: f64,        // 0.0 when the exchange reports none
-    pub unrealized_pnl: f64,
-    pub leverage: u32,
-    pub liquidation_px: Option<f64>,
+    pub oid: u64,
+    pub dir: String, // SDK `dir`, e.g. "Open Long" / "Close Long"
+    pub px: f64,
+    pub sz: f64,
+    pub closed_pnl: f64,
+    pub fee: f64,
+    pub time_ms: i64,
+    pub start_position: f64,
 }
 
-/// Maps raw position fields (as strings from the SDK) into an `OpenPosition`.
-/// Returns `Ok(None)` for a zero-size position (caller skips it). Errors only
-/// when `szi` — the field that defines the position — is malformed; the
-/// display-only fields fall back (`entry_px`/`unrealized_pnl` → 0.0,
-/// `liquidation_px` → None) rather than failing the whole report.
-pub(crate) fn build_open_position(
-    coin: &str,
-    szi: &str,
-    entry_px: Option<&str>,
-    unrealized_pnl: &str,
-    leverage: u32,
-    liquidation_px: Option<&str>,
-) -> anyhow::Result<Option<OpenPosition>> {
-    let signed = szi
-        .parse::<f64>()
-        .map_err(|e| anyhow::anyhow!("cannot parse position szi {szi:?}: {e}"))?;
-    if signed == 0.0 {
-        return Ok(None);
-    }
-    Ok(Some(OpenPosition {
-        coin: coin.to_string(),
-        is_long: signed > 0.0,
-        size: signed.abs(),
-        entry_px: entry_px.and_then(|s| s.parse().ok()).unwrap_or(0.0),
-        unrealized_pnl: unrealized_pnl.parse().unwrap_or(0.0),
-        leverage,
-        liquidation_px: liquidation_px.and_then(|s| s.parse().ok()),
-    }))
+// ── LedgerFlow (USDC deposit/withdrawal record) ───────────────────────────────
+
+/// A USDC deposit/withdrawal from the non-funding ledger.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LedgerFlow {
+    pub external_id: String, // "<hash>:<kind>"
+    pub kind: String,        // "deposit" | "withdrawal"
+    /// Signed USD amount as returned by Hyperliquid — NEGATIVE for withdrawals,
+    /// positive for deposits. Direction is also given by `kind`.
+    ///
+    /// The raw value from `delta.usdc` is preserved without taking the absolute
+    /// value so callers can distinguish a withdrawal from a deposit even if they
+    /// ignore `kind`. Do NOT negate this field when displaying net capital flow.
+    pub usdc: f64,
+    pub time_ms: i64,
+}
+
+// ── OpenPosition (live perp position snapshot) ────────────────────────────────
+
+/// A single open perp position, derived from `user_state.asset_positions`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OpenPosition {
+    pub coin: String,
+    pub direction: String, // "long" | "short"
+    pub size: f64,         // absolute size
+    pub entry_px: f64,
+    pub mark_px: f64,
+    pub unrealized_pnl: f64,
+    pub leverage: f64,
+    pub notional: f64, // position value in USD
 }
 
 // ── Exchange trait ────────────────────────────────────────────────────────────
@@ -102,14 +105,29 @@ pub trait Exchange: Send + Sync {
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
     /// Returns all fills for the account from the exchange's fill history.
     async fn user_fills(&self) -> anyhow::Result<Vec<Fill>>;
+    /// All fills with price/size/order-id detail, oldest first.
+    async fn fills_detailed(&self) -> anyhow::Result<Vec<FillDetail>>;
+    /// Open perp positions with mark price and unrealized PnL.
+    async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
+    /// USDC deposits/withdrawals from the non-funding ledger, oldest first.
+    async fn usdc_flows(&self) -> anyhow::Result<Vec<LedgerFlow>>;
     /// Returns the number of resting/open orders for `coin` (case-insensitive).
     ///
     /// Used by `process_signal` to skip a new signal when a prior limit entry
     /// for the same coin is still sitting unfilled in the order book.
     async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize>;
-    /// Returns all currently-open perp positions (zero-size entries skipped).
-    /// Reads `user_state().asset_positions`; identical in unified/non-unified modes.
-    async fn open_positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
+}
+
+// ── Test utilities ────────────────────────────────────────────────────────────
+
+/// Re-export of [`mock::MockExchange`] under a stable path so sibling modules
+/// (e.g. `api::tests`) can reach it without depending on the internal `mock`
+/// module layout.
+///
+/// Gated on `test` builds only — never compiled into production binaries.
+#[cfg(test)]
+pub mod testing {
+    pub use super::mock::MockExchange;
 }
 
 // ── Mock (test-only) ──────────────────────────────────────────────────────────
@@ -125,6 +143,7 @@ pub mod mock {
     /// - `simulated_position` overrides `position_size` when `Some`; otherwise
     ///   the size is derived by summing recorded entry orders for the coin.
     /// - `fills` is returned verbatim by `user_fills`.
+    /// - `positions` is returned verbatim by `positions()`; seed via `set_positions`.
     #[derive(Default)]
     pub struct MockExchange {
         pub equity: f64,
@@ -141,8 +160,42 @@ pub mod mock {
         /// Coins that have resting/open orders; each entry is a coin name.
         /// `open_order_count` counts entries matching the queried coin (case-insensitive).
         pub open_orders: Mutex<Vec<String>>,
-        /// Positions returned verbatim by `open_positions`.
+        /// Pre-loaded open positions returned by `positions()`.
         pub positions: Mutex<Vec<super::OpenPosition>>,
+        /// Pre-loaded detailed fills returned by `fills_detailed()`.
+        pub fills_detailed: Mutex<Vec<super::FillDetail>>,
+        /// Pre-loaded USDC ledger flows returned by `usdc_flows()`.
+        pub flows: Mutex<Vec<super::LedgerFlow>>,
+    }
+
+    impl MockExchange {
+        /// Constructs a `MockExchange` that returns `equity` from [`Exchange::equity`].
+        ///
+        /// All other fields default to their zero/empty values via [`Default`].
+        pub fn with_equity(equity: f64) -> Self {
+            Self { equity, ..Self::default() }
+        }
+
+        /// Constructs a `MockExchange` with all-default fields, suitable for
+        /// general-purpose tests that do not need a specific equity value.
+        pub fn new_for_test() -> Self {
+            Self::default()
+        }
+
+        /// Seeds the open positions returned by `positions()`.
+        pub fn set_positions(&self, open_positions: Vec<super::OpenPosition>) {
+            *self.positions.lock().unwrap() = open_positions;
+        }
+
+        /// Seeds the detailed fills returned by `fills_detailed()`.
+        pub fn set_fills_detailed(&self, detailed_fills: Vec<super::FillDetail>) {
+            *self.fills_detailed.lock().unwrap() = detailed_fills;
+        }
+
+        /// Seeds the USDC ledger flows returned by `usdc_flows()`.
+        pub fn set_flows(&self, ledger_flows: Vec<super::LedgerFlow>) {
+            *self.flows.lock().unwrap() = ledger_flows;
+        }
     }
 
     #[async_trait]
@@ -208,6 +261,18 @@ pub mod mock {
             Ok(self.fills.lock().unwrap().clone())
         }
 
+        async fn fills_detailed(&self) -> anyhow::Result<Vec<super::FillDetail>> {
+            Ok(self.fills_detailed.lock().unwrap().clone())
+        }
+
+        async fn positions(&self) -> anyhow::Result<Vec<super::OpenPosition>> {
+            Ok(self.positions.lock().unwrap().clone())
+        }
+
+        async fn usdc_flows(&self) -> anyhow::Result<Vec<super::LedgerFlow>> {
+            Ok(self.flows.lock().unwrap().clone())
+        }
+
         async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
             Ok(self
                 .open_orders
@@ -217,64 +282,6 @@ pub mod mock {
                 .filter(|c| c.eq_ignore_ascii_case(coin))
                 .count())
         }
-
-        async fn open_positions(&self) -> anyhow::Result<Vec<super::OpenPosition>> {
-            Ok(self.positions.lock().unwrap().clone())
-        }
-    }
-
-    #[test]
-    fn build_open_position_maps_long() {
-        let op = super::build_open_position("BTC", "0.05", Some("61200.0"), "45.2", 3, Some("52100.0"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(op, super::OpenPosition {
-            coin: "BTC".into(), is_long: true, size: 0.05,
-            entry_px: 61200.0, unrealized_pnl: 45.2, leverage: 3,
-            liquidation_px: Some(52100.0),
-        });
-    }
-
-    #[test]
-    fn build_open_position_maps_short_from_negative_szi() {
-        let op = super::build_open_position("ETH", "-1.2", Some("3410.0"), "-12.8", 2, None)
-            .unwrap()
-            .unwrap();
-        assert!(!op.is_long);
-        assert_eq!(op.size, 1.2);
-        assert_eq!(op.liquidation_px, None);
-    }
-
-    #[test]
-    fn build_open_position_skips_zero_size() {
-        assert_eq!(super::build_open_position("BTC", "0", None, "0", 1, None).unwrap(), None);
-    }
-
-    #[test]
-    fn build_open_position_defaults_missing_entry_and_bad_pnl() {
-        let op = super::build_open_position("SOL", "10", None, "not-a-number", 5, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(op.entry_px, 0.0);
-        assert_eq!(op.unrealized_pnl, 0.0);
-    }
-
-    #[test]
-    fn build_open_position_errors_on_bad_szi() {
-        assert!(super::build_open_position("BTC", "xyz", None, "0", 1, None).is_err());
-    }
-
-    #[tokio::test]
-    async fn mock_returns_preset_positions() {
-        use crate::hyperliquid::mock::MockExchange;
-        let exchange = MockExchange::default();
-        exchange.positions.lock().unwrap().push(super::OpenPosition {
-            coin: "BTC".into(), is_long: true, size: 0.05, entry_px: 61200.0,
-            unrealized_pnl: 45.2, leverage: 3, liquidation_px: Some(52100.0),
-        });
-        let positions = super::Exchange::open_positions(&exchange).await.unwrap();
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].coin, "BTC");
     }
 
     #[test]
@@ -332,6 +339,49 @@ pub mod mock {
         exchange.open_orders.lock().unwrap().push("ETH".to_string());
         assert_eq!(exchange.open_order_count("BTC").await.unwrap(), 2);
         assert_eq!(exchange.open_order_count("SOL").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mock_returns_seeded_positions() {
+        let mock = MockExchange::new_for_test();
+        let p = super::OpenPosition {
+            coin: "ETH".into(),
+            direction: "long".into(),
+            size: 1.0,
+            entry_px: 2000.0,
+            mark_px: 2100.0,
+            unrealized_pnl: 100.0,
+            leverage: 5.0,
+            notional: 2100.0,
+        };
+        mock.set_positions(vec![p.clone()]);
+        assert_eq!(mock.positions().await.unwrap(), vec![p]);
+    }
+
+    /// Pins the signed-usdc convention: withdrawals carry a NEGATIVE usdc value.
+    ///
+    /// Hyperliquid returns `delta.usdc` as a negative number for withdrawals.
+    /// `usdc_flows` must preserve the sign — it must NOT call abs() or negate.
+    /// This test ensures a withdrawal row seeded with usdc = -200.5 comes back
+    /// with `kind == "withdrawal"` and `usdc == -200.5` (sign preserved).
+    #[tokio::test]
+    async fn flows_withdrawal_preserves_negative_usdc() {
+        let mock = MockExchange::new_for_test();
+        let withdrawal_flow = super::LedgerFlow {
+            external_id: "0xwithdraw:withdrawal".into(),
+            kind: "withdrawal".into(),
+            usdc: -200.5,
+            time_ms: 9000,
+        };
+        mock.set_flows(vec![withdrawal_flow]);
+        let flows = mock.usdc_flows().await.unwrap();
+        assert_eq!(flows.len(), 1);
+        let flow = &flows[0];
+        assert_eq!(flow.kind, "withdrawal", "kind must be 'withdrawal'");
+        assert_eq!(
+            flow.usdc, -200.5,
+            "usdc must be negative for withdrawals — sign must not be stripped"
+        );
     }
 }
 
@@ -680,6 +730,89 @@ impl Exchange for HyperliquidExchange {
         Ok(fills)
     }
 
+    /// Returns all fills with price/size/order-id detail, oldest first.
+    ///
+    /// Mirrors `user_fills` but maps into `FillDetail`, which includes `px`, `sz`,
+    /// `oid`, `start_position`, and `dir` for round-trip trade reconstruction.
+    ///
+    /// # SDK field verification (UserFillsResponse, response_structs.rs)
+    /// - `r.coin: String`
+    /// - `r.oid: u64`
+    /// - `r.dir: String`
+    /// - `r.px: String` — price as string; parsed to f64
+    /// - `r.sz: String` — size as string; parsed to f64
+    /// - `r.closed_pnl: String` — parsed to f64
+    /// - `r.fee: String` — parsed to f64
+    /// - `r.time: u64` — millisecond timestamp; cast to i64
+    /// - `r.start_position: String` — parsed to f64
+    async fn fills_detailed(&self) -> anyhow::Result<Vec<FillDetail>> {
+        let raw_fills = self.info.user_fills(self.address).await?;
+        let mut detailed_fills: Vec<FillDetail> = raw_fills
+            .into_iter()
+            .map(|r| FillDetail {
+                coin: r.coin,
+                oid: r.oid,
+                dir: r.dir,
+                px: r.px.parse::<f64>().unwrap_or(0.0),
+                sz: r.sz.parse::<f64>().unwrap_or(0.0),
+                closed_pnl: r.closed_pnl.parse::<f64>().unwrap_or(0.0),
+                fee: r.fee.parse::<f64>().unwrap_or(0.0),
+                time_ms: r.time as i64,
+                start_position: r.start_position.parse::<f64>().unwrap_or(0.0),
+            })
+            .collect();
+        // Sort oldest first so callers receive a chronological stream.
+        detailed_fills.sort_by_key(|fill| fill.time_ms);
+        Ok(detailed_fills)
+    }
+
+    /// Returns all open perp positions with mark price and unrealized PnL.
+    ///
+    /// Reads `asset_positions` from `user_state`, skips flat positions (`szi == 0`),
+    /// and derives `mark_px` as `position_value / |szi|` since the SDK does not
+    /// expose a dedicated mark-price field on the position snapshot.
+    ///
+    /// # SDK field verification
+    /// Fields confirmed from `hyperliquid_rust_sdk-0.6.0/src/info/sub_structs.rs`:
+    /// - `PositionData::szi: String`
+    /// - `PositionData::entry_px: Option<String>`
+    /// - `PositionData::position_value: String`
+    /// - `PositionData::unrealized_pnl: String`
+    /// - `PositionData::leverage: Leverage { value: u32, .. }`
+    /// - `PositionData::coin: String`
+    async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>> {
+        let state = self.info.user_state(self.address).await?;
+        let mut open_positions = Vec::new();
+        for asset_position in state.asset_positions.iter() {
+            let position_data = &asset_position.position;
+            let signed_size: f64 = position_data.szi.parse().unwrap_or(0.0);
+            if signed_size == 0.0 {
+                continue;
+            }
+            let entry_px = position_data
+                .entry_px
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let notional: f64 = position_data.position_value.parse().unwrap_or(0.0);
+            let unrealized_pnl: f64 = position_data.unrealized_pnl.parse().unwrap_or(0.0);
+            let leverage: f64 = position_data.leverage.value as f64;
+            let size = signed_size.abs();
+            let mark_px = if size > 0.0 { notional / size } else { 0.0 };
+            open_positions.push(OpenPosition {
+                coin: position_data.coin.clone(),
+                direction: if signed_size >= 0.0 { "long".into() } else { "short".into() },
+                size,
+                entry_px,
+                mark_px,
+                unrealized_pnl,
+                leverage,
+                notional,
+            });
+        }
+        Ok(open_positions)
+    }
+
     /// Returns the number of resting/open orders for `coin` (case-insensitive).
     ///
     /// Queries the account's full open-order list and filters by coin name so
@@ -693,22 +826,74 @@ impl Exchange for HyperliquidExchange {
             .count())
     }
 
-    async fn open_positions(&self) -> anyhow::Result<Vec<OpenPosition>> {
-        let state = self.info.user_state(self.address).await?;
-        let mut positions = Vec::new();
-        for asset_position in &state.asset_positions {
-            let position = &asset_position.position;
-            if let Some(open_position) = build_open_position(
-                &position.coin,
-                &position.szi,
-                position.entry_px.as_deref(),
-                &position.unrealized_pnl,
-                position.leverage.value,
-                position.liquidation_px.as_deref(),
-            )? {
-                positions.push(open_position);
-            }
-        }
-        Ok(positions)
+    /// Returns USDC deposits/withdrawals from the non-funding ledger, oldest first.
+    ///
+    /// Posts `{"type":"userNonFundingLedgerUpdates","user":<address>}` to the
+    /// Hyperliquid info endpoint and maps rows whose `delta.type` is `"deposit"` or
+    /// `"withdraw"` into `LedgerFlow` values.
+    ///
+    /// # Base URL + address source
+    /// - Base URL: `self.info.http_client.base_url` — set during `InfoClient::new`
+    ///   from the same `BaseUrl` variant used for all other info calls.
+    /// - Address: `self.address` — the master account address resolved in `connect()`.
+    /// - HTTP client: `self.info.http_client.client` — the same `reqwest::Client`
+    ///   already used by the SDK for all info POSTs.
+    ///
+    /// # SDK field mapping
+    /// Raw ledger row fields (from Hyperliquid API):
+    /// - `hash: String` — transaction hash used as part of `external_id`
+    /// - `time: u64` — epoch milliseconds
+    /// - `delta.type: String` — `"deposit"` or `"withdraw"`; rows with other types are skipped
+    /// - `delta.usdc: String` — USDC amount as string; parsed to f64
+    async fn usdc_flows(&self) -> anyhow::Result<Vec<LedgerFlow>> {
+        // Build the raw POST body — the SDK InfoRequest enum does not cover this endpoint.
+        let address_hex = format!("{:#x}", self.address);
+        let body = serde_json::json!({
+            "type": "userNonFundingLedgerUpdates",
+            "user": address_hex,
+        })
+        .to_string();
+
+        let base_url = &self.info.http_client.base_url;
+        let response_text = self
+            .info
+            .http_client
+            .client
+            .post(format!("{base_url}/info"))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("usdc_flows request failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("usdc_flows response read failed: {e}"))?;
+
+        // Parse the response as a JSON array of ledger rows.
+        let raw_rows: Vec<serde_json::Value> = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow::anyhow!("usdc_flows JSON parse failed: {e}"))?;
+
+        let mut ledger_flows: Vec<LedgerFlow> = raw_rows
+            .into_iter()
+            .filter_map(|row| {
+                let hash = row.get("hash")?.as_str()?.to_string();
+                let time_ms = row.get("time")?.as_u64()? as i64;
+                let delta = row.get("delta")?;
+                let delta_type = delta.get("type")?.as_str()?;
+                let kind = match delta_type {
+                    "deposit" => "deposit",
+                    "withdraw" => "withdrawal",
+                    _ => return None,
+                };
+                let usdc_str = delta.get("usdc")?.as_str().unwrap_or("0");
+                let usdc = usdc_str.parse::<f64>().unwrap_or(0.0);
+                let external_id = format!("{hash}:{kind}");
+                Some(LedgerFlow { external_id, kind: kind.to_string(), usdc, time_ms })
+            })
+            .collect();
+
+        // Sort oldest first for consistent ordering.
+        ledger_flows.sort_by_key(|flow| flow.time_ms);
+        Ok(ledger_flows)
     }
 }
