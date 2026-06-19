@@ -1189,6 +1189,21 @@ pub async fn run<E: Exchange + 'static>(
         });
     }
 
+    // Background P&L push: periodically sends running unrealized-P&L summary to
+    // all allowed users while positions are open. Interval is read live from
+    // settings each tick; 0 disables without restarting the task.
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let monitor_settings = context.settings.clone();
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        tokio::spawn(async move {
+            crate::monitor::run_pnl_monitor(
+                monitor_bot, monitor_exchange, monitor_settings, monitor_user_ids,
+            ).await;
+        });
+    }
+
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message::<E>))
         .branch(Update::filter_callback_query().endpoint(on_callback::<E>));

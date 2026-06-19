@@ -4,9 +4,10 @@
 use crate::hyperliquid::{Exchange, FillDetail};
 use crate::journal::{Bracket, Journal};
 use crate::parser::Direction;
+use crate::settings::Settings;
 use crate::sizing::BracketLeg;
 use crate::trigger_store::{PendingLeg, PendingTrigger, TriggerStore};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::ChatId;
@@ -212,6 +213,39 @@ pub async fn run_trigger_monitor<E: Exchange + 'static>(
                 }
                 let _ = triggers.mark_expired(pending.id);
                 notify_users(&bot, &allowed_user_ids, &format!("⏱️ Trigger {} kadaluarsa — dibatalkan, tidak ada posisi.", pending.coin)).await;
+            }
+        }
+    }
+}
+
+/// Periodically pushes a running-P&L summary while positions are open. Reads
+/// `pnl_push_secs` from live settings each tick (0 disables → idle). Never panics.
+pub async fn run_pnl_monitor<E: Exchange + 'static>(
+    bot: Bot,
+    exchange: Arc<E>,
+    settings: Arc<Mutex<Settings>>,
+    allowed_user_ids: Vec<i64>,
+) {
+    loop {
+        let push_secs = settings.lock().unwrap().pnl_push_secs;
+        if push_secs == 0 {
+            // Disabled: idle at a fixed cadence so re-enabling via /set takes effect.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        tokio::time::sleep(Duration::from_secs(push_secs)).await;
+
+        let positions = match exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => { tracing::warn!("pnl monitor positions() failed: {error}"); continue; }
+        };
+        if positions.is_empty() { continue; }
+
+        let equity = exchange.equity().await.unwrap_or(0.0);
+        let message = crate::telegram::render_pnl_summary(equity, &positions);
+        for user_id in &allowed_user_ids {
+            if let Err(error) = bot.send_message(ChatId(*user_id), &message).await {
+                tracing::warn!("pnl push failed for {user_id}: {error}");
             }
         }
     }
