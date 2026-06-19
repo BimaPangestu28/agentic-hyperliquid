@@ -41,6 +41,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE trades ADD COLUMN notional REAL",
     "ALTER TABLE trades ADD COLUMN risk_amount REAL",
     "ALTER TABLE trades ADD COLUMN opened_at INTEGER",
+    "ALTER TABLE trades ADD COLUMN tp_prices TEXT",
 ];
 
 /// Signal metadata + timestamp read back from the journal for stats attribution.
@@ -50,6 +51,14 @@ pub struct TradeRecord {
     pub confidence: Option<u8>,
     pub timeframe: Option<String>,
     pub opened_at: i64,
+}
+
+/// The bracket prices of a journaled trade, used to label which leg
+/// (SL / TP1 / TP2) closed a position when a closing fill is observed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bracket {
+    pub stop_loss: f64,
+    pub take_profits: Vec<f64>,
 }
 
 /// Strategy metadata for one journaled entry, used to enrich exchange-derived
@@ -100,11 +109,13 @@ impl Journal {
         profile: &str,
         opened_at: i64,
     ) -> anyhow::Result<()> {
+        let tp_prices: Vec<f64> = plan.take_profits.iter().map(|leg| leg.price).collect();
+        let tp_prices_json = serde_json::to_string(&tp_prices).unwrap_or_else(|_| "[]".to_string());
         let connection = self.connection.lock().unwrap();
         connection.execute(
             "INSERT INTO trades (coin, direction, size, entry, leverage, stop_loss, entry_order_id,
-                                 confidence, timeframe, risk_reward, profile, notional, risk_amount, opened_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                 confidence, timeframe, risk_reward, profile, notional, risk_amount, opened_at, tp_prices)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 plan.coin,
                 format!("{:?}", plan.direction),
@@ -120,6 +131,7 @@ impl Journal {
                 plan.notional,
                 plan.risk_amount,
                 opened_at,
+                tp_prices_json,
             ],
         )?;
         Ok(())
@@ -167,6 +179,35 @@ impl Journal {
             |row| row.get(0),
         )?;
         Ok(total)
+    }
+
+    /// Returns the SL + TP prices of the most recent trade for `coin`
+    /// (case-insensitive), or `Ok(None)` if no trade was journaled for it.
+    ///
+    /// Used by the fill monitor to label which bracket leg closed a position.
+    pub fn latest_bracket_for_coin(&self, coin: &str) -> anyhow::Result<Option<Bracket>> {
+        let connection = self.connection.lock().unwrap();
+        let row = connection.query_row(
+            "SELECT stop_loss, tp_prices FROM trades
+             WHERE coin = ?1 COLLATE NOCASE ORDER BY id DESC LIMIT 1",
+            rusqlite::params![coin],
+            |row| {
+                let stop_loss: f64 = row.get(0)?;
+                let tp_json: Option<String> = row.get(1)?;
+                Ok((stop_loss, tp_json))
+            },
+        );
+        match row {
+            Ok((stop_loss, tp_json)) => {
+                let take_profits = tp_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<f64>>(raw).ok())
+                    .unwrap_or_default();
+                Ok(Some(Bracket { stop_loss, take_profits }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Returns all journaled trade records ordered by entry time, for stats attribution.
@@ -246,6 +287,34 @@ mod tests {
         };
         journal.record(&plan, Some(42), Some(8), Some("swing"), Some(2.8), "Moderate", 1_700_000_000).unwrap();
         assert_eq!(journal.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn latest_bracket_for_coin_returns_newest_sl_and_tps() {
+        let journal = Journal::open_in_memory().unwrap();
+        let plan = ExecutionPlan {
+            coin: "TAO".into(),
+            direction: Direction::Long,
+            size: 10.0,
+            entry: 300.0,
+            leverage: 3,
+            notional: 3000.0,
+            margin: 1000.0,
+            risk_amount: 50.0,
+            liquidation_price: 200.0,
+            stop_loss: BracketLeg { price: 280.0, size: 10.0 },
+            take_profits: vec![
+                BracketLeg { price: 340.0, size: 6.0 },
+                BracketLeg { price: 380.0, size: 4.0 },
+            ],
+            warnings: vec![],
+        };
+        journal.record(&plan, None, None, None, None, "Moderate", 1_700_000_000).unwrap();
+
+        let bracket = journal.latest_bracket_for_coin("TAO").unwrap().expect("bracket present");
+        assert_eq!(bracket.stop_loss, 280.0);
+        assert_eq!(bracket.take_profits, vec![340.0, 380.0]);
+        assert!(journal.latest_bracket_for_coin("ETH").unwrap().is_none());
     }
 
     #[test]
