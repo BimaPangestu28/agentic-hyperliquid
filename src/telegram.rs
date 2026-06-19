@@ -397,6 +397,7 @@ pub async fn execute_plan<E: Exchange>(
     plan: &ExecutionPlan,
     use_limit: bool,
     fill_timeout_secs: u64,
+    cancel: std::sync::Arc<tokio::sync::Notify>,
     reporter: &dyn ProgressReporter,
 ) -> anyhow::Result<()> {
     let is_buy = matches!(plan.direction, Direction::Long);
@@ -425,14 +426,37 @@ pub async fn execute_plan<E: Exchange>(
                 reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
                 break plan.size;
             }
-            if elapsed >= fill_timeout_secs {
-                // Timed out: cancel any resting remainder, then decide.
+
+            // Wait up to 1s for a fill, unless the user cancels first. When the
+            // timeout has already elapsed we skip the wait and wind down as a timeout.
+            let timed_out = elapsed >= fill_timeout_secs;
+            let user_cancelled = if timed_out {
+                false
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => { elapsed += 1; false }
+                    _ = cancel.notified() => true,
+                }
+            };
+
+            if timed_out || user_cancelled {
+                // Single canceller: this loop owns order_id, so the timeout and the
+                // button can never both cancel.
                 let cancelled = match entry_result.order_id {
                     Some(oid) => exchange.cancel_order(&plan.coin, oid).await.is_ok(),
                     None => false,
                 };
                 let held = exchange.position_size(&plan.coin).await?;
+                if held >= plan.size * 0.99 {
+                    // Filled at the instant of the tap/timeout — arm the full bracket.
+                    reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
+                    break plan.size;
+                }
                 if held <= 0.0 {
+                    if user_cancelled {
+                        reporter.report(ExecutionEvent::EntryCancelled { cancelled }).await;
+                        return Ok(());
+                    }
                     reporter.report(ExecutionEvent::FillTimeout { cancelled }).await;
                     anyhow::bail!(
                         "entry limit order not filled within {fill_timeout_secs}s; \
@@ -442,8 +466,7 @@ pub async fn execute_plan<E: Exchange>(
                 reporter.report(ExecutionEvent::Filled { size: held, partial: true }).await;
                 break held;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            elapsed += 1;
+            // Slept 1s without a fill or a cancel — poll again.
         }
     } else {
         reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
@@ -1162,6 +1185,7 @@ async fn on_callback<E: Exchange + 'static>(
             &trade.plan,
             use_limit,
             fill_timeout_secs,
+            std::sync::Arc::new(tokio::sync::Notify::new()), // TODO(task-4): wire registered Notify
             &reporter,
         )
         .await;
@@ -1464,7 +1488,7 @@ mod tests {
         };
         let plan = plan(); // long, size 666.6, 2 TPs
         let reporter = RecordingReporter::default();
-        super::execute_plan(&exchange, &plan, false, 1, &reporter).await.unwrap();
+        super::execute_plan(&exchange, &plan, false, 1, std::sync::Arc::new(tokio::sync::Notify::new()), &reporter).await.unwrap();
 
         assert_eq!(exchange.leverage_calls.lock().unwrap().len(), 1);
         assert_eq!(exchange.entries.lock().unwrap().len(), 1);
@@ -1492,7 +1516,7 @@ mod tests {
         // use_limit=true so a limit entry is placed; fill_timeout_secs=0 so the
         // loop times out immediately on the first iteration (400 < 666.6 * 0.99).
         let reporter = RecordingReporter::default();
-        super::execute_plan(&exchange, &plan, true, 0, &reporter).await.unwrap();
+        super::execute_plan(&exchange, &plan, true, 0, std::sync::Arc::new(tokio::sync::Notify::new()), &reporter).await.unwrap();
 
         // The resting order (id=1 from MockExchange) must have been cancelled.
         let cancels = exchange.cancels.lock().unwrap();
@@ -1533,7 +1557,7 @@ mod tests {
         };
         let plan = plan();
         let reporter = RecordingReporter::default();
-        super::execute_plan(&exchange, &plan, false, 1, &reporter).await.unwrap();
+        super::execute_plan(&exchange, &plan, false, 1, std::sync::Arc::new(tokio::sync::Notify::new()), &reporter).await.unwrap();
 
         let events = reporter.events.lock().unwrap();
         assert!(matches!(events.first(), Some(super::ExecutionEvent::EntrySubmitted { limit: false, .. })));
@@ -1616,5 +1640,80 @@ mod tests {
             }
             other => panic!("expected callback button, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn user_cancel_at_zero_fill_cancels_order_and_arms_no_bracket() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            simulated_position: std::sync::Mutex::new(Some(0.0)), // resting, unfilled
+            ..Default::default()
+        };
+        let plan = plan(); // long, size 666.6
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one(); // store a permit so the first select fires immediately
+        let reporter = RecordingReporter::default();
+
+        // Long timeout (100s) so only the cancel signal — not a timeout — ends the wait.
+        super::execute_plan(&exchange, &plan, true, 100, cancel, &reporter).await.unwrap();
+
+        assert_eq!(exchange.cancels.lock().unwrap().len(), 1, "resting order must be cancelled");
+        assert_eq!(exchange.triggers.lock().unwrap().len(), 0, "no bracket when nothing filled");
+        let events = reporter.events.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(e, super::ExecutionEvent::EntryCancelled { cancelled: true })));
+    }
+
+    #[tokio::test]
+    async fn user_cancel_at_partial_fill_cancels_remainder_and_brackets_held() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            simulated_position: std::sync::Mutex::new(Some(400.0)), // partial of 666.6
+            ..Default::default()
+        };
+        let plan = plan();
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one();
+        let reporter = RecordingReporter::default();
+
+        super::execute_plan(&exchange, &plan, true, 100, cancel, &reporter).await.unwrap();
+
+        assert_eq!(exchange.cancels.lock().unwrap().len(), 1, "resting remainder cancelled");
+        let triggers = exchange.triggers.lock().unwrap();
+        assert_eq!(triggers.len(), 3, "SL + 2 TP armed on the held size");
+        let stop_loss = triggers.iter().find(|t| !t.is_take_profit).unwrap();
+        assert!((stop_loss.size - 400.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_full_fill_is_a_no_op() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            simulated_position: std::sync::Mutex::new(Some(666.6)), // already fully filled
+            ..Default::default()
+        };
+        let plan = plan();
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one();
+        let reporter = RecordingReporter::default();
+
+        super::execute_plan(&exchange, &plan, true, 100, cancel, &reporter).await.unwrap();
+
+        assert_eq!(exchange.cancels.lock().unwrap().len(), 0, "nothing to cancel after a full fill");
+        assert_eq!(exchange.triggers.lock().unwrap().len(), 3, "full bracket armed");
+        let events = reporter.events.lock().unwrap();
+        assert!(!events.iter().any(|e| matches!(e, super::ExecutionEvent::EntryCancelled { .. })),
+            "must not report a cancel when the order filled");
     }
 }
