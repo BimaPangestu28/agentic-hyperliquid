@@ -951,69 +951,61 @@ async fn on_callback<E: Exchange + 'static>(
     )
     .await?;
 
-    // Capture signal metadata and timestamp before the async execute_plan call
-    // so we can journal even on error. `trade` is not moved by execute_plan
-    // (which only borrows &trade.plan), but extracting up-front keeps the
-    // borrow checker happy and avoids re-accessing after a potential move.
-    let opened_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let trade_confidence = trade.setup.confidence;
-    let trade_timeframe = trade.setup.timeframe.clone();
-    let trade_risk_reward = trade.setup.risk_reward;
-    let trade_profile = format!("{:?}", trade.profile);
-
+    // Read the live timeout before spawning (never hold the lock across await).
     let fill_timeout_secs = context.settings.lock().unwrap().entry_fill_timeout_secs;
-    let reporter = TelegramReporter {
-        bot: bot.clone(),
-        chat_id: message.chat.id,
-        coin: trade.plan.coin.clone(),
-        timeout_secs: fill_timeout_secs,
-    };
 
-    match execute_plan(
-        context.exchange.as_ref(),
-        &trade.plan,
-        use_limit,
-        fill_timeout_secs,
-        &reporter,
-    )
-    .await
-    {
-        Ok(()) => {
-            // Journal every attempt so a position that was opened is always
-            // auditable. The user-facing success message was already sent by
-            // the reporter's BracketArmed event.
-            let _ = context.journal.record(
-                &trade.plan,
-                None,
-                trade_confidence,
-                trade_timeframe.as_deref(),
-                trade_risk_reward,
-                &trade_profile,
-                opened_at,
-            );
+    // Execute off the handler so the chat is not blocked during a limit
+    // order's fill-wait — multiple entries can run concurrently. All status
+    // is delivered asynchronously via TelegramReporter.
+    let task_context = context.clone();
+    let task_bot = bot.clone();
+    let chat_id = message.chat.id;
+    tokio::spawn(async move {
+        let opened_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let trade_confidence = trade.setup.confidence;
+        let trade_timeframe = trade.setup.timeframe.clone();
+        let trade_risk_reward = trade.setup.risk_reward;
+        let trade_profile = format!("{:?}", trade.profile);
+
+        let reporter = TelegramReporter {
+            bot: task_bot.clone(),
+            chat_id,
+            coin: trade.plan.coin.clone(),
+            timeout_secs: fill_timeout_secs,
+        };
+
+        let outcome = execute_plan(
+            task_context.exchange.as_ref(),
+            &trade.plan,
+            use_limit,
+            fill_timeout_secs,
+            &reporter,
+        )
+        .await;
+
+        // Journal every attempt (a partial fill may open a position even on Err).
+        let _ = task_context.journal.record(
+            &trade.plan,
+            None,
+            trade_confidence,
+            trade_timeframe.as_deref(),
+            trade_risk_reward,
+            &trade_profile,
+            opened_at,
+        );
+
+        if let Err(error) = outcome {
+            if let Err(send_error) = task_bot
+                .send_message(chat_id, format!("❌ Execution failed: {error}"))
+                .await
+            {
+                tracing::warn!("failed to send execution error: {send_error}");
+            }
         }
-        Err(error) => {
-            // Journal on failure too: a partial fill may have opened a position
-            // even when execute_plan returns Err.
-            let _ = context.journal.record(
-                &trade.plan,
-                None,
-                trade_confidence,
-                trade_timeframe.as_deref(),
-                trade_risk_reward,
-                &trade_profile,
-                opened_at,
-            );
-            bot.send_message(
-                message.chat.id,
-                format!("❌ Execution failed: {error}"),
-            )
-            .await?;
-        }
-    }
+    });
     Ok(())
 }
 

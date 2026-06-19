@@ -49,6 +49,9 @@ armed; partial-fill and timeout are flagged). A background monitor polls fill
 history every `MONITOR_POLL_SECS` (default 30s) and messages you when a TP or SL
 closes a position, naming the leg (TP1/TP2/SL) and the realized PnL.
 
+Executions run in the background, so you can submit and confirm multiple setups
+without waiting for a prior limit order to fill.
+
 ## LLM parsing
 When `DEEPSEEK_API_KEY` is set, the bot uses DeepSeek as the primary card parser —
 it calls the DeepSeek chat API (OpenAI-compatible) to extract structured fields from
