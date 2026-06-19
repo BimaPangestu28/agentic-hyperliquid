@@ -5,10 +5,33 @@ long/short position with native SL/TP brackets on the Hyperliquid perpetuals DEX
 
 ## Prerequisites
 - Rust (stable, edition 2021)
-- A Hyperliquid **API/agent wallet** private key
+- A Hyperliquid **API/agent wallet** private key, **approved under your master account** (see below)
 - A Telegram bot token (from @BotFather) and your numeric Telegram user id
 - When using an API/agent wallet, set `HYPERLIQUID_ACCOUNT_ADDRESS` to your master account address (the one that holds funds); the agent key only signs — it holds no balance of its own.
 - If your account is in unified-account mode, set `HYPERLIQUID_UNIFIED_ACCOUNT=true` so the bot reads collateral from the spot USDC balance (the perp account reports 0 under unified mode).
+
+### Approving the agent wallet (required before trading)
+Hyperliquid will only accept orders signed by an agent wallet that has been
+**authorized** under your master account. A locally generated keypair is not
+enough — until you approve it, every order is rejected with:
+
+```
+exchange returned error: User or API Wallet 0x… does not exist
+```
+
+To authorize it:
+1. Open <https://app.hyperliquid.xyz/API> and connect your **master** wallet
+   (the one set in `HYPERLIQUID_ACCOUNT_ADDRESS`).
+2. Generate/authorize an API wallet. The page returns a private key and registers
+   the derived address as an approved agent on your master account.
+3. Put that private key in `HYPERLIQUID_AGENT_KEY`.
+
+Verify the agent is approved (returns the agent address, not `[]`):
+
+```bash
+curl -s -X POST https://api.hyperliquid.xyz/info -H "Content-Type: application/json" \
+  -d '{"type":"extraAgents","user":"<YOUR_MASTER_ADDRESS>"}'
+```
 
 ## Setup
 1. `cp .env.example .env` and fill in the values.
