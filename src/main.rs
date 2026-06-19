@@ -8,6 +8,7 @@ mod parser;
 mod risk;
 mod settings;
 mod sizing;
+mod trigger_store;
 mod state;
 mod stats;
 mod telegram;
