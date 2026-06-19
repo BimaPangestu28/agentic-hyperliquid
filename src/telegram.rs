@@ -398,6 +398,13 @@ pub async fn arm_bracket<E: Exchange>(
 /// any size was partially filled the bracket is armed on that partial size so
 /// the position is never left without a stop-loss. Only when zero size was
 /// filled does the function bail without placing any bracket.
+///
+/// The `cancel` signal (fired by the cancel button via the pending_fills
+/// registry) ends the wait early: the resting order is cancelled, then if zero
+/// size filled the function returns `Ok(())` (no position, no bracket —
+/// distinct from the timeout path which bails), or if partially filled the
+/// bracket is armed on the held size. A market execution never triggers this
+/// signal; the `cancel` parameter is still required by the function signature.
 pub async fn execute_plan<E: Exchange>(
     exchange: &E,
     plan: &ExecutionPlan,
@@ -1219,11 +1226,17 @@ async fn on_callback<E: Exchange + 'static>(
 
     let cancel = Arc::new(Notify::new());
     let coin_key = trade.plan.coin.to_uppercase();
-    context
-        .pending_fills
-        .lock()
-        .unwrap()
-        .insert(coin_key.clone(), cancel.clone());
+
+    // Only register a cancellable wait when a resting limit order will be placed.
+    // Market executions never show a cancel button, so their entry in the registry
+    // would be a phantom that could confuse a concurrent cancel_fill callback.
+    if use_limit {
+        context
+            .pending_fills
+            .lock()
+            .unwrap()
+            .insert(coin_key.clone(), cancel.clone());
+    }
 
     tokio::spawn(async move {
         let reporter = TelegramReporter {
@@ -1243,8 +1256,10 @@ async fn on_callback<E: Exchange + 'static>(
         )
         .await;
 
-        // Always clear the registry entry, whatever the outcome.
-        task_context.pending_fills.lock().unwrap().remove(&coin_key);
+        // Clear the registry entry only when one was inserted (limit path).
+        if use_limit {
+            task_context.pending_fills.lock().unwrap().remove(&coin_key);
+        }
 
         if let Err(error) = outcome {
             if let Err(send_error) = task_bot
