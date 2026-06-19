@@ -158,7 +158,8 @@ pub fn render_settings(settings: &Settings) -> String {
          max_daily_risk_pct: {}\n\
          leverage_conservative: {}x\n\
          leverage_moderate: {}x\n\
-         leverage_aggressive: {}x\n\n\
+         leverage_aggressive: {}x\n\
+         entry_fill_timeout_secs: {}s\n\n\
          Change a number:  /set <key> <value>\n\
          e.g.  /set entry_pct 10\n\
          Switch entry mode with the buttons below.",
@@ -170,6 +171,7 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.leverage.conservative,
         settings.leverage.moderate,
         settings.leverage.aggressive,
+        settings.entry_fill_timeout_secs,
     )
 }
 
@@ -214,6 +216,74 @@ pub fn recompute_plan(
     })
 }
 
+/// A concise execution-progress event emitted by [`execute_plan`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionEvent {
+    /// Entry order accepted by the exchange. `limit` distinguishes a resting
+    /// limit order (awaiting fill) from a market order (filling now).
+    EntrySubmitted { limit: bool, price: f64 },
+    /// A fill was observed. `partial` marks a partial fill after a limit timeout.
+    Filled { size: f64, partial: bool },
+    /// A limit entry did not fill within the timeout. `cancelled` notes the
+    /// best-effort cancel of the resting remainder.
+    FillTimeout { cancelled: bool },
+    /// The reduce-only SL + TP bracket was placed.
+    BracketArmed { stop_loss: f64, take_profits: usize },
+}
+
+/// Receives [`ExecutionEvent`]s during [`execute_plan`]. Implementations must
+/// be best-effort: a failure to deliver must not abort execution.
+#[async_trait::async_trait]
+pub trait ProgressReporter: Send + Sync {
+    async fn report(&self, event: ExecutionEvent);
+}
+
+/// Formats an [`ExecutionEvent`] into the Indonesian message shown to the user.
+pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEvent) -> String {
+    match event {
+        ExecutionEvent::EntrySubmitted { limit: true, price } => {
+            format!("⏳ Limit {coin} @ ${price:.4} dipasang, menunggu fill…")
+        }
+        ExecutionEvent::EntrySubmitted { limit: false, .. } => {
+            format!("⏳ Entry {coin} dikirim…")
+        }
+        ExecutionEvent::Filled { size, partial: false } => {
+            format!("✅ {coin} terisi (size {size}).")
+        }
+        ExecutionEvent::Filled { size, partial: true } => {
+            format!("⚠️ Partial fill {coin}: bracket dipasang di size {size}.")
+        }
+        ExecutionEvent::FillTimeout { cancelled: true } => {
+            format!("❌ Limit {coin} tak terisi dalam {timeout_secs}s — dibatalkan, tidak ada posisi.")
+        }
+        ExecutionEvent::FillTimeout { cancelled: false } => {
+            format!("⚠️ Limit {coin} tak terisi dalam {timeout_secs}s dan pembatalan TIDAK terkonfirmasi — cek manual, mungkin masih ada order tersisa.")
+        }
+        ExecutionEvent::BracketArmed { stop_loss, take_profits } => {
+            format!("✅ SL/TP {coin} terpasang (SL ${stop_loss:.4}, {take_profits} TP).")
+        }
+    }
+}
+
+/// Production [`ProgressReporter`] that forwards each event to a Telegram chat.
+/// Send failures are logged and swallowed so execution never aborts mid-bracket.
+struct TelegramReporter {
+    bot: Bot,
+    chat_id: teloxide::types::ChatId,
+    coin: String,
+    timeout_secs: u64,
+}
+
+#[async_trait::async_trait]
+impl ProgressReporter for TelegramReporter {
+    async fn report(&self, event: ExecutionEvent) {
+        let text = format_execution_event(&self.coin, self.timeout_secs, &event);
+        if let Err(error) = self.bot.send_message(self.chat_id, text).await {
+            tracing::warn!("progress notification failed: {error}");
+        }
+    }
+}
+
 /// Sets leverage, places the entry order, waits for fill (limit only), then
 /// places the reduce-only bracket sized to the ACTUAL held position.
 ///
@@ -226,6 +296,7 @@ pub async fn execute_plan<E: Exchange>(
     plan: &ExecutionPlan,
     use_limit: bool,
     fill_timeout_secs: u64,
+    reporter: &dyn ProgressReporter,
 ) -> anyhow::Result<()> {
     let is_buy = matches!(plan.direction, Direction::Long);
     exchange.set_leverage(&plan.coin, plan.leverage).await?;
@@ -237,6 +308,9 @@ pub async fn execute_plan<E: Exchange>(
         limit_price: if use_limit { Some(plan.entry) } else { None },
     };
     let entry_result = exchange.place_entry(&entry).await?;
+    reporter
+        .report(ExecutionEvent::EntrySubmitted { limit: use_limit, price: plan.entry })
+        .await;
 
     // Determine the size we actually hold before arming the bracket.
     // For market orders (or an immediately-filled limit) this is plan.size.
@@ -247,29 +321,31 @@ pub async fn execute_plan<E: Exchange>(
             let held = exchange.position_size(&plan.coin).await?;
             if held >= plan.size * 0.99 {
                 // Treat ~full fill as full.
+                reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
                 break plan.size;
             }
             if elapsed >= fill_timeout_secs {
                 // Timed out: cancel any resting remainder, then decide.
-                if let Some(oid) = entry_result.order_id {
-                    // best-effort cancel — ignore errors to avoid masking the
-                    // partial-fill handling below.
-                    let _ = exchange.cancel_order(&plan.coin, oid).await;
-                }
+                let cancelled = match entry_result.order_id {
+                    Some(oid) => exchange.cancel_order(&plan.coin, oid).await.is_ok(),
+                    None => false,
+                };
                 let held = exchange.position_size(&plan.coin).await?;
                 if held <= 0.0 {
+                    reporter.report(ExecutionEvent::FillTimeout { cancelled }).await;
                     anyhow::bail!(
                         "entry limit order not filled within {fill_timeout_secs}s; \
                          order cancelled, no position opened"
                     );
                 }
-                // Partial fill: arm the bracket on exactly what we hold.
+                reporter.report(ExecutionEvent::Filled { size: held, partial: true }).await;
                 break held;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             elapsed += 1;
         }
     } else {
+        reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
         plan.size
     };
 
@@ -300,6 +376,12 @@ pub async fn execute_plan<E: Exchange>(
             })
             .await?;
     }
+    reporter
+        .report(ExecutionEvent::BracketArmed {
+            stop_loss: plan.stop_loss.price,
+            take_profits: plan.take_profits.len(),
+        })
+        .await;
     Ok(())
 }
 
@@ -871,67 +953,56 @@ async fn on_callback<E: Exchange + 'static>(
     )
     .await?;
 
-    // Capture signal metadata and timestamp before the async execute_plan call
-    // so we can journal even on error. `trade` is not moved by execute_plan
-    // (which only borrows &trade.plan), but extracting up-front keeps the
-    // borrow checker happy and avoids re-accessing after a potential move.
+    // Read the live timeout before spawning (never hold the lock across await).
+    let fill_timeout_secs = context.settings.lock().unwrap().entry_fill_timeout_secs;
+
+    // Reserve this trade's risk in the journal synchronously at confirm time so a
+    // concurrent confirm's daily-cap check sees it immediately — execution runs in a
+    // background task that may take up to the fill timeout to finish. Journalled once
+    // here regardless of the eventual execution outcome (order id is recorded later).
     let opened_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
-    let trade_confidence = trade.setup.confidence;
-    let trade_timeframe = trade.setup.timeframe.clone();
-    let trade_risk_reward = trade.setup.risk_reward;
-    let trade_profile = format!("{:?}", trade.profile);
-
-    match execute_plan(
-        context.exchange.as_ref(),
+    let _ = context.journal.record(
         &trade.plan,
-        use_limit,
-        context.config.entry_fill_timeout_secs,
-    )
-    .await
-    {
-        Ok(()) => {
-            // Journal every attempt so a position that was opened is always
-            // auditable — even when subsequent steps (e.g. bracket placement)
-            // returned Ok. execute_plan signature is kept as Result<()>; order
-            // id is journalled as None here (thread-out is a future task).
-            let _ = context.journal.record(
-                &trade.plan,
-                None,
-                trade_confidence,
-                trade_timeframe.as_deref(),
-                trade_risk_reward,
-                &trade_profile,
-                opened_at,
-            );
-            bot.send_message(
-                message.chat.id,
-                format!("✅ Executed {} with SL/TP bracket.", trade.plan.coin),
-            )
-            .await?;
+        None,
+        trade.setup.confidence,
+        trade.setup.timeframe.as_deref(),
+        trade.setup.risk_reward,
+        &format!("{:?}", trade.profile),
+        opened_at,
+    );
+
+    let task_context = context.clone();
+    let task_bot = bot.clone();
+    let chat_id = message.chat.id;
+    tokio::spawn(async move {
+        let reporter = TelegramReporter {
+            bot: task_bot.clone(),
+            chat_id,
+            coin: trade.plan.coin.clone(),
+            timeout_secs: fill_timeout_secs,
+        };
+
+        let outcome = execute_plan(
+            task_context.exchange.as_ref(),
+            &trade.plan,
+            use_limit,
+            fill_timeout_secs,
+            &reporter,
+        )
+        .await;
+
+        if let Err(error) = outcome {
+            if let Err(send_error) = task_bot
+                .send_message(chat_id, format!("❌ Execution failed: {error}"))
+                .await
+            {
+                tracing::warn!("failed to send execution error: {send_error}");
+            }
         }
-        Err(error) => {
-            // Journal on failure too: a partial fill may have opened a position
-            // even when execute_plan returns Err, so we must leave an audit
-            // trail before sending the error message.
-            let _ = context.journal.record(
-                &trade.plan,
-                None,
-                trade_confidence,
-                trade_timeframe.as_deref(),
-                trade_risk_reward,
-                &trade_profile,
-                opened_at,
-            );
-            bot.send_message(
-                message.chat.id,
-                format!("❌ Execution failed: {error}"),
-            )
-            .await?;
-        }
-    }
+    });
     Ok(())
 }
 
@@ -957,6 +1028,26 @@ pub async fn run<E: Exchange + 'static>(
         settings_store,
         http,
     });
+
+    // Background close (TP/SL) notifications. Uses its own Journal connection
+    // (separate SQLite handle) so it never contends with the bot's writes.
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let monitor_journal = Arc::new(Journal::open(&journal_path)?);
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        let monitor_poll_secs = context.config.monitor_poll_secs;
+        tokio::spawn(async move {
+            crate::monitor::run_fill_monitor(
+                monitor_bot,
+                monitor_exchange,
+                monitor_journal,
+                monitor_user_ids,
+                monitor_poll_secs,
+            )
+            .await;
+        });
+    }
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message::<E>))
@@ -1050,6 +1141,7 @@ mod tests {
             entry_fixed_usd: 50.0,
             max_daily_risk_pct: Some(5.0),
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+            entry_fill_timeout_secs: 300,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1064,6 +1156,7 @@ mod tests {
             risk_pct: 1.0, entry_pct: 10.0, entry_fixed_usd: 50.0,
             max_daily_risk_pct: None,
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+            entry_fill_timeout_secs: 300,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }
@@ -1126,6 +1219,18 @@ mod tests {
     use crate::hyperliquid::mock::MockExchange;
     use crate::sizing::AssetMeta;
 
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: std::sync::Mutex<Vec<super::ExecutionEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::ProgressReporter for RecordingReporter {
+        async fn report(&self, event: super::ExecutionEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     #[tokio::test]
     async fn execute_plan_sets_leverage_then_entry_then_brackets() {
         let exchange = MockExchange {
@@ -1134,7 +1239,8 @@ mod tests {
             ..Default::default()
         };
         let plan = plan(); // long, size 666.6, 2 TPs
-        super::execute_plan(&exchange, &plan, false, 1).await.unwrap();
+        let reporter = RecordingReporter::default();
+        super::execute_plan(&exchange, &plan, false, 1, &reporter).await.unwrap();
 
         assert_eq!(exchange.leverage_calls.lock().unwrap().len(), 1);
         assert_eq!(exchange.entries.lock().unwrap().len(), 1);
@@ -1161,7 +1267,8 @@ mod tests {
         let plan = plan(); // long, size 666.6, SL + 2 TPs
         // use_limit=true so a limit entry is placed; fill_timeout_secs=0 so the
         // loop times out immediately on the first iteration (400 < 666.6 * 0.99).
-        super::execute_plan(&exchange, &plan, true, 0).await.unwrap();
+        let reporter = RecordingReporter::default();
+        super::execute_plan(&exchange, &plan, true, 0, &reporter).await.unwrap();
 
         // The resting order (id=1 from MockExchange) must have been cancelled.
         let cancels = exchange.cancels.lock().unwrap();
@@ -1191,5 +1298,30 @@ mod tests {
                 take_profit.size
             );
         }
+    }
+
+    #[tokio::test]
+    async fn execute_plan_reports_market_event_sequence() {
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            ..Default::default()
+        };
+        let plan = plan();
+        let reporter = RecordingReporter::default();
+        super::execute_plan(&exchange, &plan, false, 1, &reporter).await.unwrap();
+
+        let events = reporter.events.lock().unwrap();
+        assert!(matches!(events.first(), Some(super::ExecutionEvent::EntrySubmitted { limit: false, .. })));
+        assert!(events.iter().any(|e| matches!(e, super::ExecutionEvent::Filled { partial: false, .. })));
+        assert!(matches!(events.last(), Some(super::ExecutionEvent::BracketArmed { take_profits: 2, .. })));
+    }
+
+    #[test]
+    fn format_execution_event_renders_indonesian_copy() {
+        let armed = super::ExecutionEvent::BracketArmed { stop_loss: 280.0, take_profits: 2 };
+        let text = super::format_execution_event("TAO", 300, &armed);
+        assert!(text.contains("TAO"));
+        assert!(text.contains("SL/TP"));
     }
 }
