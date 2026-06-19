@@ -15,6 +15,7 @@ pub const CB_MODERATE: &str = "profile:moderate";
 pub const CB_AGGRESSIVE: &str = "profile:aggressive";
 pub const CB_LIMIT: &str = "confirm:limit";
 pub const CB_MARKET: &str = "confirm:market";
+pub const CB_TRIGGER: &str = "confirm:trigger";
 pub const CB_CANCEL: &str = "cancel";
 pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
@@ -100,6 +101,7 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
         vec![
             InlineKeyboardButton::callback("✅ Confirm Limit", CB_LIMIT),
             InlineKeyboardButton::callback("⚡ Confirm Market", CB_MARKET),
+            InlineKeyboardButton::callback("🎯 Confirm Trigger", CB_TRIGGER),
         ],
         vec![InlineKeyboardButton::callback("❌ Cancel", CB_CANCEL)],
     ])
@@ -422,6 +424,7 @@ pub struct BotContext<E: Exchange + 'static> {
     pub journal: Arc<Journal>,
     pub settings: Arc<std::sync::Mutex<Settings>>,
     pub settings_store: Arc<SettingsStore>,
+    pub triggers: Arc<crate::trigger_store::TriggerStore>,
     pub http: reqwest::Client,
 }
 
@@ -932,9 +935,11 @@ async fn on_callback<E: Exchange + 'static>(
         return Ok(());
     }
 
-    let use_limit = match data.as_str() {
-        CB_LIMIT => true,
-        CB_MARKET => false,
+    enum Confirm { Limit, Market, Trigger }
+    let confirm = match data.as_str() {
+        CB_LIMIT => Confirm::Limit,
+        CB_MARKET => Confirm::Market,
+        CB_TRIGGER => Confirm::Trigger,
         _ => return Ok(()),
     };
 
@@ -968,12 +973,6 @@ async fn on_callback<E: Exchange + 'static>(
     }
 
     bot.answer_callback_query(&query.id).await?;
-    bot.edit_message_text(
-        message.chat.id,
-        message.id,
-        format!("Executing {}…", trade.plan.coin),
-    )
-    .await?;
 
     // Read the live timeout before spawning (never hold the lock across await).
     let fill_timeout_secs = context.settings.lock().unwrap().entry_fill_timeout_secs;
@@ -996,9 +995,75 @@ async fn on_callback<E: Exchange + 'static>(
         opened_at,
     );
 
+    let chat_id = message.chat.id;
+
+    // Trigger path: place a resting trigger entry on the exchange, persist it to
+    // TriggerStore, and return — the trigger monitor (run_trigger_monitor) will arm
+    // the bracket once the fill lands, or cancel on expiry.
+    if let Confirm::Trigger = confirm {
+        bot.edit_message_text(
+            message.chat.id,
+            message.id,
+            format!("Memasang trigger {}…", trade.plan.coin),
+        )
+        .await?;
+
+        let is_buy = matches!(trade.plan.direction, Direction::Long);
+        let expiry_secs = context.settings.lock().unwrap().trigger_expiry_secs;
+
+        if let Err(error) = context.exchange.set_leverage(&trade.plan.coin, trade.plan.leverage).await {
+            bot.send_message(chat_id, format!("❌ Gagal set leverage: {error}")).await.ok();
+            return Ok(());
+        }
+
+        let placed = context.exchange.place_trigger_entry(
+            &trade.plan.coin, is_buy, trade.plan.size, trade.plan.entry,
+        ).await;
+
+        match placed {
+            Ok(result) => {
+                let take_profits: Vec<crate::trigger_store::PendingLeg> = trade.setup.take_profits.iter()
+                    .map(|tp| crate::trigger_store::PendingLeg { price: tp.price, alloc_pct: tp.allocation_pct })
+                    .collect();
+                let pending = crate::trigger_store::PendingTrigger {
+                    id: 0,
+                    coin: trade.plan.coin.clone(),
+                    direction: format!("{:?}", trade.plan.direction),
+                    size: trade.plan.size,
+                    trigger_px: trade.plan.entry,
+                    leverage: trade.plan.leverage,
+                    stop_loss: trade.plan.stop_loss.price,
+                    take_profits,
+                    entry_oid: result.order_id,
+                    chat_id: chat_id.0,
+                    created_at: opened_at,
+                    expiry_at: opened_at + expiry_secs as i64,
+                    status: "active".into(),
+                };
+                let _ = context.triggers.insert(&pending);
+                bot.send_message(
+                    chat_id,
+                    format!("🎯 Trigger {} @ ${:.4} dipasang — nunggu harga menembus.", trade.plan.coin, trade.plan.entry),
+                ).await.ok();
+            }
+            Err(error) => {
+                bot.send_message(chat_id, format!("❌ Gagal pasang trigger: {error}")).await.ok();
+            }
+        }
+        return Ok(());
+    }
+
+    // Limit / Market path: edit message then spawn execution.
+    bot.edit_message_text(
+        message.chat.id,
+        message.id,
+        format!("Executing {}…", trade.plan.coin),
+    )
+    .await?;
+
+    let use_limit = matches!(confirm, Confirm::Limit);
     let task_context = context.clone();
     let task_bot = bot.clone();
-    let chat_id = message.chat.id;
     tokio::spawn(async move {
         let reporter = TelegramReporter {
             bot: task_bot.clone(),
@@ -1041,6 +1106,8 @@ pub async fn run<E: Exchange + 'static>(
     let journal_path = config.journal_path.clone();
     let settings_store = Arc::new(SettingsStore::open(&journal_path)?);
     let seeded = settings_store.load(Settings::from_config(&config))?;
+    // Single shared TriggerStore — BotContext and run_trigger_monitor both use this Arc.
+    let trigger_store = Arc::new(crate::trigger_store::TriggerStore::open(&journal_path)?);
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
@@ -1048,6 +1115,7 @@ pub async fn run<E: Exchange + 'static>(
         journal: Arc::new(Journal::open(&journal_path)?),
         settings: Arc::new(std::sync::Mutex::new(seeded)),
         settings_store,
+        triggers: trigger_store.clone(),
         http,
     });
 
@@ -1072,17 +1140,17 @@ pub async fn run<E: Exchange + 'static>(
     }
 
     // Background trigger-entry monitor: arms SL/TP when the trigger fill lands,
-    // or cancels and notifies on expiry. Opens its own TriggerStore connection
-    // (Task 7 will promote this to a shared Arc via BotContext).
+    // or cancels and notifies on expiry. Uses the same shared TriggerStore Arc as
+    // BotContext so inserts from on_callback are immediately visible to the monitor.
     {
         let monitor_bot = bot.clone();
         let monitor_exchange = context.exchange.clone();
-        let trigger_store = Arc::new(crate::trigger_store::TriggerStore::open(&journal_path)?);
+        let monitor_trigger_store = trigger_store.clone();
         let monitor_user_ids = context.config.allowed_user_ids.clone();
         let monitor_poll_secs = context.config.monitor_poll_secs;
         tokio::spawn(async move {
             crate::monitor::run_trigger_monitor(
-                monitor_bot, monitor_exchange, trigger_store, monitor_user_ids, monitor_poll_secs,
+                monitor_bot, monitor_exchange, monitor_trigger_store, monitor_user_ids, monitor_poll_secs,
             ).await;
         });
     }
