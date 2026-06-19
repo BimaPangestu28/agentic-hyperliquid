@@ -17,6 +17,7 @@ pub const CB_LIMIT: &str = "confirm:limit";
 pub const CB_MARKET: &str = "confirm:market";
 pub const CB_TRIGGER: &str = "confirm:trigger";
 pub const CB_CANCEL: &str = "cancel";
+pub const CB_CANCEL_FILL_PREFIX: &str = "cancel_fill:";
 pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
 pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
@@ -121,6 +122,16 @@ pub fn confirmation_keyboard(active: RiskProfile, trigger_enabled: bool) -> Inli
         execute_row,
         vec![InlineKeyboardButton::callback("❌ Cancel", CB_CANCEL)],
     ])
+}
+
+/// One-button keyboard attached to the "menunggu fill…" message so the user can
+/// cancel a resting limit entry before it fills. The callback data carries the
+/// coin so `on_callback` can look up the right in-flight wait.
+fn fill_wait_keyboard(coin: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "❌ Batalkan order",
+        format!("{CB_CANCEL_FILL_PREFIX}{coin}"),
+    )]])
 }
 
 /// Sum of unrealized PnL across all positions.
@@ -1590,5 +1601,20 @@ mod tests {
         // sample_positions(): BTC uPnL=45.20, ETH uPnL=-12.80 => total=+32.40
         let text = super::render_account(1234.56, &sample_positions(), 0.0, Some(10.0));
         assert!(text.contains("Total uPnL: $+32.40"));
+    }
+
+    #[test]
+    fn fill_wait_keyboard_has_single_cancel_button_for_coin() {
+        let keyboard = super::fill_wait_keyboard("AERO");
+        let rows = &keyboard.inline_keyboard;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        let button = &rows[0][0];
+        match &button.kind {
+            teloxide::types::InlineKeyboardButtonKind::CallbackData(data) => {
+                assert_eq!(data, "cancel_fill:AERO");
+            }
+            other => panic!("expected callback button, got {other:?}"),
+        }
     }
 }
