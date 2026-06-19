@@ -74,6 +74,10 @@ pub struct TradeMeta {
 impl Journal {
     fn from_connection(connection: Connection) -> anyhow::Result<Self> {
         connection.execute(SCHEMA, [])?;
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS seen_fills (fill_key TEXT PRIMARY KEY)",
+            [],
+        )?;
         // Run migrations idempotently — ignore "duplicate column" errors on
         // pre-existing databases.
         for migration in MIGRATIONS {
@@ -227,6 +231,35 @@ impl Journal {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Returns true if `fill_key` has already been recorded as notified.
+    pub fn is_fill_seen(&self, fill_key: &str) -> anyhow::Result<bool> {
+        let connection = self.connection.lock().unwrap();
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM seen_fills WHERE fill_key = ?1",
+            rusqlite::params![fill_key],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Records `fill_key` as notified. Idempotent (INSERT OR IGNORE).
+    pub fn mark_fill_seen(&self, fill_key: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap();
+        connection.execute(
+            "INSERT OR IGNORE INTO seen_fills (fill_key) VALUES (?1)",
+            rusqlite::params![fill_key],
+        )?;
+        Ok(())
+    }
+
+    /// Returns true when no fills have been recorded yet — used once at monitor
+    /// startup to baseline historical fills silently on a brand-new database.
+    pub fn seen_fills_empty(&self) -> anyhow::Result<bool> {
+        let connection = self.connection.lock().unwrap();
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM seen_fills", [], |row| row.get(0))?;
+        Ok(count == 0)
+    }
+
     #[cfg(test)]
     fn count(&self) -> anyhow::Result<i64> {
         let connection = self.connection.lock().unwrap();
@@ -315,6 +348,20 @@ mod tests {
         assert_eq!(bracket.stop_loss, 280.0);
         assert_eq!(bracket.take_profits, vec![340.0, 380.0]);
         assert!(journal.latest_bracket_for_coin("ETH").unwrap().is_none());
+    }
+
+    #[test]
+    fn seen_fills_dedup_lifecycle() {
+        let journal = Journal::open_in_memory().unwrap();
+        assert!(journal.seen_fills_empty().unwrap(), "fresh db has no seen fills");
+        assert!(!journal.is_fill_seen("123:1000:300.0:10.0").unwrap());
+
+        journal.mark_fill_seen("123:1000:300.0:10.0").unwrap();
+        assert!(journal.is_fill_seen("123:1000:300.0:10.0").unwrap());
+        assert!(!journal.seen_fills_empty().unwrap());
+
+        // Idempotent: marking the same key twice does not error.
+        journal.mark_fill_seen("123:1000:300.0:10.0").unwrap();
     }
 
     #[test]
