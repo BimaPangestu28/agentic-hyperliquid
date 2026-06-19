@@ -44,6 +44,11 @@ and buttons: switch risk profile (Conservative/Moderate/Aggressive → leverage)
 then **Confirm Limit** or **Confirm Market**, or **Cancel**. On confirmation it
 sets leverage, places the entry, and arms a reduce-only SL + TP1 + TP2 bracket.
 
+While a trade executes the bot reports each step (entry submitted, fill, bracket
+armed; partial-fill and timeout are flagged). A background monitor polls fill
+history every `MONITOR_POLL_SECS` (default 30s) and messages you when a TP or SL
+closes a position, naming the leg (TP1/TP2/SL) and the realized PnL.
+
 ## LLM parsing
 When `DEEPSEEK_API_KEY` is set, the bot uses DeepSeek as the primary card parser —
 it calls the DeepSeek chat API (OpenAI-compatible) to extract structured fields from
