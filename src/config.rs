@@ -62,6 +62,9 @@ pub struct Config {
     /// Path to the SQLite trade journal shared by the bot and the API server.
     /// Set via `JOURNAL_DB_PATH` (default `trades.db`).
     pub journal_path: String,
+    /// Seconds between background polls of the fill history for close
+    /// (TP/SL) notifications. Set via `MONITOR_POLL_SECS` (default 30).
+    pub monitor_poll_secs: u64,
 }
 
 impl Config {
@@ -167,6 +170,7 @@ pub fn from_env() -> anyhow::Result<Config> {
             .unwrap_or_else(|_| "127.0.0.1:8088".to_string()),
         api_token: std::env::var("PORTFOLIO_API_TOKEN").ok().filter(|s| !s.is_empty()),
         journal_path: std::env::var("JOURNAL_DB_PATH").unwrap_or_else(|_| "trades.db".to_string()),
+        monitor_poll_secs: parse_env_or("MONITOR_POLL_SECS", 30_u64)?,
     })
 }
 
@@ -205,9 +209,16 @@ mod tests {
             http_bind_addr: "127.0.0.1:8088".into(),
             api_token: None,
             journal_path: "trades.db".into(),
+            monitor_poll_secs: 30,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));
+    }
+
+    #[test]
+    fn monitor_poll_secs_defaults_to_30_when_absent() {
+        std::env::remove_var("MONITOR_POLL_SECS");
+        assert_eq!(parse_env_or::<u64>("MONITOR_POLL_SECS", 30).unwrap(), 30);
     }
 
     #[test]
