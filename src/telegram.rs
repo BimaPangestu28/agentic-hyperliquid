@@ -1037,6 +1037,26 @@ pub async fn run<E: Exchange + 'static>(
         http,
     });
 
+    // Background close (TP/SL) notifications. Uses its own Journal connection
+    // (separate SQLite handle) so it never contends with the bot's writes.
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let monitor_journal = Arc::new(Journal::open(&journal_path)?);
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        let monitor_poll_secs = context.config.monitor_poll_secs;
+        tokio::spawn(async move {
+            crate::monitor::run_fill_monitor(
+                monitor_bot,
+                monitor_exchange,
+                monitor_journal,
+                monitor_user_ids,
+                monitor_poll_secs,
+            )
+            .await;
+        });
+    }
+
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message::<E>))
         .branch(Update::filter_callback_query().endpoint(on_callback::<E>));

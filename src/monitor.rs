@@ -1,8 +1,12 @@
 //! Background fill monitor: polls Hyperliquid fill history and notifies the
 //! Telegram user when a TP or SL trigger closes a position.
 
-use crate::hyperliquid::FillDetail;
-use crate::journal::Bracket;
+use crate::hyperliquid::{Exchange, FillDetail};
+use crate::journal::{Bracket, Journal};
+use std::sync::Arc;
+use std::time::Duration;
+use teloxide::prelude::*;
+use teloxide::types::ChatId;
 
 /// Which bracket leg a closing fill corresponds to.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,9 +45,96 @@ pub fn classify_close_fill(fill_price: f64, bracket: &Bracket) -> CloseLabel {
     best_label
 }
 
+/// Formats a signed USD PnL as `+$12.30` / `-$8.10`.
+fn format_pnl(closed_pnl: f64) -> String {
+    let sign = if closed_pnl < 0.0 { "-" } else { "+" };
+    format!("{sign}${:.2}", closed_pnl.abs())
+}
+
+/// Builds the Telegram message for a closed position.
+pub fn format_close_message(coin: &str, label: Option<CloseLabel>, closed_pnl: f64) -> String {
+    let pnl = format_pnl(closed_pnl);
+    match label {
+        Some(CloseLabel::TakeProfit(index)) => format!("🎯 TP{index} kena — {coin} {pnl}"),
+        Some(CloseLabel::StopLoss) => format!("🛑 SL kena — {coin} {pnl}"),
+        None => format!("📕 Posisi {coin} ditutup — {pnl}"),
+    }
+}
+
+/// Polls fill history every `poll_secs` and notifies all `allowed_user_ids`
+/// when a TP/SL closing fill is observed. Never panics: poll/send/DB errors are
+/// logged and the loop continues.
+///
+/// On a brand-new database (`seen_fills` empty) the first pass baselines all
+/// historical closing fills silently so the user is not spammed at first boot.
+pub async fn run_fill_monitor<E: Exchange + 'static>(
+    bot: Bot,
+    exchange: Arc<E>,
+    journal: Arc<Journal>,
+    allowed_user_ids: Vec<i64>,
+    poll_secs: u64,
+) {
+    // Baseline: silence pre-existing fills on a fresh database.
+    if journal.seen_fills_empty().unwrap_or(false) {
+        if let Ok(fills) = exchange.fills_detailed().await {
+            for fill in fills.iter().filter(|fill| is_closing(fill)) {
+                let _ = journal.mark_fill_seen(&fill_key(fill));
+            }
+        }
+        tracing::info!("fill monitor baselined historical fills");
+    }
+
+    let interval = Duration::from_secs(poll_secs.max(1));
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let fills = match exchange.fills_detailed().await {
+            Ok(fills) => fills,
+            Err(error) => {
+                tracing::warn!("fill monitor poll failed: {error}");
+                continue;
+            }
+        };
+
+        for fill in fills.iter().filter(|fill| is_closing(fill)) {
+            let key = fill_key(fill);
+            if journal.is_fill_seen(&key).unwrap_or(false) {
+                continue;
+            }
+            let label = journal
+                .latest_bracket_for_coin(&fill.coin)
+                .ok()
+                .flatten()
+                .map(|bracket| classify_close_fill(fill.px, &bracket));
+            let message = format_close_message(&fill.coin, label, fill.closed_pnl);
+            for user_id in &allowed_user_ids {
+                if let Err(error) = bot.send_message(ChatId(*user_id), &message).await {
+                    tracing::warn!("close notification failed for {user_id}: {error}");
+                }
+            }
+            let _ = journal.mark_fill_seen(&key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_close_message_labels_leg_and_pnl() {
+        let tp = format_close_message("TAO", Some(CloseLabel::TakeProfit(1)), 12.30);
+        assert!(tp.contains("TP1"));
+        assert!(tp.contains("TAO"));
+        assert!(tp.contains("+$12.30"));
+
+        let sl = format_close_message("TAO", Some(CloseLabel::StopLoss), -8.10);
+        assert!(sl.contains("SL"));
+        assert!(sl.contains("-$8.10"));
+
+        let generic = format_close_message("TAO", None, 5.0);
+        assert!(generic.contains("ditutup"));
+    }
 
     fn detail(dir: &str, closed_pnl: f64, oid: u64, px: f64, sz: f64, time_ms: i64) -> FillDetail {
         FillDetail {
