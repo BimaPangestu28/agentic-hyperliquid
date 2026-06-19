@@ -117,6 +117,36 @@ pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
     ])
 }
 
+/// Sum of unrealized PnL across all positions.
+fn total_unrealized_pnl(positions: &[OpenPosition]) -> f64 {
+    positions.iter().map(|position| position.unrealized_pnl).sum()
+}
+
+/// One position row, shared by /account and the P&L push.
+fn position_line(position: &OpenPosition) -> String {
+    format!(
+        "  {:<6} {:<5} {} @ ${:.2}  mark ${:.2}  uPnL ${:+.2}  {:.0}x\n",
+        position.coin,
+        position.direction.to_uppercase(),
+        position.size,
+        position.entry_px,
+        position.mark_px,
+        position.unrealized_pnl,
+        position.leverage,
+    )
+}
+
+/// Running-P&L push: total + per-position unrealized PnL.
+pub fn render_pnl_summary(equity: f64, positions: &[OpenPosition]) -> String {
+    let mut out = String::from("📊 Running P&L\n");
+    out.push_str(&format!("Equity: ${:.2}\n", equity));
+    out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
+    for position in positions {
+        out.push_str(&position_line(position));
+    }
+    out
+}
+
 /// Plain-text account card (no parse_mode). The daily-risk line is omitted
 /// when the cap is disabled (`cap_pct` is `None`).
 pub fn render_account(
@@ -140,17 +170,9 @@ pub fn render_account(
         return out;
     }
     out.push_str(&format!("\nOpen positions ({}):\n", positions.len()));
+    out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
     for position in positions {
-        out.push_str(&format!(
-            "  {:<6} {:<5} {} @ ${:.2}  mark ${:.2}  uPnL ${:+.2}  {:.0}x\n",
-            position.coin,
-            position.direction.to_uppercase(),
-            position.size,
-            position.entry_px,
-            position.mark_px,
-            position.unrealized_pnl,
-            position.leverage,
-        ));
+        out.push_str(&position_line(position));
     }
     out
 }
@@ -1469,5 +1491,21 @@ mod tests {
         // Short: fires immediately if trigger >= mark.
         assert!(super::trigger_fires_immediately(Direction::Short, 68.53, 68.00));
         assert!(!super::trigger_fires_immediately(Direction::Short, 68.53, 69.00));
+    }
+
+    #[test]
+    fn render_pnl_summary_totals_unrealized() {
+        // sample_positions(): BTC uPnL=45.20, ETH uPnL=-12.80 => total=+32.40
+        let text = super::render_pnl_summary(1234.56, &sample_positions());
+        assert!(text.contains("Total uPnL: $+32.40"));
+        assert!(text.contains("BTC"));
+        assert!(text.contains("ETH"));
+    }
+
+    #[test]
+    fn account_card_shows_total_upnl_when_positions_present() {
+        // sample_positions(): BTC uPnL=45.20, ETH uPnL=-12.80 => total=+32.40
+        let text = super::render_account(1234.56, &sample_positions(), 0.0, Some(10.0));
+        assert!(text.contains("Total uPnL: $+32.40"));
     }
 }
