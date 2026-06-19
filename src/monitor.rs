@@ -3,7 +3,9 @@
 
 use crate::hyperliquid::{Exchange, FillDetail};
 use crate::journal::{Bracket, Journal};
-use std::sync::Arc;
+use crate::settings::Settings;
+use crate::trigger_store::{PendingTrigger, TriggerStore};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::ChatId;
@@ -43,6 +45,31 @@ pub fn classify_close_fill(fill_price: f64, bracket: &Bracket) -> CloseLabel {
         }
     }
     best_label
+}
+
+/// True when `now_secs` is past the trigger's expiry timestamp.
+pub fn is_expired(now_secs: i64, expiry_at: i64) -> bool {
+    now_secs > expiry_at
+}
+
+/// True when `fill` is the OPENING fill of `pending`'s entry order: an opening
+/// `dir`, matching `entry_oid` (when known), and `time_ms >= created_at`. Matching
+/// the specific order id keeps this correct even if a position already existed on
+/// the coin (an older or closing fill never matches).
+pub fn matches_entry_fill(fill: &FillDetail, pending: &PendingTrigger) -> bool {
+    let is_opening = fill.dir.to_ascii_lowercase().contains("open");
+    let oid_ok = match pending.entry_oid {
+        Some(oid) => fill.oid == oid,
+        None => fill.coin.eq_ignore_ascii_case(&pending.coin),
+    };
+    is_opening && oid_ok && fill.time_ms >= pending.created_at
+}
+
+/// Total filled size across all opening fills that belong to `pending`'s entry
+/// order. Summing (not first-match) keeps the bracket correctly sized when a
+/// market-on-trigger entry fills in multiple prints.
+pub fn sum_entry_fill_size(fills: &[FillDetail], pending: &PendingTrigger) -> f64 {
+    fills.iter().filter(|fill| matches_entry_fill(fill, pending)).map(|fill| fill.sz).sum()
 }
 
 /// Formats a signed USD PnL as `+$12.30` / `-$8.10`.
@@ -132,6 +159,150 @@ pub async fn run_fill_monitor<E: Exchange + 'static>(
     }
 }
 
+/// Polls for trigger-entry fills (arming the bracket) and expiries (cancelling the
+/// resting order). Never panics: all errors are logged and the loop continues.
+pub async fn run_trigger_monitor<E: Exchange + 'static>(
+    bot: Bot,
+    exchange: Arc<E>,
+    triggers: Arc<TriggerStore>,
+    allowed_user_ids: Vec<i64>,
+    poll_secs: u64,
+) {
+    let interval = Duration::from_secs(poll_secs.max(1));
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let active = match triggers.list_active() {
+            Ok(active) => active,
+            Err(error) => { tracing::warn!("trigger monitor list_active failed: {error}"); continue; }
+        };
+        if active.is_empty() { continue; }
+
+        let fills = exchange.fills_detailed().await.unwrap_or_else(|error| {
+            tracing::warn!("trigger monitor fills_detailed failed: {error}");
+            Vec::new()
+        });
+        let now_secs = now_unix_secs();
+
+        for pending in active {
+            // 1. Filled? Sum ALL matching opening fills so the bracket is sized to
+            //    the actual position even when the entry filled in multiple prints.
+            let filled_size = sum_entry_fill_size(&fills, &pending);
+            if filled_size > 0.0 {
+                let close_is_buy = !pending.direction.eq_ignore_ascii_case("long");
+                // Place the SL FIRST. Only once it is on the book do we mark the
+                // trigger armed — so a retry never double-places the SL (if the SL
+                // itself fails, nothing was placed and the next poll retries cleanly).
+                let stop_loss = crate::hyperliquid::TriggerOrder {
+                    coin: pending.coin.clone(),
+                    is_buy: close_is_buy,
+                    size: filled_size,
+                    trigger_price: pending.stop_loss,
+                    is_take_profit: false,
+                };
+                match exchange.place_trigger(&stop_loss).await {
+                    Err(error) => {
+                        tracing::warn!("trigger SL placement failed for {}: {error}", pending.coin);
+                        notify_users(&bot, &allowed_user_ids,
+                            &format!("⚠️ Posisi {} TERBUKA tapi GAGAL pasang SL — cek manual SEKARANG!", pending.coin)).await;
+                        // leave active → retry next poll (no SL placed yet, no duplicate)
+                        continue;
+                    }
+                    Ok(_) => {
+                        // Position is now protected; mark armed so the SL is never re-placed.
+                        let _ = triggers.mark_armed(pending.id);
+                        // Place TPs best-effort, sized to the actual filled size.
+                        let mut failed_tps: Vec<usize> = Vec::new();
+                        for (index, leg) in pending.take_profits.iter().enumerate() {
+                            let tp = crate::hyperliquid::TriggerOrder {
+                                coin: pending.coin.clone(),
+                                is_buy: close_is_buy,
+                                size: filled_size * (leg.alloc_pct / 100.0),
+                                trigger_price: leg.price,
+                                is_take_profit: true,
+                            };
+                            if let Err(error) = exchange.place_trigger(&tp).await {
+                                tracing::warn!("trigger TP{} placement failed for {}: {error}", index + 1, pending.coin);
+                                failed_tps.push(index + 1);
+                            }
+                        }
+                        let message = if failed_tps.is_empty() {
+                            format!("✅ Trigger {} kena — SL/TP terpasang.", pending.coin)
+                        } else {
+                            format!("✅ Trigger {} kena — SL terpasang. ⚠️ TP{:?} gagal, pasang manual.", pending.coin, failed_tps)
+                        };
+                        notify_users(&bot, &allowed_user_ids, &message).await;
+                    }
+                }
+                continue;
+            }
+            // 2. Expired? Cancel the resting entry order.
+            if is_expired(now_secs, pending.expiry_at) {
+                if let Some(oid) = pending.entry_oid {
+                    if let Err(error) = exchange.cancel_order(&pending.coin, oid).await {
+                        tracing::warn!("trigger expiry cancel failed for {}: {error}", pending.coin);
+                    }
+                }
+                let _ = triggers.mark_expired(pending.id);
+                notify_users(&bot, &allowed_user_ids, &format!("⏱️ Trigger {} kadaluarsa — dibatalkan, tidak ada posisi.", pending.coin)).await;
+            }
+        }
+    }
+}
+
+/// Periodically pushes a running-P&L summary while positions are open. Reads
+/// `pnl_push_secs` from live settings each tick (0 disables → idle). Never panics.
+pub async fn run_pnl_monitor<E: Exchange + 'static>(
+    bot: Bot,
+    exchange: Arc<E>,
+    settings: Arc<Mutex<Settings>>,
+    allowed_user_ids: Vec<i64>,
+) {
+    loop {
+        let push_secs = settings.lock().unwrap().pnl_push_secs;
+        if push_secs == 0 {
+            // Disabled: idle at a fixed cadence so re-enabling via /set takes effect.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        tokio::time::sleep(Duration::from_secs(push_secs)).await;
+
+        let positions = match exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => { tracing::warn!("pnl monitor positions() failed: {error}"); continue; }
+        };
+        if positions.is_empty() { continue; }
+
+        let equity = match exchange.equity().await {
+            Ok(equity) => equity,
+            Err(error) => { tracing::warn!("pnl monitor equity() failed: {error}"); continue; }
+        };
+        let message = crate::telegram::render_pnl_summary(equity, &positions);
+        for user_id in &allowed_user_ids {
+            if let Err(error) = bot.send_message(ChatId(*user_id), &message).await {
+                tracing::warn!("pnl push failed for {user_id}: {error}");
+            }
+        }
+    }
+}
+
+/// Sends `message` to every allowlisted user, logging (not propagating) send errors.
+async fn notify_users(bot: &Bot, allowed_user_ids: &[i64], message: &str) {
+    for user_id in allowed_user_ids {
+        if let Err(error) = bot.send_message(ChatId(*user_id), message).await {
+            tracing::warn!("trigger notification failed for {user_id}: {error}");
+        }
+    }
+}
+
+/// Current UNIX time in seconds (0 on clock error).
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +334,52 @@ mod tests {
             time_ms,
             start_position: 0.0,
         }
+    }
+
+    fn detail_full(dir: &str, oid: u64, time_ms: i64, coin: &str) -> FillDetail {
+        FillDetail { coin: coin.into(), oid, dir: dir.into(), px: 68.53, sz: 0.5,
+            closed_pnl: 0.0, fee: 0.0, time_ms, start_position: 0.0 }
+    }
+
+    fn pending(entry_oid: Option<u64>, created_at: i64) -> crate::trigger_store::PendingTrigger {
+        crate::trigger_store::PendingTrigger {
+            id: 1, coin: "SOL".into(), direction: "Long".into(), size: 0.5, trigger_px: 68.53,
+            leverage: 3, stop_loss: 68.02, take_profits: vec![], entry_oid, chat_id: 1,
+            created_at, expiry_at: created_at + 100, status: "active".into(),
+        }
+    }
+
+    #[test]
+    fn is_expired_compares_now_to_expiry() {
+        assert!(!is_expired(1099, 1100));
+        assert!(is_expired(1101, 1100));
+    }
+
+    #[test]
+    fn sum_entry_fill_size_adds_matching_opening_fills() {
+        let p = pending(Some(7), 1000);
+        let fills = vec![
+            detail_full("Open Long", 7, 1500, "SOL"),  // sz 0.5
+            detail_full("Open Long", 7, 1600, "SOL"),  // sz 0.5
+            detail_full("Open Long", 8, 1500, "SOL"),  // wrong oid → ignored
+            detail_full("Close Long", 7, 1500, "SOL"), // closing → ignored
+        ];
+        assert!((sum_entry_fill_size(&fills, &p) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn matches_entry_fill_by_oid_and_opening_dir_and_time() {
+        let p = pending(Some(7), 1000);
+        let opening = detail_full("Open Long", 7, 1500, "SOL");
+        assert!(matches_entry_fill(&opening, &p));
+        // wrong oid
+        assert!(!matches_entry_fill(&detail_full("Open Long", 8, 1500, "SOL"), &p));
+        // closing dir
+        assert!(!matches_entry_fill(&detail_full("Close Long", 7, 1500, "SOL"), &p));
+        // older than created_at
+        assert!(!matches_entry_fill(&detail_full("Open Long", 7, 999, "SOL"), &p));
+        // pre-existing-position guard: an older opening fill on same coin must not match
+        assert!(!matches_entry_fill(&detail_full("Open Long", 7, 500, "SOL"), &p));
     }
 
     #[test]

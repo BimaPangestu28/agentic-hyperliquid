@@ -100,6 +100,9 @@ pub trait Exchange: Send + Sync {
     async fn set_leverage(&self, coin: &str, leverage: u32) -> anyhow::Result<()>;
     async fn place_entry(&self, order: &EntryOrder) -> anyhow::Result<OrderResult>;
     async fn place_trigger(&self, order: &TriggerOrder) -> anyhow::Result<OrderResult>;
+    /// Places a market-on-trigger ENTRY order (opens a position when price crosses
+    /// `trigger_price`). Not reduce-only. Returns the resting order's id in `order_id`.
+    async fn place_trigger_entry(&self, coin: &str, is_buy: bool, size: f64, trigger_price: f64) -> anyhow::Result<OrderResult>;
     async fn position_size(&self, coin: &str) -> anyhow::Result<f64>;
     /// Cancels a resting order by its exchange-assigned order id.
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
@@ -166,6 +169,8 @@ pub mod mock {
         pub fills_detailed: Mutex<Vec<super::FillDetail>>,
         /// Pre-loaded USDC ledger flows returned by `usdc_flows()`.
         pub flows: Mutex<Vec<super::LedgerFlow>>,
+        /// Records every `place_trigger_entry` call as `(coin, is_buy, size, trigger_price)`.
+        pub trigger_entries: Mutex<Vec<(String, bool, f64, f64)>>,
     }
 
     impl MockExchange {
@@ -232,6 +237,11 @@ pub mod mock {
                 filled: false,
                 avg_price: None,
             })
+        }
+
+        async fn place_trigger_entry(&self, coin: &str, is_buy: bool, size: f64, trigger_price: f64) -> anyhow::Result<OrderResult> {
+            self.trigger_entries.lock().unwrap().push((coin.to_string(), is_buy, size, trigger_price));
+            Ok(OrderResult { order_id: Some(7), filled: false, avg_price: None })
         }
 
         async fn position_size(&self, coin: &str) -> anyhow::Result<f64> {
@@ -358,6 +368,21 @@ pub mod mock {
         assert_eq!(mock.positions().await.unwrap(), vec![p]);
     }
 
+    #[test]
+    fn entry_trigger_tpsl_is_stop() {
+        assert_eq!(super::entry_trigger_tpsl(), "sl");
+    }
+
+    #[tokio::test]
+    async fn mock_records_trigger_entry() {
+        let exchange = MockExchange::default();
+        let result = exchange.place_trigger_entry("SOL", true, 0.5, 68.53).await.unwrap();
+        assert_eq!(result.order_id, Some(7));
+        let calls = exchange.trigger_entries.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], ("SOL".to_string(), true, 0.5, 68.53));
+    }
+
     /// Pins the signed-usdc convention: withdrawals carry a NEGATIVE usdc value.
     ///
     /// Hyperliquid returns `delta.usdc` as a negative number for withdrawals.
@@ -395,6 +420,13 @@ use hyperliquid_rust_sdk::{
     ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketOrderParams,
     OpenOrdersResponse,
 };
+
+/// Returns the Hyperliquid `tpsl` tag for a trigger ENTRY order. Entries on a
+/// reclaim/breakout are stop orders (fire when price trades through the trigger),
+/// so the tag is `"sl"`; the order side (`is_buy`) selects the trigger direction.
+fn entry_trigger_tpsl() -> &'static str {
+    "sl"
+}
 
 /// Parses an `ExchangeResponseStatus` returned by the SDK's `order` / `market_open`
 /// calls and maps it to our domain `OrderResult`.
@@ -679,6 +711,28 @@ impl Exchange for HyperliquidExchange {
             .await
             .map_err(|e| anyhow::anyhow!("place_trigger failed: {e}"))?;
 
+        parse_order_response(response)
+    }
+
+    async fn place_trigger_entry(&self, coin: &str, is_buy: bool, size: f64, trigger_price: f64) -> anyhow::Result<OrderResult> {
+        let request = ClientOrderRequest {
+            asset: coin.to_string(),
+            is_buy,
+            reduce_only: false,
+            limit_px: trigger_price,
+            sz: size,
+            cloid: None,
+            order_type: ClientOrder::Trigger(ClientTrigger {
+                trigger_px: trigger_price,
+                is_market: true,
+                tpsl: entry_trigger_tpsl().to_string(),
+            }),
+        };
+        let response = self
+            .exchange
+            .order(request, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("place_trigger_entry failed: {e}"))?;
         parse_order_response(response)
     }
 

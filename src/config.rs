@@ -65,6 +65,16 @@ pub struct Config {
     /// Seconds between background polls of the fill history for close
     /// (TP/SL) notifications. Set via `MONITOR_POLL_SECS` (default 30).
     pub monitor_poll_secs: u64,
+    /// Seconds an unfilled trigger entry rests before auto-cancellation.
+    /// Set via `TRIGGER_EXPIRY_SECS` (default 14400 = 4h).
+    pub trigger_expiry_secs: u64,
+    /// Whether the "Confirm Trigger" (stop-entry) button is shown/usable. OFF by
+    /// default: the trigger tpsl direction mapping is unverified against the live
+    /// exchange. Set via `TRIGGER_ENTRY_ENABLED` (1/true/yes to enable).
+    pub trigger_entry_enabled: bool,
+    /// Seconds between background P&L push updates while positions are open.
+    /// Set via `PNL_PUSH_SECS` (default 900 = 15min; 0 disables).
+    pub pnl_push_secs: u64,
 }
 
 impl Config {
@@ -171,6 +181,11 @@ pub fn from_env() -> anyhow::Result<Config> {
         api_token: std::env::var("PORTFOLIO_API_TOKEN").ok().filter(|s| !s.is_empty()),
         journal_path: std::env::var("JOURNAL_DB_PATH").unwrap_or_else(|_| "trades.db".to_string()),
         monitor_poll_secs: parse_env_or("MONITOR_POLL_SECS", 30_u64)?,
+        trigger_expiry_secs: parse_env_or("TRIGGER_EXPIRY_SECS", 14400_u64)?,
+        trigger_entry_enabled: std::env::var("TRIGGER_ENTRY_ENABLED")
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
+        pnl_push_secs: parse_env_or("PNL_PUSH_SECS", 900_u64)?,
     })
 }
 
@@ -210,6 +225,9 @@ mod tests {
             api_token: None,
             journal_path: "trades.db".into(),
             monitor_poll_secs: 30,
+            trigger_expiry_secs: 14400,
+            trigger_entry_enabled: false,
+            pnl_push_secs: 900,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));

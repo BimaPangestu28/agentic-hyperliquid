@@ -15,10 +15,22 @@ pub const CB_MODERATE: &str = "profile:moderate";
 pub const CB_AGGRESSIVE: &str = "profile:aggressive";
 pub const CB_LIMIT: &str = "confirm:limit";
 pub const CB_MARKET: &str = "confirm:market";
+pub const CB_TRIGGER: &str = "confirm:trigger";
 pub const CB_CANCEL: &str = "cancel";
 pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
 pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
+
+/// True when a trigger entry would fire immediately because price is already past
+/// the trigger (long with trigger ≤ mark, or short with trigger ≥ mark) — i.e. it
+/// would behave like a market order rather than waiting for a breakout.
+#[allow(dead_code)] // TODO: wire into confirm flow once Exchange exposes a mark-price accessor
+pub fn trigger_fires_immediately(direction: Direction, trigger_px: f64, mark_px: f64) -> bool {
+    match direction {
+        Direction::Long => trigger_px <= mark_px,
+        Direction::Short => trigger_px >= mark_px,
+    }
+}
 
 /// Escapes text for Telegram MarkdownV2 (every reserved char gets a backslash).
 fn escape_markdown_v2(text: &str) -> String {
@@ -90,19 +102,55 @@ fn label(text: &str, active: bool) -> String {
     if active { format!("{text} ✓") } else { text.to_string() }
 }
 
-pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
+pub fn confirmation_keyboard(active: RiskProfile, trigger_enabled: bool) -> InlineKeyboardMarkup {
+    // The execute row always offers Limit/Market; the Trigger button is gated off
+    // by default because its stop-direction mapping is unverified on the live exchange.
+    let mut execute_row = vec![
+        InlineKeyboardButton::callback("✅ Confirm Limit", CB_LIMIT),
+        InlineKeyboardButton::callback("⚡ Confirm Market", CB_MARKET),
+    ];
+    if trigger_enabled {
+        execute_row.push(InlineKeyboardButton::callback("🎯 Confirm Trigger", CB_TRIGGER));
+    }
     InlineKeyboardMarkup::new(vec![
         vec![
             InlineKeyboardButton::callback(label("Conservative", active == RiskProfile::Conservative), CB_CONSERVATIVE),
             InlineKeyboardButton::callback(label("Moderate", active == RiskProfile::Moderate), CB_MODERATE),
             InlineKeyboardButton::callback(label("Aggressive", active == RiskProfile::Aggressive), CB_AGGRESSIVE),
         ],
-        vec![
-            InlineKeyboardButton::callback("✅ Confirm Limit", CB_LIMIT),
-            InlineKeyboardButton::callback("⚡ Confirm Market", CB_MARKET),
-        ],
+        execute_row,
         vec![InlineKeyboardButton::callback("❌ Cancel", CB_CANCEL)],
     ])
+}
+
+/// Sum of unrealized PnL across all positions.
+fn total_unrealized_pnl(positions: &[OpenPosition]) -> f64 {
+    positions.iter().map(|position| position.unrealized_pnl).sum()
+}
+
+/// One position row, shared by /account and the P&L push.
+fn position_line(position: &OpenPosition) -> String {
+    format!(
+        "  {:<6} {:<5} {} @ ${:.2}  mark ${:.2}  uPnL ${:+.2}  {:.0}x\n",
+        position.coin,
+        position.direction.to_uppercase(),
+        position.size,
+        position.entry_px,
+        position.mark_px,
+        position.unrealized_pnl,
+        position.leverage,
+    )
+}
+
+/// Running-P&L push: total + per-position unrealized PnL.
+pub fn render_pnl_summary(equity: f64, positions: &[OpenPosition]) -> String {
+    let mut out = String::from("📊 Running P&L\n");
+    out.push_str(&format!("Equity: ${:.2}\n", equity));
+    out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
+    for position in positions {
+        out.push_str(&position_line(position));
+    }
+    out
 }
 
 /// Plain-text account card (no parse_mode). The daily-risk line is omitted
@@ -128,17 +176,9 @@ pub fn render_account(
         return out;
     }
     out.push_str(&format!("\nOpen positions ({}):\n", positions.len()));
+    out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
     for position in positions {
-        out.push_str(&format!(
-            "  {:<6} {:<5} {} @ ${:.2}  mark ${:.2}  uPnL ${:+.2}  {:.0}x\n",
-            position.coin,
-            position.direction.to_uppercase(),
-            position.size,
-            position.entry_px,
-            position.mark_px,
-            position.unrealized_pnl,
-            position.leverage,
-        ));
+        out.push_str(&position_line(position));
     }
     out
 }
@@ -159,7 +199,9 @@ pub fn render_settings(settings: &Settings) -> String {
          leverage_conservative: {}x\n\
          leverage_moderate: {}x\n\
          leverage_aggressive: {}x\n\
-         entry_fill_timeout_secs: {}s\n\n\
+         entry_fill_timeout_secs: {}s\n\
+         trigger_expiry_secs: {}s\n\
+         pnl_push_secs: {}s\n\n\
          Change a number:  /set <key> <value>\n\
          e.g.  /set entry_pct 10\n\
          Switch entry mode with the buttons below.",
@@ -172,6 +214,8 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.leverage.moderate,
         settings.leverage.aggressive,
         settings.entry_fill_timeout_secs,
+        settings.trigger_expiry_secs,
+        settings.pnl_push_secs,
     )
 }
 
@@ -284,6 +328,43 @@ impl ProgressReporter for TelegramReporter {
     }
 }
 
+/// Places the reduce-only bracket: SL covering the full held size, and each TP
+/// scaled by `effective_size/planned_size` (for partial fills). Closing side is
+/// opposite `direction`. Shared by limit/market execution and the trigger monitor.
+pub async fn arm_bracket<E: Exchange>(
+    exchange: &E,
+    coin: &str,
+    direction: Direction,
+    planned_size: f64,
+    effective_size: f64,
+    stop_loss: f64,
+    take_profits: &[crate::sizing::BracketLeg],
+) -> anyhow::Result<()> {
+    let scale = if planned_size > 0.0 { effective_size / planned_size } else { 0.0 };
+    let close_is_buy = !matches!(direction, Direction::Long);
+    exchange
+        .place_trigger(&TriggerOrder {
+            coin: coin.to_string(),
+            is_buy: close_is_buy,
+            size: effective_size,
+            trigger_price: stop_loss,
+            is_take_profit: false,
+        })
+        .await?;
+    for take_profit in take_profits {
+        exchange
+            .place_trigger(&TriggerOrder {
+                coin: coin.to_string(),
+                is_buy: close_is_buy,
+                size: take_profit.size * scale,
+                trigger_price: take_profit.price,
+                is_take_profit: true,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 /// Sets leverage, places the entry order, waits for fill (limit only), then
 /// places the reduce-only bracket sized to the ACTUAL held position.
 ///
@@ -349,33 +430,16 @@ pub async fn execute_plan<E: Exchange>(
         plan.size
     };
 
-    // Scale factor: for a partial fill, TP sizes shrink proportionally so the
-    // total closing volume never exceeds the actual position size.
-    let scale = if plan.size > 0.0 { effective_size / plan.size } else { 0.0 };
-
-    // Bracket: SL covers the full held position; each TP is scaled.
-    // Closing side is always opposite the entry direction.
-    let close_is_buy = !is_buy;
-    exchange
-        .place_trigger(&TriggerOrder {
-            coin: plan.coin.clone(),
-            is_buy: close_is_buy,
-            size: effective_size,
-            trigger_price: plan.stop_loss.price,
-            is_take_profit: false,
-        })
-        .await?;
-    for take_profit in &plan.take_profits {
-        exchange
-            .place_trigger(&TriggerOrder {
-                coin: plan.coin.clone(),
-                is_buy: close_is_buy,
-                size: take_profit.size * scale,
-                trigger_price: take_profit.price,
-                is_take_profit: true,
-            })
-            .await?;
-    }
+    arm_bracket(
+        exchange,
+        &plan.coin,
+        plan.direction,
+        plan.size,
+        effective_size,
+        plan.stop_loss.price,
+        &plan.take_profits,
+    )
+    .await?;
     reporter
         .report(ExecutionEvent::BracketArmed {
             stop_loss: plan.stop_loss.price,
@@ -400,6 +464,7 @@ pub struct BotContext<E: Exchange + 'static> {
     pub journal: Arc<Journal>,
     pub settings: Arc<std::sync::Mutex<Settings>>,
     pub settings_store: Arc<SettingsStore>,
+    pub triggers: Arc<crate::trigger_store::TriggerStore>,
     pub http: reqwest::Client,
 }
 
@@ -767,7 +832,7 @@ pub async fn process_setups<E: Exchange + 'static>(
         let sent = bot
             .send_message(chat_id, render_summary(&plan, profile))
             .parse_mode(ParseMode::MarkdownV2)
-            .reply_markup(confirmation_keyboard(profile))
+            .reply_markup(confirmation_keyboard(profile, context.config.trigger_entry_enabled))
             .await?;
 
         context.store.insert(
@@ -887,7 +952,7 @@ async fn on_callback<E: Exchange + 'static>(
                         render_summary(&plan, profile),
                     )
                     .parse_mode(ParseMode::MarkdownV2)
-                    .reply_markup(confirmation_keyboard(profile))
+                    .reply_markup(confirmation_keyboard(profile, context.config.trigger_entry_enabled))
                     .await?;
                     bot.answer_callback_query(&query.id).await?;
                 }
@@ -910,9 +975,18 @@ async fn on_callback<E: Exchange + 'static>(
         return Ok(());
     }
 
-    let use_limit = match data.as_str() {
-        CB_LIMIT => true,
-        CB_MARKET => false,
+    // Defense-in-depth: reject a trigger confirm even if a stale keyboard still
+    // shows the button while the feature is disabled.
+    if data == CB_TRIGGER && !context.config.trigger_entry_enabled {
+        bot.answer_callback_query(&query.id).text("Trigger entry dinonaktifkan").await?;
+        return Ok(());
+    }
+
+    enum Confirm { Limit, Market, Trigger }
+    let confirm = match data.as_str() {
+        CB_LIMIT => Confirm::Limit,
+        CB_MARKET => Confirm::Market,
+        CB_TRIGGER => Confirm::Trigger,
         _ => return Ok(()),
     };
 
@@ -946,12 +1020,6 @@ async fn on_callback<E: Exchange + 'static>(
     }
 
     bot.answer_callback_query(&query.id).await?;
-    bot.edit_message_text(
-        message.chat.id,
-        message.id,
-        format!("Executing {}…", trade.plan.coin),
-    )
-    .await?;
 
     // Read the live timeout before spawning (never hold the lock across await).
     let fill_timeout_secs = context.settings.lock().unwrap().entry_fill_timeout_secs;
@@ -964,19 +1032,103 @@ async fn on_callback<E: Exchange + 'static>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
-    let _ = context.journal.record(
-        &trade.plan,
-        None,
-        trade.setup.confidence,
-        trade.setup.timeframe.as_deref(),
-        trade.setup.risk_reward,
-        &format!("{:?}", trade.profile),
-        opened_at,
-    );
+    // The trigger path may early-return before any order is placed (set_leverage or
+    // place_trigger_entry failure), so it must NOT reserve cap up front — it records
+    // only after a successful placement. Limit/Market reserve here as before.
+    if !matches!(confirm, Confirm::Trigger) {
+        let _ = context.journal.record(
+            &trade.plan,
+            None,
+            trade.setup.confidence,
+            trade.setup.timeframe.as_deref(),
+            trade.setup.risk_reward,
+            &format!("{:?}", trade.profile),
+            opened_at,
+        );
+    }
 
+    let chat_id = message.chat.id;
+
+    // Trigger path: place a resting trigger entry on the exchange, persist it to
+    // TriggerStore, and return — the trigger monitor (run_trigger_monitor) will arm
+    // the bracket once the fill lands, or cancel on expiry.
+    if let Confirm::Trigger = confirm {
+        bot.edit_message_text(
+            message.chat.id,
+            message.id,
+            format!("Memasang trigger {}…", trade.plan.coin),
+        )
+        .await?;
+
+        let is_buy = matches!(trade.plan.direction, Direction::Long);
+        let expiry_secs = context.settings.lock().unwrap().trigger_expiry_secs;
+
+        if let Err(error) = context.exchange.set_leverage(&trade.plan.coin, trade.plan.leverage).await {
+            bot.send_message(chat_id, format!("❌ Gagal set leverage: {error}")).await.ok();
+            return Ok(());
+        }
+
+        let placed = context.exchange.place_trigger_entry(
+            &trade.plan.coin, is_buy, trade.plan.size, trade.plan.entry,
+        ).await;
+
+        match placed {
+            Ok(result) => {
+                let take_profits: Vec<crate::trigger_store::PendingLeg> = trade.setup.take_profits.iter()
+                    .map(|tp| crate::trigger_store::PendingLeg { price: tp.price, alloc_pct: tp.allocation_pct })
+                    .collect();
+                let pending = crate::trigger_store::PendingTrigger {
+                    id: 0,
+                    coin: trade.plan.coin.clone(),
+                    direction: format!("{:?}", trade.plan.direction),
+                    size: trade.plan.size,
+                    trigger_px: trade.plan.entry,
+                    leverage: trade.plan.leverage,
+                    stop_loss: trade.plan.stop_loss.price,
+                    take_profits,
+                    entry_oid: result.order_id,
+                    chat_id: chat_id.0,
+                    created_at: opened_at,
+                    expiry_at: opened_at + expiry_secs as i64,
+                    status: "active".into(),
+                };
+                if result.order_id.is_none() {
+                    tracing::warn!("trigger {} placed without an order id; fill detection will fall back to coin match", trade.plan.coin);
+                }
+                // Reserve cap only now that the trigger entry is actually on the book.
+                let _ = context.journal.record(
+                    &trade.plan,
+                    result.order_id,
+                    trade.setup.confidence,
+                    trade.setup.timeframe.as_deref(),
+                    trade.setup.risk_reward,
+                    &format!("{:?}", trade.profile),
+                    opened_at,
+                );
+                let _ = context.triggers.insert(&pending);
+                bot.send_message(
+                    chat_id,
+                    format!("🎯 Trigger {} @ ${:.4} dipasang — nunggu harga menembus.", trade.plan.coin, trade.plan.entry),
+                ).await.ok();
+            }
+            Err(error) => {
+                bot.send_message(chat_id, format!("❌ Gagal pasang trigger: {error}")).await.ok();
+            }
+        }
+        return Ok(());
+    }
+
+    // Limit / Market path: edit message then spawn execution.
+    bot.edit_message_text(
+        message.chat.id,
+        message.id,
+        format!("Executing {}…", trade.plan.coin),
+    )
+    .await?;
+
+    let use_limit = matches!(confirm, Confirm::Limit);
     let task_context = context.clone();
     let task_bot = bot.clone();
-    let chat_id = message.chat.id;
     tokio::spawn(async move {
         let reporter = TelegramReporter {
             bot: task_bot.clone(),
@@ -1019,6 +1171,8 @@ pub async fn run<E: Exchange + 'static>(
     let journal_path = config.journal_path.clone();
     let settings_store = Arc::new(SettingsStore::open(&journal_path)?);
     let seeded = settings_store.load(Settings::from_config(&config))?;
+    // Single shared TriggerStore — BotContext and run_trigger_monitor both use this Arc.
+    let trigger_store = Arc::new(crate::trigger_store::TriggerStore::open(&journal_path)?);
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
@@ -1026,6 +1180,7 @@ pub async fn run<E: Exchange + 'static>(
         journal: Arc::new(Journal::open(&journal_path)?),
         settings: Arc::new(std::sync::Mutex::new(seeded)),
         settings_store,
+        triggers: trigger_store.clone(),
         http,
     });
 
@@ -1046,6 +1201,37 @@ pub async fn run<E: Exchange + 'static>(
                 monitor_poll_secs,
             )
             .await;
+        });
+    }
+
+    // Background trigger-entry monitor: arms SL/TP when the trigger fill lands,
+    // or cancels and notifies on expiry. Uses the same shared TriggerStore Arc as
+    // BotContext so inserts from on_callback are immediately visible to the monitor.
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let monitor_trigger_store = trigger_store.clone();
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        let monitor_poll_secs = context.config.monitor_poll_secs;
+        tokio::spawn(async move {
+            crate::monitor::run_trigger_monitor(
+                monitor_bot, monitor_exchange, monitor_trigger_store, monitor_user_ids, monitor_poll_secs,
+            ).await;
+        });
+    }
+
+    // Background P&L push: periodically sends running unrealized-P&L summary to
+    // all allowed users while positions are open. Interval is read live from
+    // settings each tick; 0 disables without restarting the task.
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let monitor_settings = context.settings.clone();
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        tokio::spawn(async move {
+            crate::monitor::run_pnl_monitor(
+                monitor_bot, monitor_exchange, monitor_settings, monitor_user_ids,
+            ).await;
         });
     }
 
@@ -1101,10 +1287,24 @@ mod tests {
 
     #[test]
     fn keyboard_marks_active_profile() {
-        let markup = confirmation_keyboard(RiskProfile::Aggressive);
+        let markup = confirmation_keyboard(RiskProfile::Aggressive, true);
         let first_row = &markup.inline_keyboard[0];
         assert!(first_row[2].text.contains('✓')); // Aggressive marked
         assert!(!first_row[0].text.contains('✓'));
+    }
+
+    #[test]
+    fn confirm_keyboard_gates_trigger_button() {
+        use teloxide::types::InlineKeyboardButtonKind;
+        let has_trigger = |markup: &InlineKeyboardMarkup| {
+            markup.inline_keyboard.iter().flatten().any(|button| {
+                matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(data) if data == CB_TRIGGER)
+            })
+        };
+        let with = confirmation_keyboard(RiskProfile::Moderate, true);
+        let without = confirmation_keyboard(RiskProfile::Moderate, false);
+        assert!(has_trigger(&with), "trigger button must be present when enabled");
+        assert!(!has_trigger(&without), "trigger button must be absent when disabled");
     }
 
     #[test]
@@ -1142,6 +1342,8 @@ mod tests {
             max_daily_risk_pct: Some(5.0),
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
+            trigger_expiry_secs: 14400,
+            pnl_push_secs: 900,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1157,6 +1359,8 @@ mod tests {
             max_daily_risk_pct: None,
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
+            trigger_expiry_secs: 14400,
+            pnl_push_secs: 900,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }
@@ -1323,5 +1527,45 @@ mod tests {
         let text = super::format_execution_event("TAO", 300, &armed);
         assert!(text.contains("TAO"));
         assert!(text.contains("SL/TP"));
+    }
+
+    #[tokio::test]
+    async fn arm_bracket_places_sl_and_scaled_tps() {
+        let exchange = MockExchange { meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }), ..Default::default() };
+        let tps = vec![BracketLeg { price: 1.70, size: 60.0 }, BracketLeg { price: 2.00, size: 40.0 }];
+        // planned 100, effective 100 → no scaling
+        super::arm_bracket(&exchange, "PENDLE", Direction::Long, 100.0, 100.0, 1.25, &tps).await.unwrap();
+        let triggers = exchange.triggers.lock().unwrap();
+        assert_eq!(triggers.len(), 3);
+        assert!(triggers.iter().all(|t| !t.is_buy)); // closing a long => sell
+        let sl = triggers.iter().find(|t| !t.is_take_profit).unwrap();
+        assert!((sl.size - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trigger_fires_immediately_detects_wrong_side() {
+        use crate::parser::Direction;
+        // Long: fires immediately if trigger <= mark (price already at/above trigger).
+        assert!(super::trigger_fires_immediately(Direction::Long, 68.53, 69.00));
+        assert!(!super::trigger_fires_immediately(Direction::Long, 68.53, 68.00));
+        // Short: fires immediately if trigger >= mark.
+        assert!(super::trigger_fires_immediately(Direction::Short, 68.53, 68.00));
+        assert!(!super::trigger_fires_immediately(Direction::Short, 68.53, 69.00));
+    }
+
+    #[test]
+    fn render_pnl_summary_totals_unrealized() {
+        // sample_positions(): BTC uPnL=45.20, ETH uPnL=-12.80 => total=+32.40
+        let text = super::render_pnl_summary(1234.56, &sample_positions());
+        assert!(text.contains("Total uPnL: $+32.40"));
+        assert!(text.contains("BTC"));
+        assert!(text.contains("ETH"));
+    }
+
+    #[test]
+    fn account_card_shows_total_upnl_when_positions_present() {
+        // sample_positions(): BTC uPnL=45.20, ETH uPnL=-12.80 => total=+32.40
+        let text = super::render_account(1234.56, &sample_positions(), 0.0, Some(10.0));
+        assert!(text.contains("Total uPnL: $+32.40"));
     }
 }
