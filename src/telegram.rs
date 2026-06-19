@@ -24,6 +24,7 @@ pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
 /// True when a trigger entry would fire immediately because price is already past
 /// the trigger (long with trigger ≤ mark, or short with trigger ≥ mark) — i.e. it
 /// would behave like a market order rather than waiting for a breakout.
+#[allow(dead_code)] // TODO: wire into confirm flow once Exchange exposes a mark-price accessor
 pub fn trigger_fires_immediately(direction: Direction, trigger_px: f64, mark_px: f64) -> bool {
     match direction {
         Direction::Long => trigger_px <= mark_px,
@@ -101,18 +102,23 @@ fn label(text: &str, active: bool) -> String {
     if active { format!("{text} ✓") } else { text.to_string() }
 }
 
-pub fn confirmation_keyboard(active: RiskProfile) -> InlineKeyboardMarkup {
+pub fn confirmation_keyboard(active: RiskProfile, trigger_enabled: bool) -> InlineKeyboardMarkup {
+    // The execute row always offers Limit/Market; the Trigger button is gated off
+    // by default because its stop-direction mapping is unverified on the live exchange.
+    let mut execute_row = vec![
+        InlineKeyboardButton::callback("✅ Confirm Limit", CB_LIMIT),
+        InlineKeyboardButton::callback("⚡ Confirm Market", CB_MARKET),
+    ];
+    if trigger_enabled {
+        execute_row.push(InlineKeyboardButton::callback("🎯 Confirm Trigger", CB_TRIGGER));
+    }
     InlineKeyboardMarkup::new(vec![
         vec![
             InlineKeyboardButton::callback(label("Conservative", active == RiskProfile::Conservative), CB_CONSERVATIVE),
             InlineKeyboardButton::callback(label("Moderate", active == RiskProfile::Moderate), CB_MODERATE),
             InlineKeyboardButton::callback(label("Aggressive", active == RiskProfile::Aggressive), CB_AGGRESSIVE),
         ],
-        vec![
-            InlineKeyboardButton::callback("✅ Confirm Limit", CB_LIMIT),
-            InlineKeyboardButton::callback("⚡ Confirm Market", CB_MARKET),
-            InlineKeyboardButton::callback("🎯 Confirm Trigger", CB_TRIGGER),
-        ],
+        execute_row,
         vec![InlineKeyboardButton::callback("❌ Cancel", CB_CANCEL)],
     ])
 }
@@ -826,7 +832,7 @@ pub async fn process_setups<E: Exchange + 'static>(
         let sent = bot
             .send_message(chat_id, render_summary(&plan, profile))
             .parse_mode(ParseMode::MarkdownV2)
-            .reply_markup(confirmation_keyboard(profile))
+            .reply_markup(confirmation_keyboard(profile, context.config.trigger_entry_enabled))
             .await?;
 
         context.store.insert(
@@ -946,7 +952,7 @@ async fn on_callback<E: Exchange + 'static>(
                         render_summary(&plan, profile),
                     )
                     .parse_mode(ParseMode::MarkdownV2)
-                    .reply_markup(confirmation_keyboard(profile))
+                    .reply_markup(confirmation_keyboard(profile, context.config.trigger_entry_enabled))
                     .await?;
                     bot.answer_callback_query(&query.id).await?;
                 }
@@ -966,6 +972,13 @@ async fn on_callback<E: Exchange + 'static>(
     if data == CB_CANCEL {
         context.store.remove(key);
         bot.edit_message_text(message.chat.id, message.id, "Cancelled.").await?;
+        return Ok(());
+    }
+
+    // Defense-in-depth: reject a trigger confirm even if a stale keyboard still
+    // shows the button while the feature is disabled.
+    if data == CB_TRIGGER && !context.config.trigger_entry_enabled {
+        bot.answer_callback_query(&query.id).text("Trigger entry dinonaktifkan").await?;
         return Ok(());
     }
 
@@ -1019,15 +1032,20 @@ async fn on_callback<E: Exchange + 'static>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
-    let _ = context.journal.record(
-        &trade.plan,
-        None,
-        trade.setup.confidence,
-        trade.setup.timeframe.as_deref(),
-        trade.setup.risk_reward,
-        &format!("{:?}", trade.profile),
-        opened_at,
-    );
+    // The trigger path may early-return before any order is placed (set_leverage or
+    // place_trigger_entry failure), so it must NOT reserve cap up front — it records
+    // only after a successful placement. Limit/Market reserve here as before.
+    if !matches!(confirm, Confirm::Trigger) {
+        let _ = context.journal.record(
+            &trade.plan,
+            None,
+            trade.setup.confidence,
+            trade.setup.timeframe.as_deref(),
+            trade.setup.risk_reward,
+            &format!("{:?}", trade.profile),
+            opened_at,
+        );
+    }
 
     let chat_id = message.chat.id;
 
@@ -1074,6 +1092,19 @@ async fn on_callback<E: Exchange + 'static>(
                     expiry_at: opened_at + expiry_secs as i64,
                     status: "active".into(),
                 };
+                if result.order_id.is_none() {
+                    tracing::warn!("trigger {} placed without an order id; fill detection will fall back to coin match", trade.plan.coin);
+                }
+                // Reserve cap only now that the trigger entry is actually on the book.
+                let _ = context.journal.record(
+                    &trade.plan,
+                    result.order_id,
+                    trade.setup.confidence,
+                    trade.setup.timeframe.as_deref(),
+                    trade.setup.risk_reward,
+                    &format!("{:?}", trade.profile),
+                    opened_at,
+                );
                 let _ = context.triggers.insert(&pending);
                 bot.send_message(
                     chat_id,
@@ -1256,10 +1287,24 @@ mod tests {
 
     #[test]
     fn keyboard_marks_active_profile() {
-        let markup = confirmation_keyboard(RiskProfile::Aggressive);
+        let markup = confirmation_keyboard(RiskProfile::Aggressive, true);
         let first_row = &markup.inline_keyboard[0];
         assert!(first_row[2].text.contains('✓')); // Aggressive marked
         assert!(!first_row[0].text.contains('✓'));
+    }
+
+    #[test]
+    fn confirm_keyboard_gates_trigger_button() {
+        use teloxide::types::InlineKeyboardButtonKind;
+        let has_trigger = |markup: &InlineKeyboardMarkup| {
+            markup.inline_keyboard.iter().flatten().any(|button| {
+                matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(data) if data == CB_TRIGGER)
+            })
+        };
+        let with = confirmation_keyboard(RiskProfile::Moderate, true);
+        let without = confirmation_keyboard(RiskProfile::Moderate, false);
+        assert!(has_trigger(&with), "trigger button must be present when enabled");
+        assert!(!has_trigger(&without), "trigger button must be absent when disabled");
     }
 
     #[test]

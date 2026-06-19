@@ -3,10 +3,8 @@
 
 use crate::hyperliquid::{Exchange, FillDetail};
 use crate::journal::{Bracket, Journal};
-use crate::parser::Direction;
 use crate::settings::Settings;
-use crate::sizing::BracketLeg;
-use crate::trigger_store::{PendingLeg, PendingTrigger, TriggerStore};
+use crate::trigger_store::{PendingTrigger, TriggerStore};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -65,6 +63,13 @@ pub fn matches_entry_fill(fill: &FillDetail, pending: &PendingTrigger) -> bool {
         None => fill.coin.eq_ignore_ascii_case(&pending.coin),
     };
     is_opening && oid_ok && fill.time_ms >= pending.created_at
+}
+
+/// Total filled size across all opening fills that belong to `pending`'s entry
+/// order. Summing (not first-match) keeps the bracket correctly sized when a
+/// market-on-trigger entry fills in multiple prints.
+pub fn sum_entry_fill_size(fills: &[FillDetail], pending: &PendingTrigger) -> f64 {
+    fills.iter().filter(|fill| matches_entry_fill(fill, pending)).map(|fill| fill.sz).sum()
 }
 
 /// Formats a signed USD PnL as `+$12.30` / `-$8.10`.
@@ -180,28 +185,53 @@ pub async fn run_trigger_monitor<E: Exchange + 'static>(
         let now_secs = now_unix_secs();
 
         for pending in active {
-            // 1. Filled? Match the entry order's opening fill.
-            if let Some(fill) = fills.iter().find(|fill| matches_entry_fill(fill, &pending)) {
-                let direction = if pending.direction.eq_ignore_ascii_case("short") {
-                    Direction::Short
-                } else {
-                    Direction::Long
+            // 1. Filled? Sum ALL matching opening fills so the bracket is sized to
+            //    the actual position even when the entry filled in multiple prints.
+            let filled_size = sum_entry_fill_size(&fills, &pending);
+            if filled_size > 0.0 {
+                let close_is_buy = !pending.direction.eq_ignore_ascii_case("long");
+                // Place the SL FIRST. Only once it is on the book do we mark the
+                // trigger armed — so a retry never double-places the SL (if the SL
+                // itself fails, nothing was placed and the next poll retries cleanly).
+                let stop_loss = crate::hyperliquid::TriggerOrder {
+                    coin: pending.coin.clone(),
+                    is_buy: close_is_buy,
+                    size: filled_size,
+                    trigger_price: pending.stop_loss,
+                    is_take_profit: false,
                 };
-                let take_profits: Vec<BracketLeg> = pending.take_profits.iter()
-                    .map(|leg: &PendingLeg| BracketLeg {
-                        price: leg.price,
-                        size: pending.size * (leg.alloc_pct / 100.0),
-                    })
-                    .collect();
-                match crate::telegram::arm_bracket(exchange.as_ref(), &pending.coin, direction, pending.size, fill.sz, pending.stop_loss, &take_profits).await {
-                    Ok(()) => {
-                        let _ = triggers.mark_armed(pending.id);
-                        notify_users(&bot, &allowed_user_ids, &format!("✅ Trigger {} kena — SL/TP terpasang.", pending.coin)).await;
-                    }
+                match exchange.place_trigger(&stop_loss).await {
                     Err(error) => {
-                        tracing::warn!("arm_bracket failed for {}: {error}", pending.coin);
-                        notify_users(&bot, &allowed_user_ids, &format!("⚠️ Posisi {} TERBUKA tapi GAGAL pasang SL — cek manual SEKARANG!", pending.coin)).await;
-                        // leave active → retry next poll
+                        tracing::warn!("trigger SL placement failed for {}: {error}", pending.coin);
+                        notify_users(&bot, &allowed_user_ids,
+                            &format!("⚠️ Posisi {} TERBUKA tapi GAGAL pasang SL — cek manual SEKARANG!", pending.coin)).await;
+                        // leave active → retry next poll (no SL placed yet, no duplicate)
+                        continue;
+                    }
+                    Ok(_) => {
+                        // Position is now protected; mark armed so the SL is never re-placed.
+                        let _ = triggers.mark_armed(pending.id);
+                        // Place TPs best-effort, sized to the actual filled size.
+                        let mut failed_tps: Vec<usize> = Vec::new();
+                        for (index, leg) in pending.take_profits.iter().enumerate() {
+                            let tp = crate::hyperliquid::TriggerOrder {
+                                coin: pending.coin.clone(),
+                                is_buy: close_is_buy,
+                                size: filled_size * (leg.alloc_pct / 100.0),
+                                trigger_price: leg.price,
+                                is_take_profit: true,
+                            };
+                            if let Err(error) = exchange.place_trigger(&tp).await {
+                                tracing::warn!("trigger TP{} placement failed for {}: {error}", index + 1, pending.coin);
+                                failed_tps.push(index + 1);
+                            }
+                        }
+                        let message = if failed_tps.is_empty() {
+                            format!("✅ Trigger {} kena — SL/TP terpasang.", pending.coin)
+                        } else {
+                            format!("✅ Trigger {} kena — SL terpasang. ⚠️ TP{:?} gagal, pasang manual.", pending.coin, failed_tps)
+                        };
+                        notify_users(&bot, &allowed_user_ids, &message).await;
                     }
                 }
                 continue;
@@ -209,7 +239,9 @@ pub async fn run_trigger_monitor<E: Exchange + 'static>(
             // 2. Expired? Cancel the resting entry order.
             if is_expired(now_secs, pending.expiry_at) {
                 if let Some(oid) = pending.entry_oid {
-                    let _ = exchange.cancel_order(&pending.coin, oid).await;
+                    if let Err(error) = exchange.cancel_order(&pending.coin, oid).await {
+                        tracing::warn!("trigger expiry cancel failed for {}: {error}", pending.coin);
+                    }
                 }
                 let _ = triggers.mark_expired(pending.id);
                 notify_users(&bot, &allowed_user_ids, &format!("⏱️ Trigger {} kadaluarsa — dibatalkan, tidak ada posisi.", pending.coin)).await;
@@ -241,7 +273,10 @@ pub async fn run_pnl_monitor<E: Exchange + 'static>(
         };
         if positions.is_empty() { continue; }
 
-        let equity = exchange.equity().await.unwrap_or(0.0);
+        let equity = match exchange.equity().await {
+            Ok(equity) => equity,
+            Err(error) => { tracing::warn!("pnl monitor equity() failed: {error}"); continue; }
+        };
         let message = crate::telegram::render_pnl_summary(equity, &positions);
         for user_id in &allowed_user_ids {
             if let Err(error) = bot.send_message(ChatId(*user_id), &message).await {
@@ -318,6 +353,18 @@ mod tests {
     fn is_expired_compares_now_to_expiry() {
         assert!(!is_expired(1099, 1100));
         assert!(is_expired(1101, 1100));
+    }
+
+    #[test]
+    fn sum_entry_fill_size_adds_matching_opening_fills() {
+        let p = pending(Some(7), 1000);
+        let fills = vec![
+            detail_full("Open Long", 7, 1500, "SOL"),  // sz 0.5
+            detail_full("Open Long", 7, 1600, "SOL"),  // sz 0.5
+            detail_full("Open Long", 8, 1500, "SOL"),  // wrong oid → ignored
+            detail_full("Close Long", 7, 1500, "SOL"), // closing → ignored
+        ];
+        assert!((sum_entry_fill_size(&fills, &p) - 1.0).abs() < 1e-9);
     }
 
     #[test]
