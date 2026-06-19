@@ -286,6 +286,43 @@ impl ProgressReporter for TelegramReporter {
     }
 }
 
+/// Places the reduce-only bracket: SL covering the full held size, and each TP
+/// scaled by `effective_size/planned_size` (for partial fills). Closing side is
+/// opposite `direction`. Shared by limit/market execution and the trigger monitor.
+pub async fn arm_bracket<E: Exchange>(
+    exchange: &E,
+    coin: &str,
+    direction: Direction,
+    planned_size: f64,
+    effective_size: f64,
+    stop_loss: f64,
+    take_profits: &[crate::sizing::BracketLeg],
+) -> anyhow::Result<()> {
+    let scale = if planned_size > 0.0 { effective_size / planned_size } else { 0.0 };
+    let close_is_buy = !matches!(direction, Direction::Long);
+    exchange
+        .place_trigger(&TriggerOrder {
+            coin: coin.to_string(),
+            is_buy: close_is_buy,
+            size: effective_size,
+            trigger_price: stop_loss,
+            is_take_profit: false,
+        })
+        .await?;
+    for take_profit in take_profits {
+        exchange
+            .place_trigger(&TriggerOrder {
+                coin: coin.to_string(),
+                is_buy: close_is_buy,
+                size: take_profit.size * scale,
+                trigger_price: take_profit.price,
+                is_take_profit: true,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 /// Sets leverage, places the entry order, waits for fill (limit only), then
 /// places the reduce-only bracket sized to the ACTUAL held position.
 ///
@@ -351,33 +388,16 @@ pub async fn execute_plan<E: Exchange>(
         plan.size
     };
 
-    // Scale factor: for a partial fill, TP sizes shrink proportionally so the
-    // total closing volume never exceeds the actual position size.
-    let scale = if plan.size > 0.0 { effective_size / plan.size } else { 0.0 };
-
-    // Bracket: SL covers the full held position; each TP is scaled.
-    // Closing side is always opposite the entry direction.
-    let close_is_buy = !is_buy;
-    exchange
-        .place_trigger(&TriggerOrder {
-            coin: plan.coin.clone(),
-            is_buy: close_is_buy,
-            size: effective_size,
-            trigger_price: plan.stop_loss.price,
-            is_take_profit: false,
-        })
-        .await?;
-    for take_profit in &plan.take_profits {
-        exchange
-            .place_trigger(&TriggerOrder {
-                coin: plan.coin.clone(),
-                is_buy: close_is_buy,
-                size: take_profit.size * scale,
-                trigger_price: take_profit.price,
-                is_take_profit: true,
-            })
-            .await?;
-    }
+    arm_bracket(
+        exchange,
+        &plan.coin,
+        plan.direction,
+        plan.size,
+        effective_size,
+        plan.stop_loss.price,
+        &plan.take_profits,
+    )
+    .await?;
     reporter
         .report(ExecutionEvent::BracketArmed {
             stop_loss: plan.stop_loss.price,
@@ -1327,5 +1347,18 @@ mod tests {
         let text = super::format_execution_event("TAO", 300, &armed);
         assert!(text.contains("TAO"));
         assert!(text.contains("SL/TP"));
+    }
+
+    #[tokio::test]
+    async fn arm_bracket_places_sl_and_scaled_tps() {
+        let exchange = MockExchange { meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }), ..Default::default() };
+        let tps = vec![BracketLeg { price: 1.70, size: 60.0 }, BracketLeg { price: 2.00, size: 40.0 }];
+        // planned 100, effective 100 → no scaling
+        super::arm_bracket(&exchange, "PENDLE", Direction::Long, 100.0, 100.0, 1.25, &tps).await.unwrap();
+        let triggers = exchange.triggers.lock().unwrap();
+        assert_eq!(triggers.len(), 3);
+        assert!(triggers.iter().all(|t| !t.is_buy)); // closing a long => sell
+        let sl = triggers.iter().find(|t| !t.is_take_profit).unwrap();
+        assert!((sl.size - 100.0).abs() < 1e-6);
     }
 }
