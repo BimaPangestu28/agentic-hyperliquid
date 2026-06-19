@@ -76,12 +76,17 @@ pub async fn run_fill_monitor<E: Exchange + 'static>(
 ) {
     // Baseline: silence pre-existing fills on a fresh database.
     if journal.seen_fills_empty().unwrap_or(false) {
-        if let Ok(fills) = exchange.fills_detailed().await {
-            for fill in fills.iter().filter(|fill| is_closing(fill)) {
-                let _ = journal.mark_fill_seen(&fill_key(fill));
+        match exchange.fills_detailed().await {
+            Ok(fills) => {
+                for fill in fills.iter().filter(|fill| is_closing(fill)) {
+                    let _ = journal.mark_fill_seen(&fill_key(fill));
+                }
+                tracing::info!("fill monitor baselined historical fills");
+            }
+            Err(error) => {
+                tracing::warn!("fill monitor baseline skipped: fills_detailed failed: {error}");
             }
         }
-        tracing::info!("fill monitor baselined historical fills");
     }
 
     let interval = Duration::from_secs(poll_secs.max(1));
@@ -98,8 +103,13 @@ pub async fn run_fill_monitor<E: Exchange + 'static>(
 
         for fill in fills.iter().filter(|fill| is_closing(fill)) {
             let key = fill_key(fill);
-            if journal.is_fill_seen(&key).unwrap_or(false) {
-                continue;
+            match journal.is_fill_seen(&key) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!("fill monitor is_fill_seen failed for {key}: {error}");
+                    continue;
+                }
             }
             let label = journal
                 .latest_bracket_for_coin(&fill.coin)
