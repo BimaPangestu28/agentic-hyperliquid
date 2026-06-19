@@ -342,7 +342,13 @@ struct TelegramReporter {
 impl ProgressReporter for TelegramReporter {
     async fn report(&self, event: ExecutionEvent) {
         let text = format_execution_event(&self.coin, self.timeout_secs, &event);
-        if let Err(error) = self.bot.send_message(self.chat_id, text).await {
+        let send = self.bot.send_message(self.chat_id, text);
+        let result = if matches!(event, ExecutionEvent::EntrySubmitted { limit: true, .. }) {
+            send.reply_markup(fill_wait_keyboard(&self.coin)).await
+        } else {
+            send.await
+        };
+        if let Err(error) = result {
             tracing::warn!("progress notification failed: {error}");
         }
     }
@@ -496,7 +502,9 @@ pub async fn execute_plan<E: Exchange>(
 
 use crate::journal::Journal;
 use crate::state::PendingStore;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
@@ -505,10 +513,13 @@ pub struct BotContext<E: Exchange + 'static> {
     pub exchange: Arc<E>,
     pub store: Arc<PendingStore>,
     pub journal: Arc<Journal>,
-    pub settings: Arc<std::sync::Mutex<Settings>>,
+    pub settings: Arc<Mutex<Settings>>,
     pub settings_store: Arc<SettingsStore>,
     pub triggers: Arc<crate::trigger_store::TriggerStore>,
     pub http: reqwest::Client,
+    /// Coin (upper-cased) → cancel signal for an in-flight resting-limit fill-wait.
+    /// Lets the cancel button signal the `execute_plan` loop that owns the order id.
+    pub pending_fills: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 /// First whitespace-separated token of `text`, lowercased, with any @botname
@@ -1018,6 +1029,39 @@ async fn on_callback<E: Exchange + 'static>(
         return Ok(());
     }
 
+    // Cancel a resting limit entry that is still waiting to fill. The button lives
+    // on the "menunggu fill…" message, so `message` IS that message — edit it to
+    // drop the keyboard. The execute_plan loop performs the actual cancel_order.
+    if let Some(coin) = data.strip_prefix(CB_CANCEL_FILL_PREFIX) {
+        let signal = context
+            .pending_fills
+            .lock()
+            .unwrap()
+            .get(&coin.to_uppercase())
+            .cloned();
+        match signal {
+            Some(notify) => {
+                notify.notify_one();
+                bot.answer_callback_query(&query.id).text("Membatalkan…").await?;
+                bot.edit_message_text(
+                    message.chat.id,
+                    message.id,
+                    format!("⏳ Membatalkan order {coin}…"),
+                )
+                .await?;
+            }
+            None => {
+                bot.answer_callback_query(&query.id)
+                    .text(format!("Order {coin} sudah tidak aktif."))
+                    .await?;
+                let _ = bot
+                    .edit_message_reply_markup(message.chat.id, message.id)
+                    .await;
+            }
+        }
+        return Ok(());
+    }
+
     // Defense-in-depth: reject a trigger confirm even if a stale keyboard still
     // shows the button while the feature is disabled.
     if data == CB_TRIGGER && !context.config.trigger_entry_enabled {
@@ -1172,6 +1216,15 @@ async fn on_callback<E: Exchange + 'static>(
     let use_limit = matches!(confirm, Confirm::Limit);
     let task_context = context.clone();
     let task_bot = bot.clone();
+
+    let cancel = Arc::new(Notify::new());
+    let coin_key = trade.plan.coin.to_uppercase();
+    context
+        .pending_fills
+        .lock()
+        .unwrap()
+        .insert(coin_key.clone(), cancel.clone());
+
     tokio::spawn(async move {
         let reporter = TelegramReporter {
             bot: task_bot.clone(),
@@ -1185,10 +1238,13 @@ async fn on_callback<E: Exchange + 'static>(
             &trade.plan,
             use_limit,
             fill_timeout_secs,
-            std::sync::Arc::new(tokio::sync::Notify::new()), // TODO(task-4): wire registered Notify
+            cancel,
             &reporter,
         )
         .await;
+
+        // Always clear the registry entry, whatever the outcome.
+        task_context.pending_fills.lock().unwrap().remove(&coin_key);
 
         if let Err(error) = outcome {
             if let Err(send_error) = task_bot
@@ -1222,10 +1278,11 @@ pub async fn run<E: Exchange + 'static>(
         exchange,
         store: Arc::new(PendingStore::new()),
         journal: Arc::new(Journal::open(&journal_path)?),
-        settings: Arc::new(std::sync::Mutex::new(seeded)),
+        settings: Arc::new(Mutex::new(seeded)),
         settings_store,
         triggers: trigger_store.clone(),
         http,
+        pending_fills: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // Background close (TP/SL) notifications. Uses its own Journal connection
@@ -1690,6 +1747,12 @@ mod tests {
         assert_eq!(triggers.len(), 3, "SL + 2 TP armed on the held size");
         let stop_loss = triggers.iter().find(|t| !t.is_take_profit).unwrap();
         assert!((stop_loss.size - 400.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cancel_fill_callback_round_trips_coin() {
+        let data = format!("{}{}", super::CB_CANCEL_FILL_PREFIX, "AERO");
+        assert_eq!(data.strip_prefix(super::CB_CANCEL_FILL_PREFIX), Some("AERO"));
     }
 
     #[tokio::test]
