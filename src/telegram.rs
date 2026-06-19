@@ -21,6 +21,16 @@ pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
 pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
 
+/// True when a trigger entry would fire immediately because price is already past
+/// the trigger (long with trigger ≤ mark, or short with trigger ≥ mark) — i.e. it
+/// would behave like a market order rather than waiting for a breakout.
+pub fn trigger_fires_immediately(direction: Direction, trigger_px: f64, mark_px: f64) -> bool {
+    match direction {
+        Direction::Long => trigger_px <= mark_px,
+        Direction::Short => trigger_px >= mark_px,
+    }
+}
+
 /// Escapes text for Telegram MarkdownV2 (every reserved char gets a backslash).
 fn escape_markdown_v2(text: &str) -> String {
     const RESERVED: &[char] = &['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
@@ -1444,5 +1454,16 @@ mod tests {
         assert!(triggers.iter().all(|t| !t.is_buy)); // closing a long => sell
         let sl = triggers.iter().find(|t| !t.is_take_profit).unwrap();
         assert!((sl.size - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trigger_fires_immediately_detects_wrong_side() {
+        use crate::parser::Direction;
+        // Long: fires immediately if trigger <= mark (price already at/above trigger).
+        assert!(super::trigger_fires_immediately(Direction::Long, 68.53, 69.00));
+        assert!(!super::trigger_fires_immediately(Direction::Long, 68.53, 68.00));
+        // Short: fires immediately if trigger >= mark.
+        assert!(super::trigger_fires_immediately(Direction::Short, 68.53, 68.00));
+        assert!(!super::trigger_fires_immediately(Direction::Short, 68.53, 69.00));
     }
 }
