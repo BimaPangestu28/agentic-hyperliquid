@@ -236,15 +236,6 @@ pub trait ProgressReporter: Send + Sync {
     async fn report(&self, event: ExecutionEvent);
 }
 
-/// A no-op reporter that silently discards all events. Used when no
-/// progress reporting is needed (e.g. legacy call sites).
-struct NoopReporter;
-
-#[async_trait::async_trait]
-impl ProgressReporter for NoopReporter {
-    async fn report(&self, _event: ExecutionEvent) {}
-}
-
 /// Formats an [`ExecutionEvent`] into the Indonesian message shown to the user.
 pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEvent) -> String {
     match event {
@@ -265,6 +256,25 @@ pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEv
         }
         ExecutionEvent::BracketArmed { stop_loss, take_profits } => {
             format!("✅ SL/TP {coin} terpasang (SL ${stop_loss:.4}, {take_profits} TP).")
+        }
+    }
+}
+
+/// Production [`ProgressReporter`] that forwards each event to a Telegram chat.
+/// Send failures are logged and swallowed so execution never aborts mid-bracket.
+struct TelegramReporter {
+    bot: Bot,
+    chat_id: teloxide::types::ChatId,
+    coin: String,
+    timeout_secs: u64,
+}
+
+#[async_trait::async_trait]
+impl ProgressReporter for TelegramReporter {
+    async fn report(&self, event: ExecutionEvent) {
+        let text = format_execution_event(&self.coin, self.timeout_secs, &event);
+        if let Err(error) = self.bot.send_message(self.chat_id, text).await {
+            tracing::warn!("progress notification failed: {error}");
         }
     }
 }
@@ -952,20 +962,26 @@ async fn on_callback<E: Exchange + 'static>(
     let trade_risk_reward = trade.setup.risk_reward;
     let trade_profile = format!("{:?}", trade.profile);
 
+    let reporter = TelegramReporter {
+        bot: bot.clone(),
+        chat_id: message.chat.id,
+        coin: trade.plan.coin.clone(),
+        timeout_secs: context.config.entry_fill_timeout_secs,
+    };
+
     match execute_plan(
         context.exchange.as_ref(),
         &trade.plan,
         use_limit,
         context.config.entry_fill_timeout_secs,
-        &NoopReporter,
+        &reporter,
     )
     .await
     {
         Ok(()) => {
             // Journal every attempt so a position that was opened is always
-            // auditable — even when subsequent steps (e.g. bracket placement)
-            // returned Ok. execute_plan signature is kept as Result<()>; order
-            // id is journalled as None here (thread-out is a future task).
+            // auditable. The user-facing success message was already sent by
+            // the reporter's BracketArmed event.
             let _ = context.journal.record(
                 &trade.plan,
                 None,
@@ -975,16 +991,10 @@ async fn on_callback<E: Exchange + 'static>(
                 &trade_profile,
                 opened_at,
             );
-            bot.send_message(
-                message.chat.id,
-                format!("✅ Executed {} with SL/TP bracket.", trade.plan.coin),
-            )
-            .await?;
         }
         Err(error) => {
             // Journal on failure too: a partial fill may have opened a position
-            // even when execute_plan returns Err, so we must leave an audit
-            // trail before sending the error message.
+            // even when execute_plan returns Err.
             let _ = context.journal.record(
                 &trade.plan,
                 None,
