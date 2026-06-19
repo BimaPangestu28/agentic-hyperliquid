@@ -271,6 +271,9 @@ pub enum ExecutionEvent {
     /// A limit entry did not fill within the timeout. `cancelled` notes the
     /// best-effort cancel of the resting remainder.
     FillTimeout { cancelled: bool },
+    /// A resting limit entry was cancelled by the user before it filled.
+    /// `cancelled` notes the best-effort cancel of the resting order succeeded.
+    EntryCancelled { cancelled: bool },
     /// The reduce-only SL + TP bracket was placed.
     BracketArmed { stop_loss: f64, take_profits: usize },
 }
@@ -302,6 +305,12 @@ pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEv
         }
         ExecutionEvent::FillTimeout { cancelled: false } => {
             format!("⚠️ Limit {coin} tak terisi dalam {timeout_secs}s dan pembatalan TIDAK terkonfirmasi — cek manual, mungkin masih ada order tersisa.")
+        }
+        ExecutionEvent::EntryCancelled { cancelled: true } => {
+            format!("❌ Order {coin} dibatalkan — tidak ada posisi.")
+        }
+        ExecutionEvent::EntryCancelled { cancelled: false } => {
+            format!("⚠️ Pembatalan order {coin} TIDAK terkonfirmasi — cek manual, mungkin masih ada order tersisa.")
         }
         ExecutionEvent::BracketArmed { stop_loss, take_profits } => {
             format!("✅ SL/TP {coin} terpasang (SL ${stop_loss:.4}, {take_profits} TP).")
@@ -1527,6 +1536,20 @@ mod tests {
         let text = super::format_execution_event("TAO", 300, &armed);
         assert!(text.contains("TAO"));
         assert!(text.contains("SL/TP"));
+    }
+
+    #[test]
+    fn format_execution_event_renders_entry_cancelled_copy() {
+        let cancelled = super::ExecutionEvent::EntryCancelled { cancelled: true };
+        let text = super::format_execution_event("AERO", 300, &cancelled);
+        assert!(text.contains("AERO"));
+        assert!(text.contains("dibatalkan"));
+        assert!(text.contains("tidak ada posisi"));
+
+        let uncertain = super::ExecutionEvent::EntryCancelled { cancelled: false };
+        let warn = super::format_execution_event("AERO", 300, &uncertain);
+        assert!(warn.contains("AERO"));
+        assert!(warn.contains("TIDAK terkonfirmasi"));
     }
 
     #[tokio::test]
