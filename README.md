@@ -57,6 +57,10 @@ without waiting for a prior limit order to fill.
 bracket. An unfilled trigger is cancelled after `TRIGGER_EXPIRY_SECS` (default 4h, editable
 via `/set trigger_expiry_secs`).
 
+While any position is open the bot pushes a running-P&L summary (total + per-position
+unrealized PnL) every `PNL_PUSH_SECS` (default 15min; `0` disables; editable via
+`/set pnl_push_secs`). `/account` also shows a total uPnL line.
+
 ## LLM parsing
 When `DEEPSEEK_API_KEY` is set, the bot uses DeepSeek as the primary card parser —
 it calls the DeepSeek chat API (OpenAI-compatible) to extract structured fields from
