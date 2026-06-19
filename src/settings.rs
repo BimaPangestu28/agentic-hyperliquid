@@ -20,6 +20,8 @@ pub struct Settings {
     pub leverage: LeverageMap,
     /// Seconds to wait for a limit entry to fill before cancelling.
     pub entry_fill_timeout_secs: u64,
+    /// Seconds an unfilled trigger entry rests before auto-cancellation.
+    pub trigger_expiry_secs: u64,
 }
 
 impl Settings {
@@ -33,13 +35,14 @@ impl Settings {
             max_daily_risk_pct: config.max_daily_risk_pct,
             leverage: config.leverage,
             entry_fill_timeout_secs: config.entry_fill_timeout_secs,
+            trigger_expiry_secs: config.trigger_expiry_secs,
         }
     }
 }
 
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
-max_daily_risk_pct, entry_fill_timeout_secs, leverage_conservative, leverage_moderate, leverage_aggressive";
+max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive";
 
 /// Parses a percentage that must be strictly positive and at most 100.
 fn parse_percent(value: &str) -> Result<f64, String> {
@@ -64,6 +67,15 @@ fn parse_timeout_secs(value: &str) -> Result<u64, String> {
     let parsed: u64 = value.parse().map_err(|_| format!("'{value}' is not a whole number"))?;
     if parsed < 1 {
         return Err("entry_fill_timeout_secs must be >= 1".to_string());
+    }
+    Ok(parsed)
+}
+
+/// Parses a trigger expiry in seconds; whole number of at least 1.
+fn parse_trigger_expiry_secs(value: &str) -> Result<u64, String> {
+    let parsed: u64 = value.parse().map_err(|_| format!("'{value}' is not a whole number"))?;
+    if parsed < 1 {
+        return Err("trigger_expiry_secs must be >= 1".to_string());
     }
     Ok(parsed)
 }
@@ -102,6 +114,7 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
         "leverage_moderate" => next.leverage.moderate = parse_leverage(value)?,
         "leverage_aggressive" => next.leverage.aggressive = parse_leverage(value)?,
         "entry_fill_timeout_secs" => next.entry_fill_timeout_secs = parse_timeout_secs(value)?,
+        "trigger_expiry_secs" => next.trigger_expiry_secs = parse_trigger_expiry_secs(value)?,
         _ => return Err(format!("Unknown setting '{key}'. Valid keys: {VALID_KEYS}")),
     }
     Ok(next)
@@ -166,6 +179,7 @@ impl SettingsStore {
         self.put("leverage_moderate", &settings.leverage.moderate.to_string())?;
         self.put("leverage_aggressive", &settings.leverage.aggressive.to_string())?;
         self.put("entry_fill_timeout_secs", &settings.entry_fill_timeout_secs.to_string())?;
+        self.put("trigger_expiry_secs", &settings.trigger_expiry_secs.to_string())?;
         Ok(())
     }
 
@@ -231,6 +245,12 @@ impl SettingsStore {
                 Err(_) => tracing::warn!(key = "entry_fill_timeout_secs", value = %raw, "failed to parse stored setting; keeping seed value"),
             }
         }
+        if let Some(raw) = self.get("trigger_expiry_secs")? {
+            match raw.parse() {
+                Ok(value) => resolved.trigger_expiry_secs = value,
+                Err(_) => tracing::warn!(key = "trigger_expiry_secs", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
+        }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
         Ok(resolved)
@@ -250,6 +270,7 @@ mod tests {
             max_daily_risk_pct: Some(5.0),
             leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
+            trigger_expiry_secs: 14400,
         }
     }
 
@@ -348,5 +369,27 @@ mod tests {
         changed.entry_fill_timeout_secs = 1800;
         store.persist(&changed).unwrap();
         assert_eq!(store.load(sample()).unwrap().entry_fill_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn sets_trigger_expiry_secs() {
+        let next = apply_setting(&sample(), "trigger_expiry_secs", "7200").unwrap();
+        assert_eq!(next.trigger_expiry_secs, 7200);
+    }
+
+    #[test]
+    fn rejects_zero_trigger_expiry() {
+        assert!(apply_setting(&sample(), "trigger_expiry_secs", "0").is_err());
+        assert!(apply_setting(&sample(), "trigger_expiry_secs", "abc").is_err());
+    }
+
+    #[test]
+    fn trigger_expiry_persists_and_reloads() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        store.load(sample()).unwrap();
+        let mut changed = sample();
+        changed.trigger_expiry_secs = 7200;
+        store.persist(&changed).unwrap();
+        assert_eq!(store.load(sample()).unwrap().trigger_expiry_secs, 7200);
     }
 }

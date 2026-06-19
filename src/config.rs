@@ -65,6 +65,9 @@ pub struct Config {
     /// Seconds between background polls of the fill history for close
     /// (TP/SL) notifications. Set via `MONITOR_POLL_SECS` (default 30).
     pub monitor_poll_secs: u64,
+    /// Seconds an unfilled trigger entry rests before auto-cancellation.
+    /// Set via `TRIGGER_EXPIRY_SECS` (default 14400 = 4h).
+    pub trigger_expiry_secs: u64,
 }
 
 impl Config {
@@ -171,6 +174,7 @@ pub fn from_env() -> anyhow::Result<Config> {
         api_token: std::env::var("PORTFOLIO_API_TOKEN").ok().filter(|s| !s.is_empty()),
         journal_path: std::env::var("JOURNAL_DB_PATH").unwrap_or_else(|_| "trades.db".to_string()),
         monitor_poll_secs: parse_env_or("MONITOR_POLL_SECS", 30_u64)?,
+        trigger_expiry_secs: parse_env_or("TRIGGER_EXPIRY_SECS", 14400_u64)?,
     })
 }
 
@@ -210,6 +214,7 @@ mod tests {
             api_token: None,
             journal_path: "trades.db".into(),
             monitor_poll_secs: 30,
+            trigger_expiry_secs: 14400,
         };
         assert!(config.is_allowed(42));
         assert!(!config.is_allowed(99));
