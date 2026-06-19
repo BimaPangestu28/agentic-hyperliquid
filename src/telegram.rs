@@ -214,6 +214,61 @@ pub fn recompute_plan(
     })
 }
 
+/// A concise execution-progress event emitted by [`execute_plan`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutionEvent {
+    /// Entry order accepted by the exchange. `limit` distinguishes a resting
+    /// limit order (awaiting fill) from a market order (filling now).
+    EntrySubmitted { limit: bool, price: f64 },
+    /// A fill was observed. `partial` marks a partial fill after a limit timeout.
+    Filled { size: f64, partial: bool },
+    /// A limit entry did not fill within the timeout. `cancelled` notes the
+    /// best-effort cancel of the resting remainder.
+    FillTimeout { cancelled: bool },
+    /// The reduce-only SL + TP bracket was placed.
+    BracketArmed { stop_loss: f64, take_profits: usize },
+}
+
+/// Receives [`ExecutionEvent`]s during [`execute_plan`]. Implementations must
+/// be best-effort: a failure to deliver must not abort execution.
+#[async_trait::async_trait]
+pub trait ProgressReporter: Send + Sync {
+    async fn report(&self, event: ExecutionEvent);
+}
+
+/// A no-op reporter that silently discards all events. Used when no
+/// progress reporting is needed (e.g. legacy call sites).
+struct NoopReporter;
+
+#[async_trait::async_trait]
+impl ProgressReporter for NoopReporter {
+    async fn report(&self, _event: ExecutionEvent) {}
+}
+
+/// Formats an [`ExecutionEvent`] into the Indonesian message shown to the user.
+pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEvent) -> String {
+    match event {
+        ExecutionEvent::EntrySubmitted { limit: true, price } => {
+            format!("⏳ Limit {coin} @ ${price:.4} dipasang, menunggu fill…")
+        }
+        ExecutionEvent::EntrySubmitted { limit: false, .. } => {
+            format!("⏳ Entry {coin} dikirim…")
+        }
+        ExecutionEvent::Filled { size, partial: false } => {
+            format!("✅ {coin} terisi (size {size}).")
+        }
+        ExecutionEvent::Filled { size, partial: true } => {
+            format!("⚠️ Partial fill {coin}: bracket dipasang di size {size}.")
+        }
+        ExecutionEvent::FillTimeout { .. } => {
+            format!("❌ Limit {coin} tak terisi dalam {timeout_secs}s — dibatalkan, tidak ada posisi.")
+        }
+        ExecutionEvent::BracketArmed { stop_loss, take_profits } => {
+            format!("✅ SL/TP {coin} terpasang (SL ${stop_loss:.4}, {take_profits} TP).")
+        }
+    }
+}
+
 /// Sets leverage, places the entry order, waits for fill (limit only), then
 /// places the reduce-only bracket sized to the ACTUAL held position.
 ///
@@ -226,6 +281,7 @@ pub async fn execute_plan<E: Exchange>(
     plan: &ExecutionPlan,
     use_limit: bool,
     fill_timeout_secs: u64,
+    reporter: &dyn ProgressReporter,
 ) -> anyhow::Result<()> {
     let is_buy = matches!(plan.direction, Direction::Long);
     exchange.set_leverage(&plan.coin, plan.leverage).await?;
@@ -237,6 +293,9 @@ pub async fn execute_plan<E: Exchange>(
         limit_price: if use_limit { Some(plan.entry) } else { None },
     };
     let entry_result = exchange.place_entry(&entry).await?;
+    reporter
+        .report(ExecutionEvent::EntrySubmitted { limit: use_limit, price: plan.entry })
+        .await;
 
     // Determine the size we actually hold before arming the bracket.
     // For market orders (or an immediately-filled limit) this is plan.size.
@@ -247,6 +306,7 @@ pub async fn execute_plan<E: Exchange>(
             let held = exchange.position_size(&plan.coin).await?;
             if held >= plan.size * 0.99 {
                 // Treat ~full fill as full.
+                reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
                 break plan.size;
             }
             if elapsed >= fill_timeout_secs {
@@ -258,18 +318,20 @@ pub async fn execute_plan<E: Exchange>(
                 }
                 let held = exchange.position_size(&plan.coin).await?;
                 if held <= 0.0 {
+                    reporter.report(ExecutionEvent::FillTimeout { cancelled: true }).await;
                     anyhow::bail!(
                         "entry limit order not filled within {fill_timeout_secs}s; \
                          order cancelled, no position opened"
                     );
                 }
-                // Partial fill: arm the bracket on exactly what we hold.
+                reporter.report(ExecutionEvent::Filled { size: held, partial: true }).await;
                 break held;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             elapsed += 1;
         }
     } else {
+        reporter.report(ExecutionEvent::Filled { size: plan.size, partial: false }).await;
         plan.size
     };
 
@@ -300,6 +362,12 @@ pub async fn execute_plan<E: Exchange>(
             })
             .await?;
     }
+    reporter
+        .report(ExecutionEvent::BracketArmed {
+            stop_loss: plan.stop_loss.price,
+            take_profits: plan.take_profits.len(),
+        })
+        .await;
     Ok(())
 }
 
@@ -889,6 +957,7 @@ async fn on_callback<E: Exchange + 'static>(
         &trade.plan,
         use_limit,
         context.config.entry_fill_timeout_secs,
+        &NoopReporter,
     )
     .await
     {
@@ -1126,6 +1195,18 @@ mod tests {
     use crate::hyperliquid::mock::MockExchange;
     use crate::sizing::AssetMeta;
 
+    #[derive(Default)]
+    struct RecordingReporter {
+        events: std::sync::Mutex<Vec<super::ExecutionEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::ProgressReporter for RecordingReporter {
+        async fn report(&self, event: super::ExecutionEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     #[tokio::test]
     async fn execute_plan_sets_leverage_then_entry_then_brackets() {
         let exchange = MockExchange {
@@ -1134,7 +1215,8 @@ mod tests {
             ..Default::default()
         };
         let plan = plan(); // long, size 666.6, 2 TPs
-        super::execute_plan(&exchange, &plan, false, 1).await.unwrap();
+        let reporter = RecordingReporter::default();
+        super::execute_plan(&exchange, &plan, false, 1, &reporter).await.unwrap();
 
         assert_eq!(exchange.leverage_calls.lock().unwrap().len(), 1);
         assert_eq!(exchange.entries.lock().unwrap().len(), 1);
@@ -1161,7 +1243,8 @@ mod tests {
         let plan = plan(); // long, size 666.6, SL + 2 TPs
         // use_limit=true so a limit entry is placed; fill_timeout_secs=0 so the
         // loop times out immediately on the first iteration (400 < 666.6 * 0.99).
-        super::execute_plan(&exchange, &plan, true, 0).await.unwrap();
+        let reporter = RecordingReporter::default();
+        super::execute_plan(&exchange, &plan, true, 0, &reporter).await.unwrap();
 
         // The resting order (id=1 from MockExchange) must have been cancelled.
         let cancels = exchange.cancels.lock().unwrap();
@@ -1191,5 +1274,30 @@ mod tests {
                 take_profit.size
             );
         }
+    }
+
+    #[tokio::test]
+    async fn execute_plan_reports_market_event_sequence() {
+        let exchange = MockExchange {
+            equity: 10_000.0,
+            meta: Some(AssetMeta { sz_decimals: 1, max_leverage: 10 }),
+            ..Default::default()
+        };
+        let plan = plan();
+        let reporter = RecordingReporter::default();
+        super::execute_plan(&exchange, &plan, false, 1, &reporter).await.unwrap();
+
+        let events = reporter.events.lock().unwrap();
+        assert!(matches!(events.first(), Some(super::ExecutionEvent::EntrySubmitted { limit: false, .. })));
+        assert!(events.iter().any(|e| matches!(e, super::ExecutionEvent::Filled { partial: false, .. })));
+        assert!(matches!(events.last(), Some(super::ExecutionEvent::BracketArmed { take_profits: 2, .. })));
+    }
+
+    #[test]
+    fn format_execution_event_renders_indonesian_copy() {
+        let armed = super::ExecutionEvent::BracketArmed { stop_loss: 280.0, take_profits: 2 };
+        let text = super::format_execution_event("TAO", 300, &armed);
+        assert!(text.contains("TAO"));
+        assert!(text.contains("SL/TP"));
     }
 }
