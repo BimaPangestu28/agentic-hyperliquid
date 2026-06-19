@@ -172,7 +172,8 @@ pub fn render_settings(settings: &Settings) -> String {
          leverage_moderate: {}x\n\
          leverage_aggressive: {}x\n\
          entry_fill_timeout_secs: {}s\n\
-         trigger_expiry_secs: {}s\n\n\
+         trigger_expiry_secs: {}s\n\
+         pnl_push_secs: {}s\n\n\
          Change a number:  /set <key> <value>\n\
          e.g.  /set entry_pct 10\n\
          Switch entry mode with the buttons below.",
@@ -186,6 +187,7 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.leverage.aggressive,
         settings.entry_fill_timeout_secs,
         settings.trigger_expiry_secs,
+        settings.pnl_push_secs,
     )
 }
 
@@ -1259,6 +1261,7 @@ mod tests {
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
+            pnl_push_secs: 900,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1275,6 +1278,7 @@ mod tests {
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
+            pnl_push_secs: 900,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }

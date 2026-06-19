@@ -22,6 +22,8 @@ pub struct Settings {
     pub entry_fill_timeout_secs: u64,
     /// Seconds an unfilled trigger entry rests before auto-cancellation.
     pub trigger_expiry_secs: u64,
+    /// Seconds between background P&L push updates (0 disables).
+    pub pnl_push_secs: u64,
 }
 
 impl Settings {
@@ -36,13 +38,14 @@ impl Settings {
             leverage: config.leverage,
             entry_fill_timeout_secs: config.entry_fill_timeout_secs,
             trigger_expiry_secs: config.trigger_expiry_secs,
+            pnl_push_secs: config.pnl_push_secs,
         }
     }
 }
 
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
-max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive";
+max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs";
 
 /// Parses a percentage that must be strictly positive and at most 100.
 fn parse_percent(value: &str) -> Result<f64, String> {
@@ -115,6 +118,9 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
         "leverage_aggressive" => next.leverage.aggressive = parse_leverage(value)?,
         "entry_fill_timeout_secs" => next.entry_fill_timeout_secs = parse_timeout_secs(value)?,
         "trigger_expiry_secs" => next.trigger_expiry_secs = parse_trigger_expiry_secs(value)?,
+        "pnl_push_secs" => {
+            next.pnl_push_secs = value.parse::<u64>().map_err(|_| format!("'{value}' is not a whole number"))?;
+        }
         _ => return Err(format!("Unknown setting '{key}'. Valid keys: {VALID_KEYS}")),
     }
     Ok(next)
@@ -180,6 +186,7 @@ impl SettingsStore {
         self.put("leverage_aggressive", &settings.leverage.aggressive.to_string())?;
         self.put("entry_fill_timeout_secs", &settings.entry_fill_timeout_secs.to_string())?;
         self.put("trigger_expiry_secs", &settings.trigger_expiry_secs.to_string())?;
+        self.put("pnl_push_secs", &settings.pnl_push_secs.to_string())?;
         Ok(())
     }
 
@@ -251,6 +258,12 @@ impl SettingsStore {
                 Err(_) => tracing::warn!(key = "trigger_expiry_secs", value = %raw, "failed to parse stored setting; keeping seed value"),
             }
         }
+        if let Some(raw) = self.get("pnl_push_secs")? {
+            match raw.parse() {
+                Ok(value) => resolved.pnl_push_secs = value,
+                Err(_) => tracing::warn!(key = "pnl_push_secs", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
+        }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
         Ok(resolved)
@@ -271,6 +284,7 @@ mod tests {
             leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
+            pnl_push_secs: 900,
         }
     }
 
@@ -391,5 +405,26 @@ mod tests {
         changed.trigger_expiry_secs = 7200;
         store.persist(&changed).unwrap();
         assert_eq!(store.load(sample()).unwrap().trigger_expiry_secs, 7200);
+    }
+
+    #[test]
+    fn sets_pnl_push_secs_including_zero() {
+        assert_eq!(apply_setting(&sample(), "pnl_push_secs", "300").unwrap().pnl_push_secs, 300);
+        assert_eq!(apply_setting(&sample(), "pnl_push_secs", "0").unwrap().pnl_push_secs, 0);
+    }
+
+    #[test]
+    fn rejects_non_numeric_pnl_push_secs() {
+        assert!(apply_setting(&sample(), "pnl_push_secs", "abc").is_err());
+    }
+
+    #[test]
+    fn pnl_push_secs_persists_and_reloads() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        store.load(sample()).unwrap();
+        let mut changed = sample();
+        changed.pnl_push_secs = 300;
+        store.persist(&changed).unwrap();
+        assert_eq!(store.load(sample()).unwrap().pnl_push_secs, 300);
     }
 }
