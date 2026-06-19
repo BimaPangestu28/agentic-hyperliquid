@@ -158,7 +158,8 @@ pub fn render_settings(settings: &Settings) -> String {
          max_daily_risk_pct: {}\n\
          leverage_conservative: {}x\n\
          leverage_moderate: {}x\n\
-         leverage_aggressive: {}x\n\n\
+         leverage_aggressive: {}x\n\
+         entry_fill_timeout_secs: {}s\n\n\
          Change a number:  /set <key> <value>\n\
          e.g.  /set entry_pct 10\n\
          Switch entry mode with the buttons below.",
@@ -170,6 +171,7 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.leverage.conservative,
         settings.leverage.moderate,
         settings.leverage.aggressive,
+        settings.entry_fill_timeout_secs,
     )
 }
 
@@ -962,18 +964,19 @@ async fn on_callback<E: Exchange + 'static>(
     let trade_risk_reward = trade.setup.risk_reward;
     let trade_profile = format!("{:?}", trade.profile);
 
+    let fill_timeout_secs = context.settings.lock().unwrap().entry_fill_timeout_secs;
     let reporter = TelegramReporter {
         bot: bot.clone(),
         chat_id: message.chat.id,
         coin: trade.plan.coin.clone(),
-        timeout_secs: context.config.entry_fill_timeout_secs,
+        timeout_secs: fill_timeout_secs,
     };
 
     match execute_plan(
         context.exchange.as_ref(),
         &trade.plan,
         use_limit,
-        context.config.entry_fill_timeout_secs,
+        fill_timeout_secs,
         &reporter,
     )
     .await
@@ -1149,6 +1152,7 @@ mod tests {
             entry_fixed_usd: 50.0,
             max_daily_risk_pct: Some(5.0),
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+            entry_fill_timeout_secs: 300,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1163,6 +1167,7 @@ mod tests {
             risk_pct: 1.0, entry_pct: 10.0, entry_fixed_usd: 50.0,
             max_daily_risk_pct: None,
             leverage: crate::config::LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+            entry_fill_timeout_secs: 300,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }

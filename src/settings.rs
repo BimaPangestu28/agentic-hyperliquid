@@ -18,6 +18,8 @@ pub struct Settings {
     pub entry_fixed_usd: f64,
     pub max_daily_risk_pct: Option<f64>,
     pub leverage: LeverageMap,
+    /// Seconds to wait for a limit entry to fill before cancelling.
+    pub entry_fill_timeout_secs: u64,
 }
 
 impl Settings {
@@ -30,13 +32,14 @@ impl Settings {
             entry_fixed_usd: config.entry_fixed_usd,
             max_daily_risk_pct: config.max_daily_risk_pct,
             leverage: config.leverage,
+            entry_fill_timeout_secs: config.entry_fill_timeout_secs,
         }
     }
 }
 
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
-max_daily_risk_pct, leverage_conservative, leverage_moderate, leverage_aggressive";
+max_daily_risk_pct, entry_fill_timeout_secs, leverage_conservative, leverage_moderate, leverage_aggressive";
 
 /// Parses a percentage that must be strictly positive and at most 100.
 fn parse_percent(value: &str) -> Result<f64, String> {
@@ -52,6 +55,15 @@ fn parse_leverage(value: &str) -> Result<u32, String> {
     let parsed: u32 = value.parse().map_err(|_| format!("'{value}' is not a whole number"))?;
     if parsed < 1 {
         return Err("leverage must be >= 1".to_string());
+    }
+    Ok(parsed)
+}
+
+/// Parses a fill-timeout in seconds; must be a whole number of at least 1.
+fn parse_timeout_secs(value: &str) -> Result<u64, String> {
+    let parsed: u64 = value.parse().map_err(|_| format!("'{value}' is not a whole number"))?;
+    if parsed < 1 {
+        return Err("entry_fill_timeout_secs must be >= 1".to_string());
     }
     Ok(parsed)
 }
@@ -89,6 +101,7 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
         "leverage_conservative" => next.leverage.conservative = parse_leverage(value)?,
         "leverage_moderate" => next.leverage.moderate = parse_leverage(value)?,
         "leverage_aggressive" => next.leverage.aggressive = parse_leverage(value)?,
+        "entry_fill_timeout_secs" => next.entry_fill_timeout_secs = parse_timeout_secs(value)?,
         _ => return Err(format!("Unknown setting '{key}'. Valid keys: {VALID_KEYS}")),
     }
     Ok(next)
@@ -152,6 +165,7 @@ impl SettingsStore {
         self.put("leverage_conservative", &settings.leverage.conservative.to_string())?;
         self.put("leverage_moderate", &settings.leverage.moderate.to_string())?;
         self.put("leverage_aggressive", &settings.leverage.aggressive.to_string())?;
+        self.put("entry_fill_timeout_secs", &settings.entry_fill_timeout_secs.to_string())?;
         Ok(())
     }
 
@@ -211,6 +225,12 @@ impl SettingsStore {
                 Err(_) => tracing::warn!(key = "leverage_aggressive", value = %raw, "failed to parse stored setting; keeping seed value"),
             }
         }
+        if let Some(raw) = self.get("entry_fill_timeout_secs")? {
+            match raw.parse() {
+                Ok(value) => resolved.entry_fill_timeout_secs = value,
+                Err(_) => tracing::warn!(key = "entry_fill_timeout_secs", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
+        }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
         Ok(resolved)
@@ -229,6 +249,7 @@ mod tests {
             entry_fixed_usd: 50.0,
             max_daily_risk_pct: Some(5.0),
             leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+            entry_fill_timeout_secs: 300,
         }
     }
 
@@ -305,5 +326,27 @@ mod tests {
         seed.max_daily_risk_pct = None;
         store.persist(&seed).unwrap();
         assert_eq!(store.load(sample()).unwrap().max_daily_risk_pct, None);
+    }
+
+    #[test]
+    fn sets_entry_fill_timeout_secs() {
+        let next = apply_setting(&sample(), "entry_fill_timeout_secs", "1800").unwrap();
+        assert_eq!(next.entry_fill_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn rejects_zero_timeout() {
+        assert!(apply_setting(&sample(), "entry_fill_timeout_secs", "0").is_err());
+        assert!(apply_setting(&sample(), "entry_fill_timeout_secs", "abc").is_err());
+    }
+
+    #[test]
+    fn timeout_persists_and_reloads() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        store.load(sample()).unwrap();
+        let mut changed = sample();
+        changed.entry_fill_timeout_secs = 1800;
+        store.persist(&changed).unwrap();
+        assert_eq!(store.load(sample()).unwrap().entry_fill_timeout_secs, 1800);
     }
 }
