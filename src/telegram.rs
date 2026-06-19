@@ -253,8 +253,11 @@ pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEv
         ExecutionEvent::Filled { size, partial: true } => {
             format!("⚠️ Partial fill {coin}: bracket dipasang di size {size}.")
         }
-        ExecutionEvent::FillTimeout { .. } => {
+        ExecutionEvent::FillTimeout { cancelled: true } => {
             format!("❌ Limit {coin} tak terisi dalam {timeout_secs}s — dibatalkan, tidak ada posisi.")
+        }
+        ExecutionEvent::FillTimeout { cancelled: false } => {
+            format!("⚠️ Limit {coin} tak terisi dalam {timeout_secs}s dan pembatalan TIDAK terkonfirmasi — cek manual, mungkin masih ada order tersisa.")
         }
         ExecutionEvent::BracketArmed { stop_loss, take_profits } => {
             format!("✅ SL/TP {coin} terpasang (SL ${stop_loss:.4}, {take_profits} TP).")
@@ -323,14 +326,13 @@ pub async fn execute_plan<E: Exchange>(
             }
             if elapsed >= fill_timeout_secs {
                 // Timed out: cancel any resting remainder, then decide.
-                if let Some(oid) = entry_result.order_id {
-                    // best-effort cancel — ignore errors to avoid masking the
-                    // partial-fill handling below.
-                    let _ = exchange.cancel_order(&plan.coin, oid).await;
-                }
+                let cancelled = match entry_result.order_id {
+                    Some(oid) => exchange.cancel_order(&plan.coin, oid).await.is_ok(),
+                    None => false,
+                };
                 let held = exchange.position_size(&plan.coin).await?;
                 if held <= 0.0 {
-                    reporter.report(ExecutionEvent::FillTimeout { cancelled: true }).await;
+                    reporter.report(ExecutionEvent::FillTimeout { cancelled }).await;
                     anyhow::bail!(
                         "entry limit order not filled within {fill_timeout_secs}s; \
                          order cancelled, no position opened"
@@ -954,22 +956,28 @@ async fn on_callback<E: Exchange + 'static>(
     // Read the live timeout before spawning (never hold the lock across await).
     let fill_timeout_secs = context.settings.lock().unwrap().entry_fill_timeout_secs;
 
-    // Execute off the handler so the chat is not blocked during a limit
-    // order's fill-wait — multiple entries can run concurrently. All status
-    // is delivered asynchronously via TelegramReporter.
+    // Reserve this trade's risk in the journal synchronously at confirm time so a
+    // concurrent confirm's daily-cap check sees it immediately — execution runs in a
+    // background task that may take up to the fill timeout to finish. Journalled once
+    // here regardless of the eventual execution outcome (order id is recorded later).
+    let opened_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let _ = context.journal.record(
+        &trade.plan,
+        None,
+        trade.setup.confidence,
+        trade.setup.timeframe.as_deref(),
+        trade.setup.risk_reward,
+        &format!("{:?}", trade.profile),
+        opened_at,
+    );
+
     let task_context = context.clone();
     let task_bot = bot.clone();
     let chat_id = message.chat.id;
     tokio::spawn(async move {
-        let opened_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs() as i64)
-            .unwrap_or(0);
-        let trade_confidence = trade.setup.confidence;
-        let trade_timeframe = trade.setup.timeframe.clone();
-        let trade_risk_reward = trade.setup.risk_reward;
-        let trade_profile = format!("{:?}", trade.profile);
-
         let reporter = TelegramReporter {
             bot: task_bot.clone(),
             chat_id,
@@ -985,17 +993,6 @@ async fn on_callback<E: Exchange + 'static>(
             &reporter,
         )
         .await;
-
-        // Journal every attempt (a partial fill may open a position even on Err).
-        let _ = task_context.journal.record(
-            &trade.plan,
-            None,
-            trade_confidence,
-            trade_timeframe.as_deref(),
-            trade_risk_reward,
-            &trade_profile,
-            opened_at,
-        );
 
         if let Err(error) = outcome {
             if let Err(send_error) = task_bot

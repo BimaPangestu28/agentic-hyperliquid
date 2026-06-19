@@ -203,10 +203,16 @@ impl Journal {
         );
         match row {
             Ok((stop_loss, tp_json)) => {
-                let take_profits = tp_json
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<Vec<f64>>(raw).ok())
-                    .unwrap_or_default();
+                let take_profits = match tp_json.as_deref() {
+                    Some(raw) => match serde_json::from_str::<Vec<f64>>(raw) {
+                        Ok(prices) => prices,
+                        Err(error) => {
+                            tracing::warn!(coin, raw, %error, "malformed tp_prices JSON; treating as no take-profits");
+                            Vec::new()
+                        }
+                    },
+                    None => Vec::new(),
+                };
                 Ok(Some(Bracket { stop_loss, take_profits }))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),

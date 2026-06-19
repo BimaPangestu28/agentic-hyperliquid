@@ -111,6 +111,11 @@ pub async fn run_fill_monitor<E: Exchange + 'static>(
                     continue;
                 }
             }
+            // Labelling uses the NEWEST journaled bracket for the coin. If multiple
+            // trades on the same coin are open concurrently, an older trade's close
+            // may be labelled against the newer trade's SL/TP prices. The PnL value
+            // from `closed_pnl` is always correct; only the leg label (SL/TP) may
+            // be misattributed in that multi-trade scenario.
             let label = journal
                 .latest_bracket_for_coin(&fill.coin)
                 .ok()
@@ -185,5 +190,12 @@ mod tests {
     fn classify_with_only_stop_loss() {
         let bracket = Bracket { stop_loss: 280.0, take_profits: vec![] };
         assert_eq!(classify_close_fill(999.0, &bracket), CloseLabel::StopLoss);
+    }
+
+    #[test]
+    fn classify_tie_break_prefers_take_profit() {
+        // Equidistant: 310 is 30 from SL(280) and 30 from TP1(340) → TP wins.
+        let bracket = Bracket { stop_loss: 280.0, take_profits: vec![340.0] };
+        assert_eq!(classify_close_fill(310.0, &bracket), CloseLabel::TakeProfit(1));
     }
 }
