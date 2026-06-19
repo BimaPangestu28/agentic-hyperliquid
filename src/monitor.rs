@@ -3,7 +3,9 @@
 
 use crate::hyperliquid::{Exchange, FillDetail};
 use crate::journal::{Bracket, Journal};
-use crate::trigger_store::PendingTrigger;
+use crate::parser::Direction;
+use crate::sizing::BracketLeg;
+use crate::trigger_store::{PendingLeg, PendingTrigger, TriggerStore};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -149,6 +151,87 @@ pub async fn run_fill_monitor<E: Exchange + 'static>(
             let _ = journal.mark_fill_seen(&key);
         }
     }
+}
+
+/// Polls for trigger-entry fills (arming the bracket) and expiries (cancelling the
+/// resting order). Never panics: all errors are logged and the loop continues.
+pub async fn run_trigger_monitor<E: Exchange + 'static>(
+    bot: Bot,
+    exchange: Arc<E>,
+    triggers: Arc<TriggerStore>,
+    allowed_user_ids: Vec<i64>,
+    poll_secs: u64,
+) {
+    let interval = Duration::from_secs(poll_secs.max(1));
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let active = match triggers.list_active() {
+            Ok(active) => active,
+            Err(error) => { tracing::warn!("trigger monitor list_active failed: {error}"); continue; }
+        };
+        if active.is_empty() { continue; }
+
+        let fills = exchange.fills_detailed().await.unwrap_or_else(|error| {
+            tracing::warn!("trigger monitor fills_detailed failed: {error}");
+            Vec::new()
+        });
+        let now_secs = now_unix_secs();
+
+        for pending in active {
+            // 1. Filled? Match the entry order's opening fill.
+            if let Some(fill) = fills.iter().find(|fill| matches_entry_fill(fill, &pending)) {
+                let direction = if pending.direction.eq_ignore_ascii_case("short") {
+                    Direction::Short
+                } else {
+                    Direction::Long
+                };
+                let take_profits: Vec<BracketLeg> = pending.take_profits.iter()
+                    .map(|leg: &PendingLeg| BracketLeg {
+                        price: leg.price,
+                        size: pending.size * (leg.alloc_pct / 100.0),
+                    })
+                    .collect();
+                match crate::telegram::arm_bracket(exchange.as_ref(), &pending.coin, direction, pending.size, fill.sz, pending.stop_loss, &take_profits).await {
+                    Ok(()) => {
+                        let _ = triggers.mark_armed(pending.id);
+                        notify_users(&bot, &allowed_user_ids, &format!("✅ Trigger {} kena — SL/TP terpasang.", pending.coin)).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!("arm_bracket failed for {}: {error}", pending.coin);
+                        notify_users(&bot, &allowed_user_ids, &format!("⚠️ Posisi {} TERBUKA tapi GAGAL pasang SL — cek manual SEKARANG!", pending.coin)).await;
+                        // leave active → retry next poll
+                    }
+                }
+                continue;
+            }
+            // 2. Expired? Cancel the resting entry order.
+            if is_expired(now_secs, pending.expiry_at) {
+                if let Some(oid) = pending.entry_oid {
+                    let _ = exchange.cancel_order(&pending.coin, oid).await;
+                }
+                let _ = triggers.mark_expired(pending.id);
+                notify_users(&bot, &allowed_user_ids, &format!("⏱️ Trigger {} kadaluarsa — dibatalkan, tidak ada posisi.", pending.coin)).await;
+            }
+        }
+    }
+}
+
+/// Sends `message` to every allowlisted user, logging (not propagating) send errors.
+async fn notify_users(bot: &Bot, allowed_user_ids: &[i64], message: &str) {
+    for user_id in allowed_user_ids {
+        if let Err(error) = bot.send_message(ChatId(*user_id), message).await {
+            tracing::warn!("trigger notification failed for {user_id}: {error}");
+        }
+    }
+}
+
+/// Current UNIX time in seconds (0 on clock error).
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

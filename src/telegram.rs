@@ -1071,6 +1071,22 @@ pub async fn run<E: Exchange + 'static>(
         });
     }
 
+    // Background trigger-entry monitor: arms SL/TP when the trigger fill lands,
+    // or cancels and notifies on expiry. Opens its own TriggerStore connection
+    // (Task 7 will promote this to a shared Arc via BotContext).
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let trigger_store = Arc::new(crate::trigger_store::TriggerStore::open(&journal_path)?);
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        let monitor_poll_secs = context.config.monitor_poll_secs;
+        tokio::spawn(async move {
+            crate::monitor::run_trigger_monitor(
+                monitor_bot, monitor_exchange, trigger_store, monitor_user_ids, monitor_poll_secs,
+            ).await;
+        });
+    }
+
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message::<E>))
         .branch(Update::filter_callback_query().endpoint(on_callback::<E>));
