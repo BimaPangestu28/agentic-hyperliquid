@@ -3,6 +3,7 @@
 
 use crate::hyperliquid::{Exchange, FillDetail};
 use crate::journal::{Bracket, Journal};
+use crate::trigger_store::PendingTrigger;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -43,6 +44,24 @@ pub fn classify_close_fill(fill_price: f64, bracket: &Bracket) -> CloseLabel {
         }
     }
     best_label
+}
+
+/// True when `now_secs` is past the trigger's expiry timestamp.
+pub fn is_expired(now_secs: i64, expiry_at: i64) -> bool {
+    now_secs > expiry_at
+}
+
+/// True when `fill` is the OPENING fill of `pending`'s entry order: an opening
+/// `dir`, matching `entry_oid` (when known), and `time_ms >= created_at`. Matching
+/// the specific order id keeps this correct even if a position already existed on
+/// the coin (an older or closing fill never matches).
+pub fn matches_entry_fill(fill: &FillDetail, pending: &PendingTrigger) -> bool {
+    let is_opening = fill.dir.to_ascii_lowercase().contains("open");
+    let oid_ok = match pending.entry_oid {
+        Some(oid) => fill.oid == oid,
+        None => fill.coin.eq_ignore_ascii_case(&pending.coin),
+    };
+    is_opening && oid_ok && fill.time_ms >= pending.created_at
 }
 
 /// Formats a signed USD PnL as `+$12.30` / `-$8.10`.
@@ -163,6 +182,40 @@ mod tests {
             time_ms,
             start_position: 0.0,
         }
+    }
+
+    fn detail_full(dir: &str, oid: u64, time_ms: i64, coin: &str) -> FillDetail {
+        FillDetail { coin: coin.into(), oid, dir: dir.into(), px: 68.53, sz: 0.5,
+            closed_pnl: 0.0, fee: 0.0, time_ms, start_position: 0.0 }
+    }
+
+    fn pending(entry_oid: Option<u64>, created_at: i64) -> crate::trigger_store::PendingTrigger {
+        crate::trigger_store::PendingTrigger {
+            id: 1, coin: "SOL".into(), direction: "Long".into(), size: 0.5, trigger_px: 68.53,
+            leverage: 3, stop_loss: 68.02, take_profits: vec![], entry_oid, chat_id: 1,
+            created_at, expiry_at: created_at + 100, status: "active".into(),
+        }
+    }
+
+    #[test]
+    fn is_expired_compares_now_to_expiry() {
+        assert!(!is_expired(1099, 1100));
+        assert!(is_expired(1101, 1100));
+    }
+
+    #[test]
+    fn matches_entry_fill_by_oid_and_opening_dir_and_time() {
+        let p = pending(Some(7), 1000);
+        let opening = detail_full("Open Long", 7, 1500, "SOL");
+        assert!(matches_entry_fill(&opening, &p));
+        // wrong oid
+        assert!(!matches_entry_fill(&detail_full("Open Long", 8, 1500, "SOL"), &p));
+        // closing dir
+        assert!(!matches_entry_fill(&detail_full("Close Long", 7, 1500, "SOL"), &p));
+        // older than created_at
+        assert!(!matches_entry_fill(&detail_full("Open Long", 7, 999, "SOL"), &p));
+        // pre-existing-position guard: an older opening fill on same coin must not match
+        assert!(!matches_entry_fill(&detail_full("Open Long", 7, 500, "SOL"), &p));
     }
 
     #[test]
