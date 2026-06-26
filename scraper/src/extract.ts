@@ -36,8 +36,9 @@ export function extractSetup(html: string): Setup | null {
   const arahValue = arahLabel.closest("[data-slot='card']").find(".font-bold").text().toUpperCase();
   const direction = arahValue.includes("LONG") ? "long" : arahValue.includes("SHORT") ? "short" : null;
 
-  // Confidence: first "{n}/10".
-  const confMatch = $.root().text().match(/(\d{1,2})\s*\/\s*10/);
+  // Confidence: the "{n}/10" inside the "Keyakinan" card (scoped, mirroring "Arah").
+  const keyakinanLabel = $("div").filter((_, el) => $(el).text().trim() === "Keyakinan").first();
+  const confMatch = keyakinanLabel.closest("[data-slot='card']").text().match(/(\d{1,2})\s*\/\s*10/);
   const confidence = confMatch ? Number(confMatch[1]) : NaN;
 
   const entry = priceForLabel($, "Masuk");

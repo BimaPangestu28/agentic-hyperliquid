@@ -22,4 +22,8 @@ describe("extractSetup", () => {
   it("returns null when there is no setup card", () => {
     expect(extractSetup("<div>hello</div>")).toBeNull();
   });
+  it("ignores a decoy n/10 outside the Keyakinan card", () => {
+    const decoy = fixture.replace('<h4', '<span>3/10</span><h4');
+    expect(extractSetup(decoy)!.confidence).toBe(7);
+  });
 });
