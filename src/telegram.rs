@@ -1142,6 +1142,22 @@ async fn download_photo_as_data_url(bot: &Bot, file_id: &str) -> anyhow::Result<
     ))
 }
 
+/// Runs `execute_close` on `targets`, renders the result, and edits `message_id` in place.
+///
+/// Shared by the `CB_CLOSE_ALL` and `CB_CLOSE_ONE_PREFIX` confirm handlers to avoid
+/// duplicating the execute → render → edit sequence.
+async fn run_close_and_render<E: Exchange>(
+    bot: &Bot,
+    exchange: &E,
+    chat_id: teloxide::types::ChatId,
+    message_id: teloxide::types::MessageId,
+    targets: &[OpenPosition],
+) -> anyhow::Result<()> {
+    let outcomes = execute_close(exchange, targets).await;
+    bot.edit_message_text(chat_id, message_id, render_close_result(&outcomes)).await?;
+    Ok(())
+}
+
 async fn on_callback<E: Exchange + 'static>(
     bot: Bot,
     query: CallbackQuery,
@@ -1156,6 +1172,13 @@ async fn on_callback<E: Exchange + 'static>(
     // MessageId(i32), cast to i64 for PendingStore key
     let key = message.id.0 as i64;
     let data = query.data.clone().unwrap_or_default();
+
+    // Authorization guard: mirror on_message's allowlist check.
+    // CallbackQuery.from is User (non-Option) in teloxide-core 0.10.
+    let caller_id = query.from.id.0 as i64;
+    if !context.config.is_allowed(caller_id) {
+        return Ok(());
+    }
 
     // Entry-mode switch from the /settings keyboard.
     if let Some(mode) = entry_mode_from_callback(&data) {
@@ -1281,8 +1304,7 @@ async fn on_callback<E: Exchange + 'static>(
             bot.edit_message_text(message.chat.id, message.id, "Tidak ada posisi terbuka.").await?;
             return Ok(());
         }
-        let outcomes = execute_close(context.exchange.as_ref(), &positions).await;
-        bot.edit_message_text(message.chat.id, message.id, render_close_result(&outcomes)).await?;
+        run_close_and_render(&bot, context.exchange.as_ref(), message.chat.id, message.id, &positions).await?;
         return Ok(());
     }
 
@@ -1298,8 +1320,7 @@ async fn on_callback<E: Exchange + 'static>(
         };
         match positions.into_iter().find(|p| p.coin.eq_ignore_ascii_case(coin)) {
             Some(position) => {
-                let outcomes = execute_close(context.exchange.as_ref(), &[position]).await;
-                bot.edit_message_text(message.chat.id, message.id, render_close_result(&outcomes)).await?;
+                run_close_and_render(&bot, context.exchange.as_ref(), message.chat.id, message.id, &[position]).await?;
             }
             None => {
                 bot.edit_message_text(message.chat.id, message.id, format!("Posisi {coin} sudah tidak ada.")).await?;

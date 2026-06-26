@@ -107,7 +107,7 @@ pub trait Exchange: Send + Sync {
     /// Market-closes (flattens) the full open position `size` for `coin`.
     /// The exchange auto-detects the closing side from the live position.
     async fn close_position(&self, coin: &str, size: f64) -> anyhow::Result<OrderResult>;
-    /// Cancels every resting order for `coin` (e.g. orphaned SL/TP triggers).
+    /// Cancels ALL resting orders for `coin` (SL/TP triggers AND any pending entry on that coin).
     /// Returns the number of orders cancelled. Best-effort: a per-order failure
     /// is logged and skipped, not propagated.
     async fn cancel_orders_for_coin(&self, coin: &str) -> anyhow::Result<usize>;
