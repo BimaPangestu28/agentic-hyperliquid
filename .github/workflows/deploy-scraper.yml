@@ -67,3 +67,24 @@ jobs:
             kubectl -n agentic-hyperliquid set image deploy/scraper scraper=ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:$GITHUB_SHA
             kubectl -n agentic-hyperliquid rollout status deploy/scraper --timeout=420s
           "
+      # On rollout failure, surface WHY the pod never became ready (image pull,
+      # CreateContainerConfigError, Pending/scheduling, CrashLoopBackOff). The output
+      # lands in the CI log so the cause is visible without manual VPS access.
+      - name: Diagnose failed rollout
+        if: failure()
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+          SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+        run: |
+          sshpass -e ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
+            set +e
+            echo '===== pods ====='
+            kubectl -n agentic-hyperliquid get pods -l app=neurobro-scraper -o wide
+            echo '===== describe ====='
+            kubectl -n agentic-hyperliquid describe pod -l app=neurobro-scraper | tail -50
+            echo '===== recent events ====='
+            kubectl -n agentic-hyperliquid get events --sort-by=.lastTimestamp | tail -25
+            echo '===== logs (if any) ====='
+            kubectl -n agentic-hyperliquid logs -l app=neurobro-scraper --tail=40 --all-containers 2>&1 | tail -40
+          "
