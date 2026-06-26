@@ -20,6 +20,13 @@ pub struct ApiState {
     pub exchange: Arc<dyn Exchange>,
     pub db_path: String,
     pub token: String,
+    /// Default settings used to seed `SettingsStore::load` when reading current
+    /// settings from the DB per request.
+    pub settings_seed: crate::settings::Settings,
+    /// Telegram bot token used to construct a `Bot` for auto-open notifications.
+    pub telegram_bot_token: String,
+    /// Chat ids that receive auto-open notifications.
+    pub allowed_user_ids: Vec<i64>,
 }
 
 /// Reject any request whose `Authorization: Bearer <token>` does not match the
@@ -47,8 +54,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/balance", get(balance))
         .route("/positions", get(positions))
+        .route("/watchlist", get(watchlist))
         .route("/trades", get(trades))
         .route("/flows", get(flows))
+        .route("/execute", axum::routing::post(execute))
         .layer(middleware::from_fn_with_state(state.clone(), require_bearer))
         .with_state(state)
 }
@@ -63,6 +72,13 @@ use serde::{Deserialize, Serialize};
 struct BalanceResponse {
     equity_usd: f64,
     as_of_ms: i64,
+}
+
+#[derive(Serialize)]
+struct WatchlistResponse {
+    coins: Vec<String>,
+    auto_scalp_enabled: bool,
+    max_open_positions: u32,
 }
 
 async fn balance(State(state): State<ApiState>) -> Result<Json<BalanceResponse>, StatusCode> {
@@ -178,6 +194,139 @@ async fn flows(
     Ok(Json(ledger_flows))
 }
 
+async fn watchlist(State(state): State<ApiState>) -> Result<Json<WatchlistResponse>, StatusCode> {
+    let store = crate::settings::SettingsStore::open(&state.db_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let settings = store.load(state.settings_seed.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(WatchlistResponse {
+        coins: settings.watchlist,
+        auto_scalp_enabled: settings.auto_scalp_enabled,
+        max_open_positions: settings.max_open_positions,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct ExecuteRequest {
+    coin: String,
+    direction: String, // "long" | "short"
+    entry: f64,
+    stop_loss: f64,
+    take_profit: f64,
+    confidence: u8,
+    #[serde(default)]
+    thesis: String,
+}
+
+async fn execute(
+    State(state): State<ApiState>,
+    Json(req): Json<ExecuteRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Load current settings from the DB.
+    let store = crate::settings::SettingsStore::open(&state.db_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let settings = store
+        .load(state.settings_seed.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Gate 1: master kill-switch.
+    if !settings.auto_scalp_enabled {
+        return Err(StatusCode::CONFLICT);
+    }
+    // Gate 2: confidence threshold.
+    if req.confidence < 7 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    // Gate 3: position cap.
+    let open_positions = state
+        .exchange
+        .positions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if open_positions.len() as u32 >= settings.max_open_positions {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    // Build the TradeSetup (single TP, 100% allocation).
+    let direction = match req.direction.to_lowercase().as_str() {
+        "long" => crate::parser::Direction::Long,
+        "short" => crate::parser::Direction::Short,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let setup = crate::parser::TradeSetup {
+        coin: req.coin.to_uppercase(),
+        direction,
+        timeframe: Some("scalp".to_string()),
+        risk_reward: None,
+        confidence: Some(req.confidence),
+        entry: req.entry,
+        stop_loss: req.stop_loss,
+        take_profits: vec![crate::parser::TakeProfit {
+            price: req.take_profit,
+            allocation_pct: 100.0,
+        }],
+    };
+
+    // Size with the Aggressive profile (max leverage), market entry.
+    let equity = state
+        .exchange
+        .equity()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let asset_meta = state
+        .exchange
+        .asset_meta(&setup.coin)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let plan = crate::sizing::build_plan(&crate::sizing::SizingInput {
+        setup: &setup,
+        equity,
+        risk_pct: settings.risk_pct,
+        entry_mode: settings.entry_mode,
+        entry_pct: settings.entry_pct,
+        entry_fixed_usd: settings.entry_fixed_usd,
+        profile: crate::sizing::RiskProfile::Aggressive,
+        leverage: &settings.leverage,
+        asset_meta: &asset_meta,
+    })
+    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    // Execute: market entry + SL/TP bracket, no confirm.
+    crate::telegram::execute_plan(
+        state.exchange.as_ref(),
+        &plan,
+        false,
+        settings.entry_fill_timeout_secs,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        &crate::telegram::NoopReporter,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Notify via Telegram (best-effort: individual send failures are swallowed).
+    use teloxide::prelude::Requester;
+    let bot = teloxide::Bot::new(&state.telegram_bot_token);
+    let msg = format!(
+        "🤖 Auto-buka {} {} {} @ {} · SL {} · TP {} · conf {}/10\n{}",
+        setup.coin,
+        if matches!(setup.direction, crate::parser::Direction::Long) { "LONG" } else { "SHORT" },
+        plan.size,
+        plan.entry,
+        plan.stop_loss.price,
+        req.take_profit,
+        req.confidence,
+        req.thesis
+    );
+    for user_id in &state.allowed_user_ids {
+        let _ = bot
+            .send_message(teloxide::types::ChatId(*user_id), &msg)
+            .await;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// Returns the current time as milliseconds since the Unix epoch.
 ///
 /// Isolated into its own function so handlers remain deterministic under test
@@ -205,6 +354,9 @@ mod tests {
             exchange: Arc::new(MockExchange::with_equity(equity)),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         }
     }
 
@@ -244,6 +396,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         }
     }
 
@@ -350,6 +505,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         let response = app
             .oneshot(
@@ -393,6 +551,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         let response = app
             .oneshot(
@@ -430,6 +591,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         let response = app
             .oneshot(
@@ -457,6 +621,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         }
     }
 
@@ -594,6 +761,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         // Filter since=5000 — only SOL should come back.
         let response = app
@@ -612,5 +782,66 @@ mod tests {
         let trades_array = json.as_array().unwrap();
         assert_eq!(trades_array.len(), 1);
         assert_eq!(trades_array[0]["coin"].as_str().unwrap(), "SOL");
+    }
+
+    #[tokio::test]
+    async fn watchlist_requires_auth_and_returns_settings() {
+        let app = router(state_with(1000.0));
+        // no bearer → 401
+        let res = app.clone().oneshot(
+            Request::builder().uri("/watchlist").body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // with bearer → 200 + JSON
+        let res = app.oneshot(
+            Request::builder().uri("/watchlist").header("authorization", "Bearer t")
+                .body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    fn execute_body(confidence: u8) -> String {
+        format!(
+            r#"{{"coin":"AVAX","direction":"long","entry":6.12,"stop_loss":5.99,"take_profit":6.32,"confidence":{confidence},"thesis":"t"}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_rejected_when_auto_scalp_disabled() {
+        // state_with leaves auto_scalp_enabled at the seed default (false).
+        let app = router(state_with(1000.0));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(execute_body(8)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT); // 409 kill-switch
+    }
+
+    #[tokio::test]
+    async fn execute_rejected_when_confidence_below_gate() {
+        let mut state = state_with(1000.0);
+        state.settings_seed.auto_scalp_enabled = true;
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(execute_body(6)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY); // 422 conf<7
     }
 }

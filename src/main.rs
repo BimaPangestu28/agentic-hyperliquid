@@ -32,6 +32,9 @@ async fn main() -> anyhow::Result<()> {
             exchange: api_exchange,
             db_path: config.journal_path.clone(),
             token: api_token,
+            settings_seed: settings::Settings::from_config(&config),
+            telegram_bot_token: config.telegram_token.clone(),
+            allowed_user_ids: config.allowed_user_ids.clone(),
         };
         let bind_addr = config.http_bind_addr.clone();
         tokio::spawn(async move {

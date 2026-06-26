@@ -24,6 +24,12 @@ pub struct Settings {
     pub trigger_expiry_secs: u64,
     /// Seconds between background P&L push updates (0 disables).
     pub pnl_push_secs: u64,
+    /// Coins the auto-scalp scraper scans, upper-cased.
+    pub watchlist: Vec<String>,
+    /// Master kill-switch for auto-scalp execution (default false).
+    pub auto_scalp_enabled: bool,
+    /// Max concurrent open positions the auto-scalp loop may hold.
+    pub max_open_positions: u32,
 }
 
 impl Settings {
@@ -39,13 +45,16 @@ impl Settings {
             entry_fill_timeout_secs: config.entry_fill_timeout_secs,
             trigger_expiry_secs: config.trigger_expiry_secs,
             pnl_push_secs: config.pnl_push_secs,
+            watchlist: Vec::new(),
+            auto_scalp_enabled: false,
+            max_open_positions: 5,
         }
     }
 }
 
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
-max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs";
+max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs, auto_scalp_enabled, max_open_positions";
 
 /// Parses a percentage that must be strictly positive and at most 100.
 fn parse_percent(value: &str) -> Result<f64, String> {
@@ -121,6 +130,20 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
         "pnl_push_secs" => {
             next.pnl_push_secs = value.parse::<u64>().map_err(|_| format!("'{value}' is not a whole number"))?;
         }
+        "auto_scalp_enabled" => {
+            next.auto_scalp_enabled = match value {
+                "true" | "on" | "1" => true,
+                "false" | "off" | "0" => false,
+                _ => return Err("auto_scalp_enabled must be true or false".to_string()),
+            };
+        }
+        "max_open_positions" => {
+            let parsed: u32 = value.parse().map_err(|_| format!("'{value}' is not a whole number"))?;
+            if parsed < 1 {
+                return Err("max_open_positions must be >= 1".to_string());
+            }
+            next.max_open_positions = parsed;
+        }
         _ => return Err(format!("Unknown setting '{key}'. Valid keys: {VALID_KEYS}")),
     }
     Ok(next)
@@ -187,6 +210,9 @@ impl SettingsStore {
         self.put("entry_fill_timeout_secs", &settings.entry_fill_timeout_secs.to_string())?;
         self.put("trigger_expiry_secs", &settings.trigger_expiry_secs.to_string())?;
         self.put("pnl_push_secs", &settings.pnl_push_secs.to_string())?;
+        self.put("watchlist", &settings.watchlist.join(","))?;
+        self.put("auto_scalp_enabled", &settings.auto_scalp_enabled.to_string())?;
+        self.put("max_open_positions", &settings.max_open_positions.to_string())?;
         Ok(())
     }
 
@@ -264,29 +290,44 @@ impl SettingsStore {
                 Err(_) => tracing::warn!(key = "pnl_push_secs", value = %raw, "failed to parse stored setting; keeping seed value"),
             }
         }
+        if let Some(raw) = self.get("watchlist")? {
+            resolved.watchlist = raw.split(',').map(|c| c.trim().to_uppercase())
+                .filter(|c| !c.is_empty()).collect();
+        }
+        if let Some(raw) = self.get("auto_scalp_enabled")? {
+            resolved.auto_scalp_enabled = matches!(raw.as_str(), "true" | "on" | "1");
+        }
+        if let Some(raw) = self.get("max_open_positions")? {
+            if let Ok(value) = raw.parse() { resolved.max_open_positions = value; }
+        }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
         Ok(resolved)
     }
 }
 
+/// Test-only seed `Settings`, reused across module test suites.
+#[cfg(test)]
+pub fn sample() -> Settings {
+    Settings {
+        entry_mode: EntryMode::RiskBased,
+        risk_pct: 1.0,
+        entry_pct: 10.0,
+        entry_fixed_usd: 50.0,
+        max_daily_risk_pct: Some(5.0),
+        leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+        entry_fill_timeout_secs: 300,
+        trigger_expiry_secs: 14400,
+        pnl_push_secs: 900,
+        watchlist: Vec::new(),
+        auto_scalp_enabled: false,
+        max_open_positions: 5,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample() -> Settings {
-        Settings {
-            entry_mode: EntryMode::RiskBased,
-            risk_pct: 1.0,
-            entry_pct: 10.0,
-            entry_fixed_usd: 50.0,
-            max_daily_risk_pct: Some(5.0),
-            leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
-            entry_fill_timeout_secs: 300,
-            trigger_expiry_secs: 14400,
-            pnl_push_secs: 900,
-        }
-    }
 
     #[test]
     fn sets_a_valid_numeric_key() {
@@ -426,5 +467,31 @@ mod tests {
         changed.pnl_push_secs = 300;
         store.persist(&changed).unwrap();
         assert_eq!(store.load(sample()).unwrap().pnl_push_secs, 300);
+    }
+
+    #[test]
+    fn apply_setting_toggles_auto_scalp_and_cap() {
+        let base = sample();
+        let on = apply_setting(&base, "auto_scalp_enabled", "true").unwrap();
+        assert!(on.auto_scalp_enabled);
+        let off = apply_setting(&on, "auto_scalp_enabled", "false").unwrap();
+        assert!(!off.auto_scalp_enabled);
+        let capped = apply_setting(&base, "max_open_positions", "3").unwrap();
+        assert_eq!(capped.max_open_positions, 3);
+        assert!(apply_setting(&base, "max_open_positions", "0").is_err());
+    }
+
+    #[test]
+    fn persist_load_roundtrips_watchlist_and_flags() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        let mut settings = sample();
+        settings.watchlist = vec!["BTC".into(), "ETH".into()];
+        settings.auto_scalp_enabled = true;
+        settings.max_open_positions = 4;
+        store.persist(&settings).unwrap();
+        let loaded = store.load(sample()).unwrap();
+        assert_eq!(loaded.watchlist, vec!["BTC".to_string(), "ETH".to_string()]);
+        assert!(loaded.auto_scalp_enabled);
+        assert_eq!(loaded.max_open_positions, 4);
     }
 }

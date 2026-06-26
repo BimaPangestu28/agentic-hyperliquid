@@ -49,15 +49,18 @@ pub struct ApiState { pub exchange: Arc<dyn Exchange>, pub db_path: String, pub 
 
 **Interfaces:**
 - Produces on `Settings`: `pub watchlist: Vec<String>`, `pub auto_scalp_enabled: bool`, `pub max_open_positions: u32`.
+- Produces a shared test seed: `#[cfg(test)] pub fn sample() -> Settings` at module scope (promoted from the existing private `sample()` in `mod tests`), reused by the telegram and api test modules.
+
+> NOTE on the existing `sample()`: `src/settings.rs` currently has a private `fn sample() -> Settings` inside `#[cfg(test)] mod tests` (line ~277) that builds a `Settings` struct literal. Adding fields to `Settings` will break this literal (missing fields). This task MUST update it AND promote it so other modules' tests can reuse one seed (DRY).
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to the `#[cfg(test)] mod tests` block in `src/settings.rs`:
+Add to the `#[cfg(test)] mod tests` block in `src/settings.rs` (they call `sample()`, available via `use super::*`):
 
 ```rust
     #[test]
     fn apply_setting_toggles_auto_scalp_and_cap() {
-        let base = Settings::from_config(&crate::config::Config::sample());
+        let base = sample();
         let on = apply_setting(&base, "auto_scalp_enabled", "true").unwrap();
         assert!(on.auto_scalp_enabled);
         let off = apply_setting(&on, "auto_scalp_enabled", "false").unwrap();
@@ -70,19 +73,17 @@ Add to the `#[cfg(test)] mod tests` block in `src/settings.rs`:
     #[test]
     fn persist_load_roundtrips_watchlist_and_flags() {
         let store = SettingsStore::open_in_memory().unwrap();
-        let mut settings = Settings::from_config(&crate::config::Config::sample());
+        let mut settings = sample();
         settings.watchlist = vec!["BTC".into(), "ETH".into()];
         settings.auto_scalp_enabled = true;
         settings.max_open_positions = 4;
         store.persist(&settings).unwrap();
-        let loaded = store.load(Settings::from_config(&crate::config::Config::sample())).unwrap();
+        let loaded = store.load(sample()).unwrap();
         assert_eq!(loaded.watchlist, vec!["BTC".to_string(), "ETH".to_string()]);
         assert!(loaded.auto_scalp_enabled);
         assert_eq!(loaded.max_open_positions, 4);
     }
 ```
-
-> If `Config::sample()` does not exist, use the constructor the other settings tests already use to build a `Config` (check the top of the test module / `config.rs` test helpers) and mirror it.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -160,6 +161,33 @@ In `load` (before the final `Ok(resolved)` — find where `pnl_push_secs` is loa
         }
 ```
 
+- [ ] **Step 5b: Promote + update the `sample()` test helper**
+
+Move the existing `fn sample() -> Settings` OUT of `#[cfg(test)] mod tests` to module scope as `#[cfg(test)] pub fn sample() -> Settings`, and add the three new fields so it compiles and is reusable by other modules' tests:
+
+```rust
+/// Test-only seed `Settings`, reused across module test suites.
+#[cfg(test)]
+pub fn sample() -> Settings {
+    Settings {
+        entry_mode: EntryMode::RiskBased,
+        risk_pct: 1.0,
+        entry_pct: 10.0,
+        entry_fixed_usd: 50.0,
+        max_daily_risk_pct: Some(5.0),
+        leverage: LeverageMap { conservative: 2, moderate: 3, aggressive: 5 },
+        entry_fill_timeout_secs: 300,
+        trigger_expiry_secs: 14400,
+        pnl_push_secs: 900,
+        watchlist: Vec::new(),
+        auto_scalp_enabled: false,
+        max_open_positions: 5,
+    }
+}
+```
+
+Remove the old private `fn sample()` from `mod tests` (the `use super::*;` there picks up the promoted one). Add `use crate::config::LeverageMap;` / `EntryMode` imports at module scope if the promoted fn needs them (they are already imported at the top of the file).
+
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cargo test --lib settings::`
@@ -202,7 +230,7 @@ git commit -m "feat(settings): watchlist + auto_scalp_enabled + max_open_positio
 
     #[test]
     fn render_watch_shows_coins_and_switch() {
-        let mut s = Settings::from_config(&crate::config::Config::sample());
+        let mut s = crate::settings::sample();
         s.watchlist = vec!["BTC".into(), "ETH".into()];
         s.auto_scalp_enabled = true;
         let text = super::render_watch(&s);
@@ -349,7 +377,7 @@ pub struct ApiState {
 In the API test module (`~line 203`), extend the `ApiState { .. }` it builds with the three new fields:
 
 ```rust
-            settings_seed: crate::settings::Settings::from_config(&crate::config::Config::sample()),
+            settings_seed: crate::settings::sample(),
             telegram_bot_token: "test-token".to_string(),
             allowed_user_ids: vec![1],
 ```
@@ -364,12 +392,12 @@ In `src/main.rs`, the `api::ApiState { .. }` block (`~line 31`):
             db_path: config.journal_path.clone(),
             token: api_token,
             settings_seed: settings::Settings::from_config(&config),
-            telegram_bot_token: config.telegram_bot_token.clone(),
+            telegram_bot_token: config.telegram_token.clone(),
             allowed_user_ids: config.allowed_user_ids.clone(),
         };
 ```
 
-> Confirm the config field name for the bot token (search `telegram` in `src/config.rs`; it may be `telegram_bot_token` or `bot_token`). Use the actual name. `mod settings;` is already declared in `main.rs`.
+> The config field is `config.telegram_token` (confirmed, `src/config.rs:20`) — the ApiState field is named `telegram_bot_token` but is sourced from `config.telegram_token`. `mod settings;` is already declared in `main.rs`.
 
 - [ ] **Step 4: Verify build + existing API tests pass**
 

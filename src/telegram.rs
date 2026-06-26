@@ -311,6 +311,38 @@ pub fn render_settings(settings: &Settings) -> String {
     )
 }
 
+/// Returns a new list with `coin` (upper-cased) appended if absent.
+pub fn add_coin(list: &[String], coin: &str) -> Vec<String> {
+    let coin = coin.trim().to_uppercase();
+    let mut next = list.to_vec();
+    if !coin.is_empty() && !next.iter().any(|c| c.eq_ignore_ascii_case(&coin)) {
+        next.push(coin);
+    }
+    next
+}
+
+/// Returns a new list with `coin` removed (case-insensitive).
+pub fn remove_coin(list: &[String], coin: &str) -> Vec<String> {
+    let coin = coin.trim();
+    list.iter().filter(|c| !c.eq_ignore_ascii_case(coin)).cloned().collect()
+}
+
+/// Renders the watchlist + auto-scalp status for the `/watch` command.
+pub fn render_watch(settings: &Settings) -> String {
+    let coins = if settings.watchlist.is_empty() {
+        "(kosong)".to_string()
+    } else {
+        settings.watchlist.join(", ")
+    };
+    let status = if settings.auto_scalp_enabled { "ON 🟢" } else { "OFF 🔴" };
+    format!(
+        "👁️ Watchlist auto-scalp\n\nCoin: {coins}\nAuto-scalp: {status}\nMax posisi: {}\n\n\
+         /watch add <COIN>  ·  /watch remove <COIN>\n\
+         /set auto_scalp_enabled on|off  ·  /set max_open_positions <n>",
+        settings.max_open_positions
+    )
+}
+
 /// Returns a new `LeverageMap` with `profile`'s leverage stepped by `delta`,
 /// clamped to the inclusive range [1, 50]. Other profiles are unchanged.
 pub fn adjust_leverage(map: &LeverageMap, profile: RiskProfile, delta: i32) -> LeverageMap {
@@ -422,6 +454,15 @@ pub trait ProgressReporter: Send + Sync {
     async fn report(&self, event: ExecutionEvent);
 }
 
+/// A [`ProgressReporter`] that drops every event — used by the API auto-execute
+/// path, which reports via a Telegram notification instead of progress events.
+pub struct NoopReporter;
+
+#[async_trait::async_trait]
+impl ProgressReporter for NoopReporter {
+    async fn report(&self, _event: ExecutionEvent) {}
+}
+
 /// Formats an [`ExecutionEvent`] into the Indonesian message shown to the user.
 pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEvent) -> String {
     match event {
@@ -483,7 +524,7 @@ impl ProgressReporter for TelegramReporter {
 /// Places the reduce-only bracket: SL covering the full held size, and each TP
 /// scaled by `effective_size/planned_size` (for partial fills). Closing side is
 /// opposite `direction`. Shared by limit/market execution and the trigger monitor.
-pub async fn arm_bracket<E: Exchange>(
+pub async fn arm_bracket<E: Exchange + ?Sized>(
     exchange: &E,
     coin: &str,
     direction: Direction,
@@ -531,7 +572,7 @@ pub async fn arm_bracket<E: Exchange>(
 /// distinct from the timeout path which bails), or if partially filled the
 /// bracket is armed on the held size. A market execution never triggers this
 /// signal; the `cancel` parameter is still required by the function signature.
-pub async fn execute_plan<E: Exchange>(
+pub async fn execute_plan<E: Exchange + ?Sized>(
     exchange: &E,
     plan: &ExecutionPlan,
     use_limit: bool,
@@ -867,6 +908,46 @@ async fn on_message<E: Exchange + 'static>(
         bot.send_message(message.chat.id, render_settings(&settings))
             .reply_markup(settings_keyboard(settings.entry_mode, &settings.leverage))
             .await?;
+        return Ok(());
+    }
+
+    // /watch [add|remove <COIN>] — manage the auto-scalp watchlist.
+    if first_command_word(text) == "/watch" {
+        let mut parts = text.split_whitespace();
+        let _cmd = parts.next();
+        let action = parts.next().map(|a| a.to_lowercase());
+        let coin = parts.next();
+        match (action.as_deref(), coin) {
+            (Some("add"), Some(coin)) => {
+                let next = {
+                    let mut guard = context.settings.lock().unwrap();
+                    guard.watchlist = add_coin(&guard.watchlist, coin);
+                    guard.clone()
+                };
+                if let Err(error) = context.settings_store.persist(&next) {
+                    tracing::warn!(%error, "failed to persist watchlist add");
+                }
+                bot.send_message(message.chat.id, render_watch(&next)).await?;
+            }
+            (Some("remove"), Some(coin)) => {
+                let next = {
+                    let mut guard = context.settings.lock().unwrap();
+                    guard.watchlist = remove_coin(&guard.watchlist, coin);
+                    guard.clone()
+                };
+                if let Err(error) = context.settings_store.persist(&next) {
+                    tracing::warn!(%error, "failed to persist watchlist remove");
+                }
+                bot.send_message(message.chat.id, render_watch(&next)).await?;
+            }
+            (None, _) => {
+                let settings = context.settings.lock().unwrap().clone();
+                bot.send_message(message.chat.id, render_watch(&settings)).await?;
+            }
+            _ => {
+                bot.send_message(message.chat.id, "Pakai: /watch  ·  /watch add <COIN>  ·  /watch remove <COIN>").await?;
+            }
+        }
         return Ok(());
     }
 
@@ -1699,6 +1780,9 @@ mod tests {
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
             pnl_push_secs: 900,
+            watchlist: Vec::new(),
+            auto_scalp_enabled: false,
+            max_open_positions: 5,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1716,6 +1800,9 @@ mod tests {
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
             pnl_push_secs: 900,
+            watchlist: Vec::new(),
+            auto_scalp_enabled: false,
+            max_open_positions: 5,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }
@@ -2134,5 +2221,29 @@ mod tests {
         let eth = outcomes.iter().find(|o| o.coin == "ETH").unwrap();
         assert!(!btc.ok);
         assert!(eth.ok);
+    }
+
+    #[test]
+    fn add_coin_normalizes_and_dedupes() {
+        let list = vec!["BTC".to_string()];
+        assert_eq!(super::add_coin(&list, "eth"), vec!["BTC".to_string(), "ETH".to_string()]);
+        assert_eq!(super::add_coin(&list, "btc"), vec!["BTC".to_string()]); // dedupe, case-insensitive
+    }
+
+    #[test]
+    fn remove_coin_is_case_insensitive() {
+        let list = vec!["BTC".to_string(), "ETH".to_string()];
+        assert_eq!(super::remove_coin(&list, "btc"), vec!["ETH".to_string()]);
+        assert_eq!(super::remove_coin(&list, "sol"), list); // absent → unchanged
+    }
+
+    #[test]
+    fn render_watch_shows_coins_and_switch() {
+        let mut s = crate::settings::sample();
+        s.watchlist = vec!["BTC".into(), "ETH".into()];
+        s.auto_scalp_enabled = true;
+        let text = super::render_watch(&s);
+        assert!(text.contains("BTC") && text.contains("ETH"));
+        assert!(text.to_lowercase().contains("auto"));
     }
 }
