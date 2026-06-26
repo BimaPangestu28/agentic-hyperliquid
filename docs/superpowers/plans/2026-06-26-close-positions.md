@@ -232,6 +232,7 @@ git commit -m "feat(exchange): implement close_position + cancel_orders_for_coin
 
 **Files:**
 - Modify: `src/telegram.rs` — callback constants (`~line 20`), new structs/functions (near `render_account`, `~line 142`), tests block (`~line 1490+`).
+- Modify: `src/monitor.rs` — make `format_pnl` public for reuse (`~line 76`).
 
 **Interfaces:**
 - Consumes: `Exchange::close_position`, `Exchange::cancel_orders_for_coin` (Task 1); `OpenPosition` (fields `coin`, `direction`, `size`, `unrealized_pnl` — `src/hyperliquid/mod.rs:82`).
@@ -239,6 +240,7 @@ git commit -m "feat(exchange): implement close_position + cancel_orders_for_coin
   - `pub const CB_CLOSE_ALL: &str = "close_all";`
   - `pub const CB_CLOSE_ONE_PREFIX: &str = "close_one:";`
   - `struct CloseOutcome { coin: String, ok: bool, error: Option<String> }`
+  - reuses `crate::monitor::format_pnl(f64) -> String` (made `pub` in this task) for signed-USD formatting — DRY, no duplicate formatter.
   - `fn render_close_all_prompt(positions: &[OpenPosition]) -> String`
   - `fn render_close_one_prompt(position: &OpenPosition) -> String`
   - `fn render_close_result(outcomes: &[CloseOutcome]) -> String`
@@ -323,22 +325,30 @@ In the `#[cfg(test)] mod tests` block at the bottom of `src/telegram.rs` (after 
 Run: `cargo test --lib close_all_prompt close_one_prompt close_result execute_close`
 Expected: FAIL — unknown `render_close_all_prompt` / `CloseOutcome` / `execute_close`.
 
-- [ ] **Step 4: Implement the struct, render functions, keyboard, and helper**
+- [ ] **Step 4a: Make `monitor::format_pnl` public for reuse**
 
-Near the other render functions (after `render_account`, ~line 230). The `format_pnl` style (`+$12.30`) mirrors `monitor::format_pnl`; inline it here to avoid a cross-module dependency:
+In `src/monitor.rs` (line ~76), change the existing `fn format_pnl` to `pub fn format_pnl` so `telegram.rs` can reuse it (DRY — no duplicate signed-USD formatter):
 
 ```rust
+/// Formats a signed USD PnL as `+$12.30` / `-$8.10`.
+pub fn format_pnl(closed_pnl: f64) -> String {
+    let sign = if closed_pnl < 0.0 { "-" } else { "+" };
+    format!("{sign}${:.2}", closed_pnl.abs())
+}
+```
+
+- [ ] **Step 4b: Implement the struct, render functions, keyboard, and helper**
+
+Near the other render functions (after `render_account`, ~line 230). Reuse `crate::monitor::format_pnl` for all signed-USD formatting:
+
+```rust
+use crate::monitor::format_pnl;
+
 /// Outcome of attempting to close one position.
 pub struct CloseOutcome {
     pub coin: String,
     pub ok: bool,
     pub error: Option<String>,
-}
-
-/// Formats a signed USD value as `+$12.30` / `-$8.10`.
-fn fmt_signed_usd(value: f64) -> String {
-    let sign = if value < 0.0 { "-" } else { "+" };
-    format!("{sign}${:.2}", value.abs())
 }
 
 /// Confirmation prompt listing every open position and the combined uPnL.
@@ -352,10 +362,10 @@ pub fn render_close_all_prompt(positions: &[OpenPosition]) -> String {
             position.coin,
             position.direction,
             position.size,
-            fmt_signed_usd(position.unrealized_pnl),
+            format_pnl(position.unrealized_pnl),
         ));
     }
-    out.push_str(&format!("\nTotal uPnL: {}", fmt_signed_usd(total)));
+    out.push_str(&format!("\nTotal uPnL: {}", format_pnl(total)));
     out
 }
 
@@ -366,7 +376,7 @@ pub fn render_close_one_prompt(position: &OpenPosition) -> String {
         position.coin,
         position.direction,
         position.size,
-        fmt_signed_usd(position.unrealized_pnl),
+        format_pnl(position.unrealized_pnl),
     )
 }
 
