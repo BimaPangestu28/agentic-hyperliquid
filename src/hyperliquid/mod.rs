@@ -480,8 +480,8 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
-    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketOrderParams,
-    OpenOrdersResponse,
+    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketCloseParams,
+    MarketOrderParams, OpenOrdersResponse,
 };
 
 /// Returns the Hyperliquid `tpsl` tag for a trigger ENTRY order. Entries on a
@@ -943,12 +943,45 @@ impl Exchange for HyperliquidExchange {
             .count())
     }
 
-    async fn close_position(&self, _coin: &str, _size: f64) -> anyhow::Result<OrderResult> {
-        unimplemented!("close_position not yet implemented for real exchange")
+    /// Market-closes the full `size` for `coin` using the SDK's `market_close`,
+    /// which fetches the mid-price, applies 1% slippage, and auto-selects the
+    /// reduce-only side from the live position.
+    async fn close_position(&self, coin: &str, size: f64) -> anyhow::Result<OrderResult> {
+        let response = self
+            .exchange
+            .market_close(MarketCloseParams {
+                asset: coin,
+                sz: Some(size),
+                px: None,
+                slippage: Some(0.01),
+                cloid: None,
+                wallet: None,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("close_position failed: {e}"))?;
+        parse_order_response(response)
     }
 
-    async fn cancel_orders_for_coin(&self, _coin: &str) -> anyhow::Result<usize> {
-        unimplemented!("cancel_orders_for_coin not yet implemented for real exchange")
+    /// Cancels every resting order for `coin`. Queries the full open-order list
+    /// (as `open_order_count` does), filters by coin, and cancels each by oid.
+    /// A per-order cancel failure is logged and skipped so one bad order does
+    /// not abort the rest.
+    async fn cancel_orders_for_coin(&self, coin: &str) -> anyhow::Result<usize> {
+        let orders: Vec<OpenOrdersResponse> = self.info.open_orders(self.address).await?;
+        let mut cancelled = 0usize;
+        for order in orders.iter().filter(|order| order.coin.eq_ignore_ascii_case(coin)) {
+            match self
+                .exchange
+                .cancel(ClientCancelRequest { asset: coin.to_string(), oid: order.oid }, None)
+                .await
+            {
+                Ok(_) => cancelled += 1,
+                Err(error) => tracing::warn!(
+                    "cancel_orders_for_coin: oid {} for {coin} failed: {error}", order.oid
+                ),
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Returns USDC deposits/withdrawals from the non-funding ledger, oldest first.
