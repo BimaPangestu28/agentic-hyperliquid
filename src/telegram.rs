@@ -1198,6 +1198,47 @@ async fn on_callback<E: Exchange + 'static>(
         return Ok(());
     }
 
+    // Confirm: close ALL positions. Re-fetch for freshness (book may have moved).
+    if data == CB_CLOSE_ALL {
+        bot.answer_callback_query(&query.id).text("Menutup semua…").await?;
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.edit_message_text(message.chat.id, message.id, format!("Gagal ambil posisi: {error}")).await?;
+                return Ok(());
+            }
+        };
+        if positions.is_empty() {
+            bot.edit_message_text(message.chat.id, message.id, "Tidak ada posisi terbuka.").await?;
+            return Ok(());
+        }
+        let outcomes = execute_close(context.exchange.as_ref(), &positions).await;
+        bot.edit_message_text(message.chat.id, message.id, render_close_result(&outcomes)).await?;
+        return Ok(());
+    }
+
+    // Confirm: close a single named position.
+    if let Some(coin) = data.strip_prefix(CB_CLOSE_ONE_PREFIX) {
+        bot.answer_callback_query(&query.id).text(format!("Menutup {coin}…")).await?;
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.edit_message_text(message.chat.id, message.id, format!("Gagal ambil posisi: {error}")).await?;
+                return Ok(());
+            }
+        };
+        match positions.into_iter().find(|p| p.coin.eq_ignore_ascii_case(coin)) {
+            Some(position) => {
+                let outcomes = execute_close(context.exchange.as_ref(), &[position]).await;
+                bot.edit_message_text(message.chat.id, message.id, render_close_result(&outcomes)).await?;
+            }
+            None => {
+                bot.edit_message_text(message.chat.id, message.id, format!("Posisi {coin} sudah tidak ada.")).await?;
+            }
+        }
+        return Ok(());
+    }
+
     // Defense-in-depth: reject a trigger confirm even if a stale keyboard still
     // shows the button while the feature is disabled.
     if data == CB_TRIGGER && !context.config.trigger_entry_enabled {
