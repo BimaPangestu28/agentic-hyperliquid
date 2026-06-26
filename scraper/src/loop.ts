@@ -63,7 +63,7 @@ export async function runOnce(deps: RunDeps): Promise<void> {
     try {
       const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);
       const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshot);
-      const setup = extractSetup(responseHtml);
+      const setup = extractSetup(responseHtml, coin);
 
       if (!setup) {
         console.warn(`${coin}: no parseable setup — skip`);

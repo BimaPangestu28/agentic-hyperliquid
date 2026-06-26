@@ -19,7 +19,7 @@ function stub(handler: (url: string, body: string) => { status: number; json: un
   });
 }
 
-const cfg = (url: string) => ({ botApiUrl: url, botApiToken: "t", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "", pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004 });
+const cfg = (url: string) => ({ botApiUrl: url, botApiToken: "t", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "", userDataDir: "", headless: true, browserChannel: "chrome", pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004 });
 
 describe("BotApi", () => {
   it("getWatchlist parses the response", async () => {

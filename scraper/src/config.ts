@@ -1,6 +1,7 @@
 export interface Config {
   botApiUrl: string; botApiToken: string;
   hyperliquidUrl: string; neurobroUrl: string; storageStatePath: string;
+  userDataDir: string; headless: boolean; browserChannel: string;
   pollIntervalSecs: number; cooldownSecs: number; maxDeviation: number;
 }
 
@@ -17,6 +18,13 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     hyperliquidUrl: env.HYPERLIQUID_URL ?? "https://app.hyperliquid.xyz",
     neurobroUrl: env.NEUROBRO_URL ?? "https://app.neurobro.ai",
     storageStatePath: env.NEUROBRO_STORAGE_STATE ?? "./neurobro-session.json",
+    // Persistent Chrome profile dir: cf_clearance (Cloudflare) + Neurobro auth live
+    // here so the loop reuses what `npm run login` established, without re-challenging.
+    userDataDir: env.NEUROBRO_USER_DATA_DIR ?? "./neurobro-profile",
+    // Default headful: Cloudflare Turnstile flags headless. On a VPS run under xvfb.
+    headless: (env.HEADLESS ?? "false") === "true",
+    // Real installed Chrome beats Playwright's "Chrome for Testing" against anti-bot.
+    browserChannel: env.BROWSER_CHANNEL ?? "chrome",
     pollIntervalSecs: Number(env.POLL_INTERVAL_SECS ?? "60"),
     cooldownSecs: Number(env.COOLDOWN_SECS ?? "300"),
     maxDeviation: Number(env.MAX_DEVIATION ?? "0.004"),
