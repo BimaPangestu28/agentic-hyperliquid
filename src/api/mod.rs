@@ -54,6 +54,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/balance", get(balance))
         .route("/positions", get(positions))
+        .route("/watchlist", get(watchlist))
         .route("/trades", get(trades))
         .route("/flows", get(flows))
         .layer(middleware::from_fn_with_state(state.clone(), require_bearer))
@@ -70,6 +71,13 @@ use serde::{Deserialize, Serialize};
 struct BalanceResponse {
     equity_usd: f64,
     as_of_ms: i64,
+}
+
+#[derive(Serialize)]
+struct WatchlistResponse {
+    coins: Vec<String>,
+    auto_scalp_enabled: bool,
+    max_open_positions: u32,
 }
 
 async fn balance(State(state): State<ApiState>) -> Result<Json<BalanceResponse>, StatusCode> {
@@ -183,6 +191,18 @@ async fn flows(
         ledger_flows.retain(|flow| flow.time_ms >= since);
     }
     Ok(Json(ledger_flows))
+}
+
+async fn watchlist(State(state): State<ApiState>) -> Result<Json<WatchlistResponse>, StatusCode> {
+    let store = crate::settings::SettingsStore::open(&state.db_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let settings = store.load(state.settings_seed.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(WatchlistResponse {
+        coins: settings.watchlist,
+        auto_scalp_enabled: settings.auto_scalp_enabled,
+        max_open_positions: settings.max_open_positions,
+    }))
 }
 
 /// Returns the current time as milliseconds since the Unix epoch.
@@ -640,5 +660,21 @@ mod tests {
         let trades_array = json.as_array().unwrap();
         assert_eq!(trades_array.len(), 1);
         assert_eq!(trades_array[0]["coin"].as_str().unwrap(), "SOL");
+    }
+
+    #[tokio::test]
+    async fn watchlist_requires_auth_and_returns_settings() {
+        let app = router(state_with(1000.0));
+        // no bearer → 401
+        let res = app.clone().oneshot(
+            Request::builder().uri("/watchlist").body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // with bearer → 200 + JSON
+        let res = app.oneshot(
+            Request::builder().uri("/watchlist").header("authorization", "Bearer t")
+                .body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }
