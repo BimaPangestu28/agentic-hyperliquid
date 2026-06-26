@@ -305,9 +305,10 @@ async fn execute(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Notify via Telegram (best-effort: individual send failures are swallowed).
+    use teloxide::prelude::Requester;
     let bot = teloxide::Bot::new(&state.telegram_bot_token);
-    let notification = format!(
-        "Auto-buka {} {} {} @ {} SL {} TP {} conf {}/10",
+    let msg = format!(
+        "🤖 Auto-buka {} {} {} @ {} · SL {} · TP {} · conf {}/10\n{}",
         setup.coin,
         if matches!(setup.direction, crate::parser::Direction::Long) { "LONG" } else { "SHORT" },
         plan.size,
@@ -315,11 +316,11 @@ async fn execute(
         plan.stop_loss.price,
         req.take_profit,
         req.confidence,
+        req.thesis
     );
     for user_id in &state.allowed_user_ids {
-        use teloxide::prelude::Requester;
         let _ = bot
-            .send_message(teloxide::types::ChatId(*user_id), &notification)
+            .send_message(teloxide::types::ChatId(*user_id), &msg)
             .await;
     }
 
