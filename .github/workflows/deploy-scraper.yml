@@ -65,7 +65,7 @@ jobs:
           sshpass -e ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
             set -euo pipefail
             kubectl -n agentic-hyperliquid set image deploy/scraper scraper=ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:$GITHUB_SHA
-            kubectl -n agentic-hyperliquid rollout status deploy/scraper --timeout=420s
+            kubectl -n agentic-hyperliquid rollout status deploy/scraper --timeout=120s
           "
       # On rollout failure, surface WHY the pod never became ready (image pull,
       # CreateContainerConfigError, Pending/scheduling, CrashLoopBackOff). The output
