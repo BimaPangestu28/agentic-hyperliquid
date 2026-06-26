@@ -62,7 +62,6 @@ export async function runOnce(deps: RunDeps): Promise<void> {
   for (const coin of eligibleCoins) {
     try {
       const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);
-      const markPrice = await readMark(deps.hlPage);
       const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshot);
       const setup = extractSetup(responseHtml);
 
@@ -76,6 +75,10 @@ export async function runOnce(deps: RunDeps): Promise<void> {
         cooldown(deps, coin);
         continue;
       }
+      // Re-read the mark fresh: entry came from a chart snapshot up to ~2 min ago, so
+      // measure slippage against the live price right before executing.
+      await deps.hlPage.bringToFront();
+      const markPrice = await readMark(deps.hlPage);
       if (!passesSlippage(markPrice, setup.entry, deps.cfg.maxDeviation)) {
         console.log(`${coin}: slippage mark=${markPrice} entry=${setup.entry} — skip`);
         cooldown(deps, coin);
