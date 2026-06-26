@@ -4,3 +4,7 @@ target/
 docs/
 k8s/
 .github/
+node_modules/
+**/node_modules
+**/*.log
+**/neurobro-session.json
