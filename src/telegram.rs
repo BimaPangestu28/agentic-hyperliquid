@@ -357,6 +357,26 @@ fn entry_mode_from_callback(data: &str) -> Option<EntryMode> {
     }
 }
 
+/// Parses `lev:<profile>:<dir>` into `(RiskProfile, delta)`. `dir` is `inc`
+/// (+1), `dec` (-1), or `noop` (0, a tap on the value label).
+fn leverage_step_from_callback(data: &str) -> Option<(RiskProfile, i32)> {
+    let rest = data.strip_prefix(CB_LEV_PREFIX)?;
+    let (profile_str, dir) = rest.split_once(':')?;
+    let profile = match profile_str {
+        "conservative" => RiskProfile::Conservative,
+        "moderate" => RiskProfile::Moderate,
+        "aggressive" => RiskProfile::Aggressive,
+        _ => return None,
+    };
+    let delta = match dir {
+        "inc" => 1,
+        "dec" => -1,
+        "noop" => 0,
+        _ => return None,
+    };
+    Some((profile, delta))
+}
+
 /// Recomputes the plan for a different risk profile, reusing the cached equity
 /// and asset metadata captured when the card was first parsed.
 pub fn recompute_plan(
@@ -1154,6 +1174,28 @@ async fn on_callback<E: Exchange + 'static>(
         return Ok(());
     }
 
+    // Leverage stepper from the /settings keyboard.
+    if let Some((profile, delta)) = leverage_step_from_callback(&data) {
+        if delta == 0 {
+            // Tap on the value label — nothing to change.
+            bot.answer_callback_query(&query.id).await?;
+            return Ok(());
+        }
+        let next = {
+            let mut guard = context.settings.lock().unwrap();
+            guard.leverage = adjust_leverage(&guard.leverage, profile, delta);
+            guard.clone()
+        };
+        if let Err(error) = context.settings_store.persist(&next) {
+            tracing::warn!(%error, "failed to persist leverage change");
+        }
+        bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
+            .reply_markup(settings_keyboard(next.entry_mode, &next.leverage))
+            .await?;
+        bot.answer_callback_query(&query.id).await?;
+        return Ok(());
+    }
+
     // Profile switch: recompute and edit the message in place.
     if let Some(profile) = profile_from_callback(&data) {
         if let Some(mut trade) = context.store.get(key) {
@@ -1692,6 +1734,16 @@ mod tests {
     fn entry_mode_callback_parses() {
         assert_eq!(super::entry_mode_from_callback(super::CB_MODE_PERCENT), Some(EntryMode::PercentBalance));
         assert_eq!(super::entry_mode_from_callback("nope"), None);
+    }
+
+    #[test]
+    fn leverage_callback_parses_profile_and_delta() {
+        use crate::sizing::RiskProfile;
+        assert_eq!(super::leverage_step_from_callback("lev:moderate:inc"), Some((RiskProfile::Moderate, 1)));
+        assert_eq!(super::leverage_step_from_callback("lev:conservative:dec"), Some((RiskProfile::Conservative, -1)));
+        assert_eq!(super::leverage_step_from_callback("lev:aggressive:noop"), Some((RiskProfile::Aggressive, 0)));
+        assert_eq!(super::leverage_step_from_callback("lev:bogus:inc"), None);
+        assert_eq!(super::leverage_step_from_callback("entry_mode:risk"), None);
     }
 
     #[test]
