@@ -7,6 +7,13 @@ async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
   const dryRun = process.argv.includes("--dry-run");
   const browser = await chromium.launch({ headless: true });
+
+  // Graceful shutdown: k8s sends SIGTERM on pod stop. Close the browser cleanly
+  // so Chromium does not leave lock files or zombie processes behind.
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.on(sig, () => { browser.close().finally(() => process.exit(0)); });
+  }
+
   const context = await browser.newContext({ storageState: cfg.storageStatePath });
   const hlPage = await context.newPage();
   const nbPage = await context.newPage();

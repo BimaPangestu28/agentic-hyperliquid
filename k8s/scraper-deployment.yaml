@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scraper
+  namespace: agentic-hyperliquid
+  labels:
+    app: neurobro-scraper
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate     # singleton: one scraper at a time; avoids PVC RWO contention
+  selector:
+    matchLabels:
+      app: neurobro-scraper
+  template:
+    metadata:
+      labels:
+        app: neurobro-scraper
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull   # remove if the GHCR package is made public
+      containers:
+        - name: scraper
+          image: ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:latest   # CI re-pins to :sha
+          envFrom:
+            - secretRef:
+                name: agentic-hyperliquid-env   # same secret as the bot; provides BOT_API_TOKEN
+          env:
+            # BOT_API_URL: in-cluster address of the bot's HTTP API server.
+            # NOTE: the bot Deployment is outbound-only and has no Service manifest yet.
+            # Before deploying the scraper, create k8s/bot-service.yaml (ClusterIP, port 8080)
+            # and ensure the bot listens on that port. Replace this placeholder accordingly.
+            - name: BOT_API_URL
+              value: "http://bot:8080"
+            # Path to the Playwright session file on the shared PVC.
+            # Bootstrap once: npm run login → kubectl cp neurobro-session.json
+            #   <pod>:/data/neurobro-session.json -n agentic-hyperliquid
+            - name: NEUROBRO_STORAGE_STATE
+              value: /data/neurobro-session.json
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "512Mi"   # Chromium headless needs ~256-512 MB baseline
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: data   # same PVC as the bot (ReadWriteOnce — both pods must land on the same node)
