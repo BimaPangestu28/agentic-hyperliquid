@@ -1,6 +1,8 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
+use crate::config::LeverageMap;
 use crate::hyperliquid::{EntryOrder, Exchange, OpenPosition, TriggerOrder};
+use crate::monitor::format_pnl;
 use crate::parser::Direction;
 use crate::settings::{Settings, SettingsStore};
 use crate::sizing::{build_plan, EntryMode, ExecutionPlan, RiskProfile, SizingError, SizingInput};
@@ -8,7 +10,7 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /settings, /set <key> <value>";
+const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /closeall, /close <COIN>, /settings, /set <key> <value>\n\n/closeall — tutup semua posisi\n/close <COIN> — tutup satu posisi (contoh: /close BTC)";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -18,9 +20,12 @@ pub const CB_MARKET: &str = "confirm:market";
 pub const CB_TRIGGER: &str = "confirm:trigger";
 pub const CB_CANCEL: &str = "cancel";
 pub const CB_CANCEL_FILL_PREFIX: &str = "cancel_fill:";
+pub const CB_CLOSE_ALL: &str = "close_all";
+pub const CB_CLOSE_ONE_PREFIX: &str = "close_one:";
 pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
 pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
+pub const CB_LEV_PREFIX: &str = "lev:";
 
 /// True when a trigger entry would fire immediately because price is already past
 /// the trigger (long with trigger ≤ mark, or short with trigger ≥ mark) — i.e. it
@@ -194,6 +199,82 @@ pub fn render_account(
     out
 }
 
+/// Outcome of attempting to close one position.
+pub struct CloseOutcome {
+    pub coin: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Confirmation prompt listing every open position and the combined uPnL.
+pub fn render_close_all_prompt(positions: &[OpenPosition]) -> String {
+    let mut out = String::from("⚠️ Tutup SEMUA posisi?\n\n");
+    let mut total = 0.0;
+    for position in positions {
+        total += position.unrealized_pnl;
+        out.push_str(&format!(
+            "• {} {} {} — {}\n",
+            position.coin,
+            position.direction,
+            position.size,
+            format_pnl(position.unrealized_pnl),
+        ));
+    }
+    out.push_str(&format!("\nTotal uPnL: {}", format_pnl(total)));
+    out
+}
+
+/// Confirmation prompt for closing a single position.
+pub fn render_close_one_prompt(position: &OpenPosition) -> String {
+    format!(
+        "⚠️ Tutup posisi {} {} {} — uPnL {}?",
+        position.coin,
+        position.direction,
+        position.size,
+        format_pnl(position.unrealized_pnl),
+    )
+}
+
+/// Result summary after an `execute_close` run.
+pub fn render_close_result(outcomes: &[CloseOutcome]) -> String {
+    let mut lines = Vec::new();
+    for outcome in outcomes {
+        if outcome.ok {
+            lines.push(format!("✅ {} ditutup", outcome.coin));
+        } else {
+            let reason = outcome.error.as_deref().unwrap_or("error");
+            lines.push(format!("⚠️ {} gagal: {}", outcome.coin, reason));
+        }
+    }
+    lines.join("\n")
+}
+
+/// A `[✅ <label>] [❌ Batal]` confirmation keyboard. `close_data` is the
+/// callback fired by the confirm button (`CB_CLOSE_ALL` or `CB_CLOSE_ONE_PREFIX` + coin).
+pub fn close_confirm_keyboard(close_data: &str, button_label: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(button_label.to_string(), close_data.to_string()),
+        InlineKeyboardButton::callback("❌ Batal", CB_CANCEL),
+    ]])
+}
+
+/// Closes each target position best-effort: cancels its resting orders first
+/// (orphan SL/TP cleanup), then market-closes. One failure never aborts the rest.
+pub async fn execute_close<E: Exchange>(exchange: &E, targets: &[OpenPosition]) -> Vec<CloseOutcome> {
+    let mut outcomes = Vec::new();
+    for position in targets {
+        if let Err(error) = exchange.cancel_orders_for_coin(&position.coin).await {
+            tracing::warn!("execute_close: cancel orders for {} failed: {error}", position.coin);
+        }
+        let outcome = match exchange.close_position(&position.coin, position.size).await {
+            Ok(_) => CloseOutcome { coin: position.coin.clone(), ok: true, error: None },
+            Err(error) => CloseOutcome { coin: position.coin.clone(), ok: false, error: Some(error.to_string()) },
+        };
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
 /// Plain-text settings card (no MarkdownV2 — sent without parse_mode).
 pub fn render_settings(settings: &Settings) -> String {
     let cap = match settings.max_daily_risk_pct {
@@ -230,16 +311,41 @@ pub fn render_settings(settings: &Settings) -> String {
     )
 }
 
-/// Inline keyboard with the three entry-mode buttons, ✓ on the active one.
-pub fn settings_keyboard(active: EntryMode) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback(
-            label("Risk-based", active == EntryMode::RiskBased), CB_MODE_RISK),
-        InlineKeyboardButton::callback(
-            label("% Balance", active == EntryMode::PercentBalance), CB_MODE_PERCENT),
-        InlineKeyboardButton::callback(
-            label("Fixed USD", active == EntryMode::FixedUsd), CB_MODE_FIXED),
-    ]])
+/// Returns a new `LeverageMap` with `profile`'s leverage stepped by `delta`,
+/// clamped to the inclusive range [1, 50]. Other profiles are unchanged.
+pub fn adjust_leverage(map: &LeverageMap, profile: RiskProfile, delta: i32) -> LeverageMap {
+    let mut next = *map;
+    let current = match profile {
+        RiskProfile::Conservative => &mut next.conservative,
+        RiskProfile::Moderate => &mut next.moderate,
+        RiskProfile::Aggressive => &mut next.aggressive,
+    };
+    let stepped = (*current as i32 + delta).clamp(1, 50);
+    *current = stepped as u32;
+    next
+}
+
+/// Inline keyboard: entry-mode buttons (✓ on active) plus a −/+ stepper row
+/// per leverage profile showing the current value.
+pub fn settings_keyboard(active: EntryMode, leverage: &LeverageMap) -> InlineKeyboardMarkup {
+    let mode_row = vec![
+        InlineKeyboardButton::callback(label("Risk-based", active == EntryMode::RiskBased), CB_MODE_RISK),
+        InlineKeyboardButton::callback(label("% Balance", active == EntryMode::PercentBalance), CB_MODE_PERCENT),
+        InlineKeyboardButton::callback(label("Fixed USD", active == EntryMode::FixedUsd), CB_MODE_FIXED),
+    ];
+    let lev_row = |name: &str, value: u32| {
+        vec![
+            InlineKeyboardButton::callback("➖".to_string(), format!("{CB_LEV_PREFIX}{name}:dec")),
+            InlineKeyboardButton::callback(format!("{name} {value}x"), format!("{CB_LEV_PREFIX}{name}:noop")),
+            InlineKeyboardButton::callback("➕".to_string(), format!("{CB_LEV_PREFIX}{name}:inc")),
+        ]
+    };
+    InlineKeyboardMarkup::new(vec![
+        mode_row,
+        lev_row("conservative", leverage.conservative),
+        lev_row("moderate", leverage.moderate),
+        lev_row("aggressive", leverage.aggressive),
+    ])
 }
 
 fn entry_mode_from_callback(data: &str) -> Option<EntryMode> {
@@ -249,6 +355,26 @@ fn entry_mode_from_callback(data: &str) -> Option<EntryMode> {
         CB_MODE_FIXED => Some(EntryMode::FixedUsd),
         _ => None,
     }
+}
+
+/// Parses `lev:<profile>:<dir>` into `(RiskProfile, delta)`. `dir` is `inc`
+/// (+1), `dec` (-1), or `noop` (0, a tap on the value label).
+fn leverage_step_from_callback(data: &str) -> Option<(RiskProfile, i32)> {
+    let rest = data.strip_prefix(CB_LEV_PREFIX)?;
+    let (profile_str, dir) = rest.split_once(':')?;
+    let profile = match profile_str {
+        "conservative" => RiskProfile::Conservative,
+        "moderate" => RiskProfile::Moderate,
+        "aggressive" => RiskProfile::Aggressive,
+        _ => return None,
+    };
+    let delta = match dir {
+        "inc" => 1,
+        "dec" => -1,
+        "noop" => 0,
+        _ => return None,
+    };
+    Some((profile, delta))
 }
 
 /// Recomputes the plan for a different risk profile, reusing the cached equity
@@ -685,11 +811,61 @@ async fn on_message<E: Exchange + 'static>(
         return Ok(());
     }
 
+    // /closeall — confirm, then flatten every open position.
+    if first_command_word(text) == "/closeall" {
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch positions: {error}")).await?;
+                return Ok(());
+            }
+        };
+        if positions.is_empty() {
+            bot.send_message(message.chat.id, "Tidak ada posisi terbuka.").await?;
+            return Ok(());
+        }
+        bot.send_message(message.chat.id, render_close_all_prompt(&positions))
+            .reply_markup(close_confirm_keyboard(CB_CLOSE_ALL, "✅ Tutup semua"))
+            .await?;
+        return Ok(());
+    }
+
+    // /close <COIN> — confirm, then flatten a single position.
+    if first_command_word(text) == "/close" {
+        let coin_arg = text.split_whitespace().nth(1).map(|c| c.to_uppercase());
+        let coin = match coin_arg {
+            Some(coin) if !coin.is_empty() => coin,
+            _ => {
+                bot.send_message(message.chat.id, "Pakai: /close <COIN>  (contoh: /close BTC)").await?;
+                return Ok(());
+            }
+        };
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch positions: {error}")).await?;
+                return Ok(());
+            }
+        };
+        match positions.iter().find(|p| p.coin.eq_ignore_ascii_case(&coin)) {
+            Some(position) => {
+                let close_data = format!("{}{}", CB_CLOSE_ONE_PREFIX, position.coin);
+                bot.send_message(message.chat.id, render_close_one_prompt(position))
+                    .reply_markup(close_confirm_keyboard(&close_data, &format!("✅ Tutup {}", position.coin)))
+                    .await?;
+            }
+            None => {
+                bot.send_message(message.chat.id, format!("Tidak ada posisi {coin} terbuka.")).await?;
+            }
+        }
+        return Ok(());
+    }
+
     // /settings — show current values + entry-mode buttons.
     if first_command_word(text) == "/settings" {
         let settings = context.settings.lock().unwrap().clone();
         bot.send_message(message.chat.id, render_settings(&settings))
-            .reply_markup(settings_keyboard(settings.entry_mode))
+            .reply_markup(settings_keyboard(settings.entry_mode, &settings.leverage))
             .await?;
         return Ok(());
     }
@@ -966,6 +1142,22 @@ async fn download_photo_as_data_url(bot: &Bot, file_id: &str) -> anyhow::Result<
     ))
 }
 
+/// Runs `execute_close` on `targets`, renders the result, and edits `message_id` in place.
+///
+/// Shared by the `CB_CLOSE_ALL` and `CB_CLOSE_ONE_PREFIX` confirm handlers to avoid
+/// duplicating the execute → render → edit sequence.
+async fn run_close_and_render<E: Exchange>(
+    bot: &Bot,
+    exchange: &E,
+    chat_id: teloxide::types::ChatId,
+    message_id: teloxide::types::MessageId,
+    targets: &[OpenPosition],
+) -> anyhow::Result<()> {
+    let outcomes = execute_close(exchange, targets).await;
+    bot.edit_message_text(chat_id, message_id, render_close_result(&outcomes)).await?;
+    Ok(())
+}
+
 async fn on_callback<E: Exchange + 'static>(
     bot: Bot,
     query: CallbackQuery,
@@ -981,6 +1173,13 @@ async fn on_callback<E: Exchange + 'static>(
     let key = message.id.0 as i64;
     let data = query.data.clone().unwrap_or_default();
 
+    // Authorization guard: mirror on_message's allowlist check.
+    // CallbackQuery.from is User (non-Option) in teloxide-core 0.10.
+    let caller_id = query.from.id.0 as i64;
+    if !context.config.is_allowed(caller_id) {
+        return Ok(());
+    }
+
     // Entry-mode switch from the /settings keyboard.
     if let Some(mode) = entry_mode_from_callback(&data) {
         let next = {
@@ -992,7 +1191,29 @@ async fn on_callback<E: Exchange + 'static>(
             tracing::warn!(%error, "failed to persist entry_mode change");
         }
         bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
-            .reply_markup(settings_keyboard(mode))
+            .reply_markup(settings_keyboard(mode, &next.leverage))
+            .await?;
+        bot.answer_callback_query(&query.id).await?;
+        return Ok(());
+    }
+
+    // Leverage stepper from the /settings keyboard.
+    if let Some((profile, delta)) = leverage_step_from_callback(&data) {
+        if delta == 0 {
+            // Tap on the value label — nothing to change.
+            bot.answer_callback_query(&query.id).await?;
+            return Ok(());
+        }
+        let next = {
+            let mut guard = context.settings.lock().unwrap();
+            guard.leverage = adjust_leverage(&guard.leverage, profile, delta);
+            guard.clone()
+        };
+        if let Err(error) = context.settings_store.persist(&next) {
+            tracing::warn!(%error, "failed to persist leverage change");
+        }
+        bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
+            .reply_markup(settings_keyboard(next.entry_mode, &next.leverage))
             .await?;
         bot.answer_callback_query(&query.id).await?;
         return Ok(());
@@ -1064,6 +1285,45 @@ async fn on_callback<E: Exchange + 'static>(
                 let _ = bot
                     .edit_message_reply_markup(message.chat.id, message.id)
                     .await;
+            }
+        }
+        return Ok(());
+    }
+
+    // Confirm: close ALL positions. Re-fetch for freshness (book may have moved).
+    if data == CB_CLOSE_ALL {
+        bot.answer_callback_query(&query.id).text("Menutup semua…").await?;
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.edit_message_text(message.chat.id, message.id, format!("Gagal ambil posisi: {error}")).await?;
+                return Ok(());
+            }
+        };
+        if positions.is_empty() {
+            bot.edit_message_text(message.chat.id, message.id, "Tidak ada posisi terbuka.").await?;
+            return Ok(());
+        }
+        run_close_and_render(&bot, context.exchange.as_ref(), message.chat.id, message.id, &positions).await?;
+        return Ok(());
+    }
+
+    // Confirm: close a single named position.
+    if let Some(coin) = data.strip_prefix(CB_CLOSE_ONE_PREFIX) {
+        bot.answer_callback_query(&query.id).text(format!("Menutup {coin}…")).await?;
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.edit_message_text(message.chat.id, message.id, format!("Gagal ambil posisi: {error}")).await?;
+                return Ok(());
+            }
+        };
+        match positions.into_iter().find(|p| p.coin.eq_ignore_ascii_case(coin)) {
+            Some(position) => {
+                run_close_and_render(&bot, context.exchange.as_ref(), message.chat.id, message.id, &[position]).await?;
+            }
+            None => {
+                bot.edit_message_text(message.chat.id, message.id, format!("Posisi {coin} sudah tidak ada.")).await?;
             }
         }
         return Ok(());
@@ -1483,7 +1743,9 @@ mod tests {
 
     #[test]
     fn settings_keyboard_marks_active_mode() {
-        let markup = super::settings_keyboard(EntryMode::FixedUsd);
+        use crate::config::LeverageMap;
+        let leverage = LeverageMap { conservative: 5, moderate: 10, aggressive: 20 };
+        let markup = super::settings_keyboard(EntryMode::FixedUsd, &leverage);
         let row = &markup.inline_keyboard[0];
         assert!(row[2].text.contains('✓')); // Fixed USD marked
         assert!(!row[0].text.contains('✓'));
@@ -1493,6 +1755,50 @@ mod tests {
     fn entry_mode_callback_parses() {
         assert_eq!(super::entry_mode_from_callback(super::CB_MODE_PERCENT), Some(EntryMode::PercentBalance));
         assert_eq!(super::entry_mode_from_callback("nope"), None);
+    }
+
+    #[test]
+    fn leverage_callback_parses_profile_and_delta() {
+        use crate::sizing::RiskProfile;
+        assert_eq!(super::leverage_step_from_callback("lev:moderate:inc"), Some((RiskProfile::Moderate, 1)));
+        assert_eq!(super::leverage_step_from_callback("lev:conservative:dec"), Some((RiskProfile::Conservative, -1)));
+        assert_eq!(super::leverage_step_from_callback("lev:aggressive:noop"), Some((RiskProfile::Aggressive, 0)));
+        assert_eq!(super::leverage_step_from_callback("lev:bogus:inc"), None);
+        assert_eq!(super::leverage_step_from_callback("entry_mode:risk"), None);
+    }
+
+    #[test]
+    fn adjust_leverage_steps_and_clamps() {
+        use crate::config::LeverageMap;
+        use crate::sizing::RiskProfile;
+        let base = LeverageMap { conservative: 5, moderate: 10, aggressive: 20 };
+
+        let up = super::adjust_leverage(&base, RiskProfile::Moderate, 1);
+        assert_eq!(up.moderate, 11);
+        assert_eq!(up.conservative, 5); // others untouched
+
+        let down = super::adjust_leverage(&base, RiskProfile::Conservative, -1);
+        assert_eq!(down.conservative, 4);
+
+        // clamp floor at 1
+        let floor = LeverageMap { conservative: 1, moderate: 10, aggressive: 20 };
+        assert_eq!(super::adjust_leverage(&floor, RiskProfile::Conservative, -1).conservative, 1);
+
+        // clamp ceiling at 50
+        let ceil = LeverageMap { conservative: 5, moderate: 10, aggressive: 50 };
+        assert_eq!(super::adjust_leverage(&ceil, RiskProfile::Aggressive, 1).aggressive, 50);
+    }
+
+    #[test]
+    fn settings_keyboard_includes_leverage_callbacks() {
+        use crate::config::LeverageMap;
+        use teloxide::types::InlineKeyboardButtonKind;
+        let leverage = LeverageMap { conservative: 5, moderate: 10, aggressive: 20 };
+        let keyboard = super::settings_keyboard(EntryMode::RiskBased, &leverage);
+        let has_lev_button = keyboard.inline_keyboard.iter().flatten().any(|button| {
+            matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(data) if data.starts_with(super::CB_LEV_PREFIX))
+        });
+        assert!(has_lev_button, "settings keyboard must include leverage stepper buttons");
     }
 
     fn sample_positions() -> Vec<crate::hyperliquid::OpenPosition> {
@@ -1793,5 +2099,61 @@ mod tests {
         let events = reporter.events.lock().unwrap();
         assert!(!events.iter().any(|e| matches!(e, super::ExecutionEvent::EntryCancelled { .. })),
             "must not report a cancel when the order filled");
+    }
+
+    #[test]
+    fn close_all_prompt_lists_each_position_and_total() {
+        let text = super::render_close_all_prompt(&sample_positions());
+        // sample_positions has BTC and ETH (see account tests)
+        assert!(text.contains("BTC"));
+        assert!(text.contains("ETH"));
+        assert!(text.to_lowercase().contains("total"));
+    }
+
+    #[test]
+    fn close_one_prompt_names_the_coin() {
+        let position = sample_positions().into_iter().next().unwrap();
+        let text = super::render_close_one_prompt(&position);
+        assert!(text.contains(&position.coin));
+    }
+
+    #[test]
+    fn close_result_marks_success_and_failure() {
+        let outcomes = vec![
+            super::CloseOutcome { coin: "BTC".into(), ok: true, error: None },
+            super::CloseOutcome { coin: "SOL".into(), ok: false, error: Some("boom".into()) },
+        ];
+        let text = super::render_close_result(&outcomes);
+        assert!(text.contains("BTC"));
+        assert!(text.contains("SOL"));
+        assert!(text.contains("✅"));
+        assert!(text.contains("⚠️"));
+    }
+
+    #[tokio::test]
+    async fn execute_close_cancels_then_closes_each_target() {
+        use crate::hyperliquid::testing::MockExchange;
+        let exchange = MockExchange::default();
+        exchange.open_orders.lock().unwrap().push("BTC".to_string()); // an orphan SL/TP
+        let targets = sample_positions(); // BTC, ETH
+        let outcomes = super::execute_close(&exchange, &targets).await;
+        assert!(outcomes.iter().all(|o| o.ok));
+        // BTC's resting order was cancelled
+        assert_eq!(exchange.cancels.lock().unwrap().len(), 1);
+        // both positions were closed
+        assert_eq!(exchange.closes.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_close_is_best_effort_on_failure() {
+        use crate::hyperliquid::testing::MockExchange;
+        let exchange = MockExchange::default();
+        exchange.fail_close_coins.lock().unwrap().push("BTC".to_string());
+        let targets = sample_positions(); // BTC (fails), ETH (ok)
+        let outcomes = super::execute_close(&exchange, &targets).await;
+        let btc = outcomes.iter().find(|o| o.coin == "BTC").unwrap();
+        let eth = outcomes.iter().find(|o| o.coin == "ETH").unwrap();
+        assert!(!btc.ok);
+        assert!(eth.ok);
     }
 }

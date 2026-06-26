@@ -104,6 +104,13 @@ pub trait Exchange: Send + Sync {
     /// `trigger_price`). Not reduce-only. Returns the resting order's id in `order_id`.
     async fn place_trigger_entry(&self, coin: &str, is_buy: bool, size: f64, trigger_price: f64) -> anyhow::Result<OrderResult>;
     async fn position_size(&self, coin: &str) -> anyhow::Result<f64>;
+    /// Market-closes (flattens) the full open position `size` for `coin`.
+    /// The exchange auto-detects the closing side from the live position.
+    async fn close_position(&self, coin: &str, size: f64) -> anyhow::Result<OrderResult>;
+    /// Cancels ALL resting orders for `coin` (SL/TP triggers AND any pending entry on that coin).
+    /// Returns the number of orders cancelled. Best-effort: a per-order failure
+    /// is logged and skipped, not propagated.
+    async fn cancel_orders_for_coin(&self, coin: &str) -> anyhow::Result<usize>;
     /// Cancels a resting order by its exchange-assigned order id.
     async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()>;
     /// Returns all fills for the account from the exchange's fill history.
@@ -171,6 +178,10 @@ pub mod mock {
         pub flows: Mutex<Vec<super::LedgerFlow>>,
         /// Records every `place_trigger_entry` call as `(coin, is_buy, size, trigger_price)`.
         pub trigger_entries: Mutex<Vec<(String, bool, f64, f64)>>,
+        /// Records every `close_position` call as `(coin, size)`.
+        pub closes: Mutex<Vec<(String, f64)>>,
+        /// Coins for which `close_position` returns Err (best-effort test hook).
+        pub fail_close_coins: Mutex<Vec<String>>,
     }
 
     impl MockExchange {
@@ -257,6 +268,29 @@ pub mod mock {
                 .filter(|e| e.coin.eq_ignore_ascii_case(coin))
                 .map(|e| e.size)
                 .sum())
+        }
+
+        async fn close_position(&self, coin: &str, size: f64) -> anyhow::Result<OrderResult> {
+            if self.fail_close_coins.lock().unwrap().iter().any(|c| c.eq_ignore_ascii_case(coin)) {
+                return Err(anyhow::anyhow!("simulated close failure for {coin}"));
+            }
+            self.closes.lock().unwrap().push((coin.to_string(), size));
+            Ok(OrderResult { order_id: Some(99), filled: true, avg_price: Some(100.0) })
+        }
+
+        async fn cancel_orders_for_coin(&self, coin: &str) -> anyhow::Result<usize> {
+            let matching: Vec<String> = self
+                .open_orders
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.eq_ignore_ascii_case(coin))
+                .cloned()
+                .collect();
+            for _ in &matching {
+                self.cancels.lock().unwrap().push((coin.to_string(), 0));
+            }
+            Ok(matching.len())
         }
 
         async fn cancel_order(&self, coin: &str, order_id: u64) -> anyhow::Result<()> {
@@ -383,6 +417,35 @@ pub mod mock {
         assert_eq!(calls[0], ("SOL".to_string(), true, 0.5, 68.53));
     }
 
+    #[tokio::test]
+    async fn mock_records_close_position() {
+        let exchange = MockExchange::default();
+        let result = exchange.close_position("BTC", 0.5).await.unwrap();
+        assert!(result.filled);
+        let closes = exchange.closes.lock().unwrap();
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0], ("BTC".to_string(), 0.5));
+    }
+
+    #[tokio::test]
+    async fn mock_close_position_can_be_forced_to_fail() {
+        let exchange = MockExchange::default();
+        exchange.fail_close_coins.lock().unwrap().push("SOL".to_string());
+        assert!(exchange.close_position("SOL", 1.0).await.is_err());
+        assert!(exchange.close_position("BTC", 1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_cancel_orders_for_coin_counts_matching() {
+        let exchange = MockExchange::default();
+        exchange.open_orders.lock().unwrap().push("ETH".to_string());
+        exchange.open_orders.lock().unwrap().push("eth".to_string());
+        exchange.open_orders.lock().unwrap().push("BTC".to_string());
+        assert_eq!(exchange.cancel_orders_for_coin("ETH").await.unwrap(), 2);
+        // each cancelled order is also recorded in `cancels`
+        assert_eq!(exchange.cancels.lock().unwrap().len(), 2);
+    }
+
     /// Pins the signed-usdc convention: withdrawals carry a NEGATIVE usdc value.
     ///
     /// Hyperliquid returns `delta.usdc` as a negative number for withdrawals.
@@ -417,8 +480,8 @@ use ethers::signers::{LocalWallet, Signer};
 use ethers::types::H160;
 use hyperliquid_rust_sdk::{
     BaseUrl, ClientCancelRequest, ClientLimit, ClientOrder, ClientOrderRequest, ClientTrigger,
-    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketOrderParams,
-    OpenOrdersResponse,
+    ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus, InfoClient, MarketCloseParams,
+    MarketOrderParams, OpenOrdersResponse,
 };
 
 /// Returns the Hyperliquid `tpsl` tag for a trigger ENTRY order. Entries on a
@@ -878,6 +941,47 @@ impl Exchange for HyperliquidExchange {
             .iter()
             .filter(|order| order.coin.eq_ignore_ascii_case(coin))
             .count())
+    }
+
+    /// Market-closes the full `size` for `coin` using the SDK's `market_close`,
+    /// which fetches the mid-price, applies 1% slippage, and auto-selects the
+    /// reduce-only side from the live position.
+    async fn close_position(&self, coin: &str, size: f64) -> anyhow::Result<OrderResult> {
+        let response = self
+            .exchange
+            .market_close(MarketCloseParams {
+                asset: coin,
+                sz: Some(size),
+                px: None,
+                slippage: Some(0.01),
+                cloid: None,
+                wallet: None,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("close_position failed: {e}"))?;
+        parse_order_response(response)
+    }
+
+    /// Cancels every resting order for `coin`. Queries the full open-order list
+    /// (as `open_order_count` does), filters by coin, and cancels each by oid.
+    /// A per-order cancel failure is logged and skipped so one bad order does
+    /// not abort the rest.
+    async fn cancel_orders_for_coin(&self, coin: &str) -> anyhow::Result<usize> {
+        let orders: Vec<OpenOrdersResponse> = self.info.open_orders(self.address).await?;
+        let mut cancelled = 0usize;
+        for order in orders.iter().filter(|order| order.coin.eq_ignore_ascii_case(coin)) {
+            match self
+                .exchange
+                .cancel(ClientCancelRequest { asset: coin.to_string(), oid: order.oid }, None)
+                .await
+            {
+                Ok(_) => cancelled += 1,
+                Err(error) => tracing::warn!(
+                    "cancel_orders_for_coin: oid {} for {coin} failed: {error}", order.oid
+                ),
+            }
+        }
+        Ok(cancelled)
     }
 
     /// Returns USDC deposits/withdrawals from the non-funding ledger, oldest first.

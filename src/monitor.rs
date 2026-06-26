@@ -73,7 +73,7 @@ pub fn sum_entry_fill_size(fills: &[FillDetail], pending: &PendingTrigger) -> f6
 }
 
 /// Formats a signed USD PnL as `+$12.30` / `-$8.10`.
-fn format_pnl(closed_pnl: f64) -> String {
+pub fn format_pnl(closed_pnl: f64) -> String {
     let sign = if closed_pnl < 0.0 { "-" } else { "+" };
     format!("{sign}${:.2}", closed_pnl.abs())
 }
