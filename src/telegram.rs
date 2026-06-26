@@ -1,6 +1,7 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
 use crate::hyperliquid::{EntryOrder, Exchange, OpenPosition, TriggerOrder};
+use crate::monitor::format_pnl;
 use crate::parser::Direction;
 use crate::settings::{Settings, SettingsStore};
 use crate::sizing::{build_plan, EntryMode, ExecutionPlan, RiskProfile, SizingError, SizingInput};
@@ -8,7 +9,7 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /settings, /set <key> <value>";
+const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /closeall, /close <COIN>, /settings, /set <key> <value>";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -205,7 +206,6 @@ pub struct CloseOutcome {
 
 /// Confirmation prompt listing every open position and the combined uPnL.
 pub fn render_close_all_prompt(positions: &[OpenPosition]) -> String {
-    use crate::monitor::format_pnl;
     let mut out = String::from("⚠️ Tutup SEMUA posisi?\n\n");
     let mut total = 0.0;
     for position in positions {
@@ -224,7 +224,6 @@ pub fn render_close_all_prompt(positions: &[OpenPosition]) -> String {
 
 /// Confirmation prompt for closing a single position.
 pub fn render_close_one_prompt(position: &OpenPosition) -> String {
-    use crate::monitor::format_pnl;
     format!(
         "⚠️ Tutup posisi {} {} {} — uPnL {}?",
         position.coin,
@@ -762,6 +761,56 @@ async fn on_message<E: Exchange + 'static>(
             .unwrap_or(0.0);
         bot.send_message(message.chat.id, render_account(equity, &positions, used_today, cap_pct))
             .await?;
+        return Ok(());
+    }
+
+    // /closeall — confirm, then flatten every open position.
+    if first_command_word(text) == "/closeall" {
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch positions: {error}")).await?;
+                return Ok(());
+            }
+        };
+        if positions.is_empty() {
+            bot.send_message(message.chat.id, "Tidak ada posisi terbuka.").await?;
+            return Ok(());
+        }
+        bot.send_message(message.chat.id, render_close_all_prompt(&positions))
+            .reply_markup(close_confirm_keyboard(CB_CLOSE_ALL, "✅ Tutup semua"))
+            .await?;
+        return Ok(());
+    }
+
+    // /close <COIN> — confirm, then flatten a single position.
+    if first_command_word(text) == "/close" {
+        let coin_arg = text.split_whitespace().nth(1).map(|c| c.to_uppercase());
+        let coin = match coin_arg {
+            Some(coin) if !coin.is_empty() => coin,
+            _ => {
+                bot.send_message(message.chat.id, "Pakai: /close <COIN>  (contoh: /close BTC)").await?;
+                return Ok(());
+            }
+        };
+        let positions = match context.exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                bot.send_message(message.chat.id, format!("Could not fetch positions: {error}")).await?;
+                return Ok(());
+            }
+        };
+        match positions.iter().find(|p| p.coin.eq_ignore_ascii_case(&coin)) {
+            Some(position) => {
+                let close_data = format!("{}{}", CB_CLOSE_ONE_PREFIX, position.coin);
+                bot.send_message(message.chat.id, render_close_one_prompt(position))
+                    .reply_markup(close_confirm_keyboard(&close_data, &format!("✅ Tutup {}", position.coin)))
+                    .await?;
+            }
+            None => {
+                bot.send_message(message.chat.id, format!("Tidak ada posisi {coin} terbuka.")).await?;
+            }
+        }
         return Ok(());
     }
 
