@@ -17,6 +17,8 @@ COPY scraper/package.json scraper/package-lock.json* ./
 RUN npm install --omit=dev && npm install tsx typescript
 COPY scraper/ ./
 
-# HEADLESS=false (the app default) + Xvfb. xvfb-run gives Chrome a display :99.
+# HEADLESS=false (the app default) + Xvfb. entrypoint.sh starts Xvfb on :99, waits for
+# it to be ready, then execs node — deterministic, unlike xvfb-run's flaky USR1 wait.
 ENV HEADLESS=false
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1280x1024x24", "npx", "tsx", "src/index.ts"]
+RUN chmod +x entrypoint.sh
+CMD ["sh", "entrypoint.sh"]

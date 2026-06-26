@@ -5,6 +5,7 @@ import { runForever, runOnce } from "./loop.js";
 import { notifyTelegram } from "./notify.js";
 
 async function main(): Promise<void> {
+  console.log("scraper boot: config loaded, launching Chrome…");
   const cfg = loadConfig(process.env);
   const dryRun = process.argv.includes("--dry-run");
   // --once runs a single cycle then exits (real execute, unlike --dry-run). Useful for
@@ -30,6 +31,7 @@ async function main(): Promise<void> {
     process.on(sig, () => { context.close().finally(() => process.exit(0)); });
   }
 
+  console.log("Chrome launched — preparing pages");
   const hlPage = await context.newPage();
   const nbPage = context.pages()[0] ?? (await context.newPage());
 
