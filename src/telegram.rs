@@ -1699,6 +1699,9 @@ mod tests {
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
             pnl_push_secs: 900,
+            watchlist: Vec::new(),
+            auto_scalp_enabled: false,
+            max_open_positions: 5,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1716,6 +1719,9 @@ mod tests {
             entry_fill_timeout_secs: 300,
             trigger_expiry_secs: 14400,
             pnl_push_secs: 900,
+            watchlist: Vec::new(),
+            auto_scalp_enabled: false,
+            max_open_positions: 5,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }
