@@ -1,5 +1,11 @@
 import type { OpenPosition } from "./botApi.js";
 
+/**
+ * Coins eligible to scan this cycle: in the watchlist, with no open position,
+ * not in cooldown, capped so open.length + result.length <= maxOpen.
+ * Coins are compared upper-cased; `cooldownUntil` keys MUST be stored upper-cased
+ * by the caller (Task 6's cooldown() helper does this).
+ */
 export function freeCoins(
   watchlist: string[], open: OpenPosition[], cooldownUntil: Map<string, number>,
   now: number, maxOpen: number,

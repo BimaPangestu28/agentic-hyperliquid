@@ -19,4 +19,10 @@ describe("passesSlippage", () => {
     expect(passesSlippage(100.3, 100, 0.004)).toBe(true);   // 0.3%
     expect(passesSlippage(100.5, 100, 0.004)).toBe(false);  // 0.5%
   });
+  it("fails closed on non-finite inputs and zero entry", () => {
+    expect(passesSlippage(NaN, 100, 0.01)).toBe(false);
+    expect(passesSlippage(100, NaN, 0.01)).toBe(false);
+    expect(passesSlippage(Infinity, 100, 0.01)).toBe(false);
+    expect(passesSlippage(100, 0, 0.01)).toBe(false);
+  });
 });
