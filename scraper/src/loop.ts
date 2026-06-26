@@ -1,4 +1,9 @@
-import type { OpenPosition } from "./botApi.js";
+import type { OpenPosition, BotApi } from "./botApi.js";
+import type { Page } from "playwright";
+import type { Config } from "./config.js";
+import { extractSetup } from "./extract.js";
+import { screenshotChart, readMark } from "./hyperliquid.js";
+import { requestSetup as neurobroRequestSetup } from "./neurobro.js";
 
 /**
  * Coins eligible to scan this cycle: in the watchlist, with no open position,
@@ -22,4 +27,85 @@ export function freeCoins(
 export function passesSlippage(mark: number, entry: number, maxDeviation: number): boolean {
   if (!Number.isFinite(mark) || !Number.isFinite(entry) || entry === 0) return false;
   return Math.abs(mark - entry) / entry <= maxDeviation;
+}
+
+export interface RunDeps {
+  cfg: Config;
+  api: BotApi;
+  hlPage: Page;
+  nbPage: Page;
+  cooldownUntil: Map<string, number>;
+  now: () => number;
+  dryRun: boolean;
+}
+
+/**
+ * Sets a cooldown for the given coin, preventing it from being scanned
+ * again until `cfg.cooldownSecs` seconds have elapsed from now.
+ */
+function cooldown(deps: RunDeps, coin: string): void {
+  deps.cooldownUntil.set(coin.toUpperCase(), deps.now() + deps.cfg.cooldownSecs);
+}
+
+/**
+ * Runs a single scan cycle: fetches the watchlist and open positions,
+ * determines eligible coins, then for each coin: takes a chart screenshot,
+ * reads the mark price, requests a Neurobro setup, and — if all gates pass —
+ * executes the trade (or logs it in dry-run mode).
+ */
+export async function runOnce(deps: RunDeps): Promise<void> {
+  const watchlist = await deps.api.getWatchlist();
+  if (!watchlist.autoScalpEnabled) { console.log("auto_scalp disabled — idle"); return; }
+  const openPositions = await deps.api.getPositions();
+  const eligibleCoins = freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions);
+
+  for (const coin of eligibleCoins) {
+    try {
+      const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);
+      const markPrice = await readMark(deps.hlPage);
+      const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshot);
+      const setup = extractSetup(responseHtml);
+
+      if (!setup) {
+        console.warn(`${coin}: no parseable setup — skip`);
+        cooldown(deps, coin);
+        continue;
+      }
+      if (setup.confidence < 7) {
+        console.log(`${coin}: conf ${setup.confidence} < 7 — skip`);
+        cooldown(deps, coin);
+        continue;
+      }
+      if (!passesSlippage(markPrice, setup.entry, deps.cfg.maxDeviation)) {
+        console.log(`${coin}: slippage mark=${markPrice} entry=${setup.entry} — skip`);
+        cooldown(deps, coin);
+        continue;
+      }
+      if (deps.dryRun) {
+        console.log(`[dry-run] would execute`, setup);
+        continue;
+      }
+      const result = await deps.api.execute(setup);
+      console.log(`${coin}: execute → ${result.status} ok=${result.ok}`);
+      if (!result.ok) cooldown(deps, coin);
+    } catch (error) {
+      console.error(`${coin}: error`, error);
+      cooldown(deps, coin);
+    }
+  }
+}
+
+/**
+ * Runs the orchestration loop indefinitely, polling every `cfg.pollIntervalSecs`
+ * seconds. A failed `runOnce` cycle is logged but never kills the loop.
+ */
+export async function runForever(deps: RunDeps): Promise<void> {
+  for (;;) {
+    try {
+      await runOnce(deps);
+    } catch (error) {
+      console.error("runOnce failed", error);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, deps.cfg.pollIntervalSecs * 1000));
+  }
 }
