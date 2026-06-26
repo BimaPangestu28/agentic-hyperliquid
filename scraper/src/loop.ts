@@ -96,6 +96,13 @@ export async function runOnce(deps: RunDeps): Promise<void> {
   const openPositions = await deps.api.getPositions();
   const eligibleCoins = freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions);
 
+  // Visibility: tell the operator a scan is starting and which coins it will analyse.
+  // Skipped (silent) when nothing is eligible so quiet cycles don't spam Telegram.
+  if (eligibleCoins.length > 0) {
+    await notifyTelegram(deps.cfg, `🔄 Scan ${eligibleCoins.length} coin: ${eligibleCoins.join(", ")}`);
+  }
+
+  const cooldownMins = Math.round(deps.cfg.cooldownSecs / 60);
   let analysesThisCycle = 0;
   for (const coin of eligibleCoins) {
     // Optional per-cycle cap (0 = unlimited → scan all eligible coins this cycle, e.g. a
@@ -111,11 +118,13 @@ export async function runOnce(deps: RunDeps): Promise<void> {
 
       if (!setup) {
         console.warn(`${coin}: no parseable setup — skip`);
+        await notifyTelegram(deps.cfg, `🔎 ${coin}: Neurobro nggak kasih setup yang kebaca — skip (cooldown ${cooldownMins}m)`);
         cooldown(deps, coin);
         continue;
       }
       if (setup.confidence < 7) {
         console.log(`${coin}: conf ${setup.confidence} < 7 — skip`);
+        await notifyTelegram(deps.cfg, `🔎 ${coin}: confidence ${setup.confidence}/10 < 7 — skip (cooldown ${cooldownMins}m)`);
         cooldown(deps, coin);
         continue;
       }
@@ -125,6 +134,7 @@ export async function runOnce(deps: RunDeps): Promise<void> {
       const markPrice = await readMark(deps.hlPage);
       if (!passesSlippage(markPrice, setup.entry, deps.cfg.maxDeviation)) {
         console.log(`${coin}: slippage mark=${markPrice} entry=${setup.entry} — skip`);
+        await notifyTelegram(deps.cfg, `🔎 ${coin}: harga geser jauh dari entry (mark ${markPrice}, entry ${setup.entry}) — skip (cooldown ${cooldownMins}m)`);
         cooldown(deps, coin);
         continue;
       }
@@ -134,7 +144,13 @@ export async function runOnce(deps: RunDeps): Promise<void> {
       }
       const result = await deps.api.execute(setup);
       console.log(`${coin}: execute → ${result.status} ok=${result.ok}`);
-      if (!result.ok) cooldown(deps, coin);
+      const direction = setup.direction.toUpperCase();
+      if (result.ok) {
+        await notifyTelegram(deps.cfg, `✅ ${coin} ${direction} dieksekusi — entry ${setup.entry}, SL ${setup.stopLoss}, TP ${setup.takeProfit} (conf ${setup.confidence}/10)`);
+      } else {
+        await notifyTelegram(deps.cfg, `❌ ${coin} ${direction}: eksekusi gagal (${result.status}) — cooldown ${cooldownMins}m`);
+        cooldown(deps, coin);
+      }
     } catch (error) {
       console.error(`${coin}: error`, error);
       cooldown(deps, coin);

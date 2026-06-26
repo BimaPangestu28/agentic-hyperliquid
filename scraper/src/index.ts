@@ -2,6 +2,7 @@ import { chromium } from "playwright";
 import { loadConfig } from "./config.js";
 import { BotApi } from "./botApi.js";
 import { runForever, runOnce } from "./loop.js";
+import { notifyTelegram } from "./notify.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
@@ -49,6 +50,12 @@ async function main(): Promise<void> {
     await context.close();
     return;
   }
+
+  // Heartbeat so the operator knows the daemon actually started (and with which knobs).
+  await notifyTelegram(
+    cfg,
+    `🚀 Scraper online — poll tiap ${cfg.pollIntervalSecs}s, max ${cfg.maxAnalysesPerDay} analisa/hari. Nunggu watchlist + auto_scalp ON.`,
+  );
 
   await runForever(deps);
 }

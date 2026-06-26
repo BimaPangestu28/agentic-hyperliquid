@@ -13,6 +13,22 @@ function required(env: Record<string, string | undefined>, key: string): string 
   return v;
 }
 
+/**
+ * Resolves the Telegram chat to notify. Prefers an explicit TELEGRAM_CHAT_ID; if
+ * unset, falls back to the first id in TELEGRAM_ALLOWED_USER_IDS (the bot's
+ * comma-separated allow-list) so notifications work from the shared secret without
+ * extra config — in a private chat, chat id == user id.
+ */
+function resolveChatId(env: Record<string, string | undefined>): string {
+  const explicit = (env.TELEGRAM_CHAT_ID ?? "").trim();
+  if (explicit) return explicit;
+  const firstAllowed = (env.TELEGRAM_ALLOWED_USER_IDS ?? "")
+    .split(",")
+    .map((id) => id.trim())
+    .find((id) => id.length > 0);
+  return firstAllowed ?? "";
+}
+
 export function loadConfig(env: Record<string, string | undefined>): Config {
   return {
     botApiUrl: required(env, "BOT_API_URL"),
@@ -33,7 +49,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     // Optional: alert the operator when the Neurobro session dies (Cloudflare/login wall).
     // Reuse the bot's Telegram bot token + your user/chat id. Empty → alerts just logged.
     telegramBotToken: env.TELEGRAM_BOT_TOKEN ?? "",
-    telegramChatId: env.TELEGRAM_CHAT_ID ?? "",
+    telegramChatId: resolveChatId(env),
     // Neurobro quota guard. Each chart analysis = 1 "light" chat; the plan grants ~100
     // light/day. Hard daily cap (persisted, resets daily) so the loop never overspends;
     // per-cycle cap spreads usage instead of burning the budget in the first minutes.
