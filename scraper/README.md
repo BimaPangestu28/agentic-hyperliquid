@@ -30,6 +30,9 @@ Copy `.env.example` and fill it in before running locally.
 | `MAX_DEVIATION` | no | `0.004` | Max fractional mark-vs-entry deviation (slippage gate) |
 | `TELEGRAM_BOT_TOKEN` | no | — | Reuse the bot's token to send "session expired" alerts |
 | `TELEGRAM_CHAT_ID` | no | — | Your chat id; both Telegram vars must be set or alerts are only logged |
+| `MAX_ANALYSES_PER_DAY` | no | `100` | Hard daily cap on Neurobro analyses (1 "light" chat each). Set below your plan's light quota |
+| `MAX_ANALYSES_PER_CYCLE` | no | `1` | Max analyses per poll cycle (spreads usage instead of front-loading) |
+| `NEUROBRO_QUOTA_STATE` | no | `./neurobro-quota.json` | Persisted daily counter (resets daily; survives restarts) |
 | `NEUROBRO_STORAGE_STATE` | no | `./neurobro-session.json` | Legacy storageState snapshot (the profile dir is the source of truth) |
 
 Requires Node ≥ 20. First run: `npm install` then `npx playwright install chrome`.
@@ -99,6 +102,27 @@ trading.
    failure sets a per-coin cooldown.
 5. **Resilience** — one coin's error never aborts the cycle; one bad cycle never kills
    the loop; `SIGTERM`/`SIGINT` closes Chrome cleanly.
+
+---
+
+## Neurobro Quota (important)
+
+Each chart analysis spends **one "light" chat** (~100/day on the plan). The scraper
+enforces a **persisted daily cap** (`MAX_ANALYSES_PER_DAY`, resets daily, survives
+restarts) so it never overspends, and a **per-cycle cap** (`MAX_ANALYSES_PER_CYCLE`) plus
+the poll interval to spread usage across the day. Sizing:
+
+- `dry-run` and `once` **also consume real quota** — they count against the daily cap.
+- The counter only tracks the scraper. If you also use Neurobro by hand, set
+  `MAX_ANALYSES_PER_DAY` **below** your light quota to leave headroom (the k8s manifest
+  uses `90`).
+- Pace via `POLL_INTERVAL_SECS`: ~90/day ≈ one every ~16 min (`900`). A short interval
+  (e.g. 60s) burns the whole budget in the first hour, then idles.
+- With N watchlist coins sharing the budget, each coin gets ~`cap/N` checks/day — keep
+  the watchlist small for scalping to stay fresh.
+
+When the cap is hit, the loop pauses and sends one Telegram alert; it resumes after the
+daily reset.
 
 ---
 

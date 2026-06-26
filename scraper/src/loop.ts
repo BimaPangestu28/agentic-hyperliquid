@@ -5,6 +5,7 @@ import { extractSetup } from "./extract.js";
 import { screenshotChart, readMark } from "./hyperliquid.js";
 import { requestSetup as neurobroRequestSetup, isNeurobroReady } from "./neurobro.js";
 import { notifyTelegram } from "./notify.js";
+import { dayKey, readQuota, remaining, recordAnalysis } from "./quota.js";
 
 /**
  * Coins eligible to scan this cycle: in the watchlist, with no open position,
@@ -41,6 +42,9 @@ export interface RunDeps {
   // Mutable holder (persists across cycles) so the "session expired" alert fires once
   // per outage, not every poll.
   sessionAlertSent: { value: boolean };
+  // Day (YYYY-MM-DD) for which the "quota exhausted" alert was already sent, so it fires
+  // at most once per day.
+  quotaAlertedDay: { value: string };
 }
 
 /**
@@ -77,13 +81,31 @@ export async function runOnce(deps: RunDeps): Promise<void> {
     deps.sessionAlertSent.value = false;
   }
 
+  // Neurobro quota guard. Each analysis spends 1 "light" chat; the daily cap (persisted)
+  // hard-stops the loop before it overspends. Bail the whole cycle if nothing is left.
+  const today = dayKey(deps.now());
+  if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) {
+    if (deps.quotaAlertedDay.value !== today) {
+      await notifyTelegram(deps.cfg, `🪫 Neurobro daily quota (${deps.cfg.maxAnalysesPerDay}) reached — auto-scalp paused until reset.`);
+      deps.quotaAlertedDay.value = today;
+    }
+    console.warn("Neurobro daily quota exhausted — skipping cycle");
+    return;
+  }
+
   const openPositions = await deps.api.getPositions();
   const eligibleCoins = freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions);
 
+  let analysesThisCycle = 0;
   for (const coin of eligibleCoins) {
+    // Spread usage: cap analyses per cycle, and stop the moment the daily budget is gone.
+    if (analysesThisCycle >= deps.cfg.maxAnalysesPerCycle) break;
+    if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) break;
     try {
       const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);
       const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshot);
+      recordAnalysis(deps.cfg.quotaStatePath, today); // an analysis was spent the moment Neurobro responded
+      analysesThisCycle += 1;
       const setup = extractSetup(responseHtml, coin);
 
       if (!setup) {

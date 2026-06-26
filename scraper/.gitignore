@@ -2,3 +2,4 @@ node_modules/
 neurobro-session.json
 .env
 neurobro-profile/
+neurobro-quota.json

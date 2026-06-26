@@ -11,6 +11,7 @@ function baseCfg() {
     userDataDir: "", headless: true, browserChannel: "chrome",
     pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004,
     telegramBotToken: "", telegramChatId: "",
+    maxAnalysesPerDay: 100, maxAnalysesPerCycle: 1, quotaStatePath: "",
   };
 }
 

@@ -41,6 +41,7 @@ async function main(): Promise<void> {
     now: () => Date.now() / 1000,
     dryRun,
     sessionAlertSent: { value: false },
+    quotaAlertedDay: { value: "" },
   };
 
   if (once) {

@@ -4,6 +4,7 @@ export interface Config {
   userDataDir: string; headless: boolean; browserChannel: string;
   pollIntervalSecs: number; cooldownSecs: number; maxDeviation: number;
   telegramBotToken: string; telegramChatId: string;
+  maxAnalysesPerDay: number; maxAnalysesPerCycle: number; quotaStatePath: string;
 }
 
 function required(env: Record<string, string | undefined>, key: string): string {
@@ -33,5 +34,12 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     // Reuse the bot's Telegram bot token + your user/chat id. Empty → alerts just logged.
     telegramBotToken: env.TELEGRAM_BOT_TOKEN ?? "",
     telegramChatId: env.TELEGRAM_CHAT_ID ?? "",
+    // Neurobro quota guard. Each chart analysis = 1 "light" chat; the plan grants ~100
+    // light/day. Hard daily cap (persisted, resets daily) so the loop never overspends;
+    // per-cycle cap spreads usage instead of burning the budget in the first minutes.
+    // Lower maxPerDay if you also use Neurobro manually (dry-run/once count too).
+    maxAnalysesPerDay: Number(env.MAX_ANALYSES_PER_DAY ?? "100"),
+    maxAnalysesPerCycle: Number(env.MAX_ANALYSES_PER_CYCLE ?? "1"),
+    quotaStatePath: env.NEUROBRO_QUOTA_STATE ?? "./neurobro-quota.json",
   };
 }

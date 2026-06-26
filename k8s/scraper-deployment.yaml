@@ -42,6 +42,19 @@ spec:
             # Headful under Xvfb (set in the image) — headless is blocked by Cloudflare.
             - name: HEADLESS
               value: "false"
+            # Persisted Neurobro quota counter on the PVC (survives restarts, resets daily).
+            - name: NEUROBRO_QUOTA_STATE
+              value: /data/neurobro-quota.json
+            # Daily cap of analyses (1 "light" chat each; plan ≈100/day). Set BELOW 100 to
+            # leave room for any manual Neurobro use — the counter only tracks the scraper.
+            - name: MAX_ANALYSES_PER_DAY
+              value: "90"
+            - name: MAX_ANALYSES_PER_CYCLE
+              value: "1"
+            # Pace usage across the day: ~90/day ≈ one every ~16 min. 900s spreads evenly
+            # instead of burning the budget in the first hour.
+            - name: POLL_INTERVAL_SECS
+              value: "900"
             # Optional session-death alerts. TELEGRAM_BOT_TOKEN comes from the shared
             # secret (envFrom); set the recipient chat id here (or add it to the secret).
             - name: TELEGRAM_CHAT_ID
