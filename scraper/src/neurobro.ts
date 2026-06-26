@@ -16,6 +16,7 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
   await fileInput.setInputFiles({ name: `${coin}.png`, mimeType: "image/png", buffer: screenshot });
 
   // Type the prompt and submit.
+  // LIVE-RESOLVE: confirm the input is a textarea[name="input"] and not a rich-text div on the live Neurobro DOM.
   const input = page.locator('textarea[name="input"]');
   await input.fill(PROMPT(coin));
   await input.press("Enter");
