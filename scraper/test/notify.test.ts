@@ -7,7 +7,7 @@ afterEach(() => server?.close());
 
 function baseCfg() {
   return {
-    botApiUrl: "", botApiToken: "", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "",
+    botApiUrl: "", botApiToken: "", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "", hlTimeframe: "15m",
     userDataDir: "", headless: true, browserChannel: "chrome",
     pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004,
     telegramBotToken: "", telegramChatId: "",
