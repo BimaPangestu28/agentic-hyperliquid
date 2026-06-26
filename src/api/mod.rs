@@ -57,6 +57,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/watchlist", get(watchlist))
         .route("/trades", get(trades))
         .route("/flows", get(flows))
+        .route("/execute", axum::routing::post(execute))
         .layer(middleware::from_fn_with_state(state.clone(), require_bearer))
         .with_state(state)
 }
@@ -203,6 +204,126 @@ async fn watchlist(State(state): State<ApiState>) -> Result<Json<WatchlistRespon
         auto_scalp_enabled: settings.auto_scalp_enabled,
         max_open_positions: settings.max_open_positions,
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct ExecuteRequest {
+    coin: String,
+    direction: String, // "long" | "short"
+    entry: f64,
+    stop_loss: f64,
+    take_profit: f64,
+    confidence: u8,
+    #[serde(default)]
+    thesis: String,
+}
+
+async fn execute(
+    State(state): State<ApiState>,
+    Json(req): Json<ExecuteRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Load current settings from the DB.
+    let store = crate::settings::SettingsStore::open(&state.db_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let settings = store
+        .load(state.settings_seed.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Gate 1: master kill-switch.
+    if !settings.auto_scalp_enabled {
+        return Err(StatusCode::CONFLICT);
+    }
+    // Gate 2: confidence threshold.
+    if req.confidence < 7 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    // Gate 3: position cap.
+    let open_positions = state
+        .exchange
+        .positions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if open_positions.len() as u32 >= settings.max_open_positions {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    // Build the TradeSetup (single TP, 100% allocation).
+    let direction = match req.direction.to_lowercase().as_str() {
+        "long" => crate::parser::Direction::Long,
+        "short" => crate::parser::Direction::Short,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let setup = crate::parser::TradeSetup {
+        coin: req.coin.to_uppercase(),
+        direction,
+        timeframe: Some("scalp".to_string()),
+        risk_reward: None,
+        confidence: Some(req.confidence),
+        entry: req.entry,
+        stop_loss: req.stop_loss,
+        take_profits: vec![crate::parser::TakeProfit {
+            price: req.take_profit,
+            allocation_pct: 100.0,
+        }],
+    };
+
+    // Size with the Aggressive profile (max leverage), market entry.
+    let equity = state
+        .exchange
+        .equity()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let asset_meta = state
+        .exchange
+        .asset_meta(&setup.coin)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let plan = crate::sizing::build_plan(&crate::sizing::SizingInput {
+        setup: &setup,
+        equity,
+        risk_pct: settings.risk_pct,
+        entry_mode: settings.entry_mode,
+        entry_pct: settings.entry_pct,
+        entry_fixed_usd: settings.entry_fixed_usd,
+        profile: crate::sizing::RiskProfile::Aggressive,
+        leverage: &settings.leverage,
+        asset_meta: &asset_meta,
+    })
+    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+    // Execute: market entry + SL/TP bracket, no confirm.
+    crate::telegram::execute_plan(
+        state.exchange.as_ref(),
+        &plan,
+        false,
+        settings.entry_fill_timeout_secs,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        &crate::telegram::NoopReporter,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Notify via Telegram (best-effort: individual send failures are swallowed).
+    let bot = teloxide::Bot::new(&state.telegram_bot_token);
+    let notification = format!(
+        "Auto-buka {} {} {} @ {} SL {} TP {} conf {}/10",
+        setup.coin,
+        if matches!(setup.direction, crate::parser::Direction::Long) { "LONG" } else { "SHORT" },
+        plan.size,
+        plan.entry,
+        plan.stop_loss.price,
+        req.take_profit,
+        req.confidence,
+    );
+    for user_id in &state.allowed_user_ids {
+        use teloxide::prelude::Requester;
+        let _ = bot
+            .send_message(teloxide::types::ChatId(*user_id), &notification)
+            .await;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// Returns the current time as milliseconds since the Unix epoch.
@@ -676,5 +797,50 @@ mod tests {
                 .body(axum::body::Body::empty()).unwrap()
         ).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    fn execute_body(confidence: u8) -> String {
+        format!(
+            r#"{{"coin":"AVAX","direction":"long","entry":6.12,"stop_loss":5.99,"take_profit":6.32,"confidence":{confidence},"thesis":"t"}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_rejected_when_auto_scalp_disabled() {
+        // state_with leaves auto_scalp_enabled at the seed default (false).
+        let app = router(state_with(1000.0));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(execute_body(8)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT); // 409 kill-switch
+    }
+
+    #[tokio::test]
+    async fn execute_rejected_when_confidence_below_gate() {
+        let mut state = state_with(1000.0);
+        state.settings_seed.auto_scalp_enabled = true;
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(execute_body(6)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY); // 422 conf<7
     }
 }

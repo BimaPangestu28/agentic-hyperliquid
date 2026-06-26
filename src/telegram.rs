@@ -454,6 +454,15 @@ pub trait ProgressReporter: Send + Sync {
     async fn report(&self, event: ExecutionEvent);
 }
 
+/// A [`ProgressReporter`] that drops every event — used by the API auto-execute
+/// path, which reports via a Telegram notification instead of progress events.
+pub struct NoopReporter;
+
+#[async_trait::async_trait]
+impl ProgressReporter for NoopReporter {
+    async fn report(&self, _event: ExecutionEvent) {}
+}
+
 /// Formats an [`ExecutionEvent`] into the Indonesian message shown to the user.
 pub fn format_execution_event(coin: &str, timeout_secs: u64, event: &ExecutionEvent) -> String {
     match event {
@@ -515,7 +524,7 @@ impl ProgressReporter for TelegramReporter {
 /// Places the reduce-only bracket: SL covering the full held size, and each TP
 /// scaled by `effective_size/planned_size` (for partial fills). Closing side is
 /// opposite `direction`. Shared by limit/market execution and the trigger monitor.
-pub async fn arm_bracket<E: Exchange>(
+pub async fn arm_bracket<E: Exchange + ?Sized>(
     exchange: &E,
     coin: &str,
     direction: Direction,
@@ -563,7 +572,7 @@ pub async fn arm_bracket<E: Exchange>(
 /// distinct from the timeout path which bails), or if partially filled the
 /// bracket is armed on the held size. A market execution never triggers this
 /// signal; the `cancel` parameter is still required by the function signature.
-pub async fn execute_plan<E: Exchange>(
+pub async fn execute_plan<E: Exchange + ?Sized>(
     exchange: &E,
     plan: &ExecutionPlan,
     use_limit: bool,
