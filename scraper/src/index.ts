@@ -6,17 +6,31 @@ import { runForever, runOnce } from "./loop.js";
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
   const dryRun = process.argv.includes("--dry-run");
-  const browser = await chromium.launch({ headless: true });
+  // --once runs a single cycle then exits (real execute, unlike --dry-run). Useful for
+  // a first live test against the bot and for cron-style scheduling instead of a daemon.
+  const once = dryRun || process.argv.includes("--once");
 
-  // Graceful shutdown: k8s sends SIGTERM on pod stop. Close the browser cleanly
-  // so Chromium does not leave lock files or zombie processes behind.
+  // Reuse the persistent Chrome profile established by `npm run login` so the
+  // Cloudflare cf_clearance cookie + Neurobro auth carry over. Real Chrome channel
+  // (not Playwright's bundled Chromium) and default-headful both help pass Turnstile;
+  // set HEADLESS=true only behind a virtual display (xvfb) on a server.
+  const context = await chromium.launchPersistentContext(cfg.userDataDir, {
+    headless: cfg.headless,
+    channel: cfg.browserChannel,
+    viewport: null,
+    // Stop announcing automation (drops navigator.webdriver + the automation banner).
+    args: ["--disable-blink-features=AutomationControlled"],
+    ignoreDefaultArgs: ["--enable-automation"],
+  });
+
+  // Graceful shutdown: k8s sends SIGTERM on pod stop. Close the context cleanly so
+  // Chromium does not leave profile lock files or zombie processes behind.
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
-    process.on(sig, () => { browser.close().finally(() => process.exit(0)); });
+    process.on(sig, () => { context.close().finally(() => process.exit(0)); });
   }
 
-  const context = await browser.newContext({ storageState: cfg.storageStatePath });
   const hlPage = await context.newPage();
-  const nbPage = await context.newPage();
+  const nbPage = context.pages()[0] ?? (await context.newPage());
 
   const deps = {
     cfg,
@@ -26,11 +40,13 @@ async function main(): Promise<void> {
     cooldownUntil: new Map<string, number>(),
     now: () => Date.now() / 1000,
     dryRun,
+    sessionAlertSent: { value: false },
+    quotaAlertedDay: { value: "" },
   };
 
-  if (dryRun) {
+  if (once) {
     await runOnce(deps);
-    await browser.close();
+    await context.close();
     return;
   }
 

@@ -4,9 +4,10 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "login": "tsx src/login.ts",
-    "dry-run": "tsx src/index.ts --dry-run",
-    "start": "tsx src/index.ts"
+    "login": "node --env-file-if-exists=.env --import tsx src/login.ts",
+    "dry-run": "node --env-file-if-exists=.env --import tsx src/index.ts --dry-run",
+    "once": "node --env-file-if-exists=.env --import tsx src/index.ts --once",
+    "start": "node --env-file-if-exists=.env --import tsx src/index.ts"
   },
   "dependencies": {
     "playwright": "^1.48.0",

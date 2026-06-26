@@ -3,7 +3,9 @@ import type { Page } from "playwright";
 import type { Config } from "./config.js";
 import { extractSetup } from "./extract.js";
 import { screenshotChart, readMark } from "./hyperliquid.js";
-import { requestSetup as neurobroRequestSetup } from "./neurobro.js";
+import { requestSetup as neurobroRequestSetup, isNeurobroReady } from "./neurobro.js";
+import { notifyTelegram } from "./notify.js";
+import { dayKey, readQuota, remaining, recordAnalysis } from "./quota.js";
 
 /**
  * Coins eligible to scan this cycle: in the watchlist, with no open position,
@@ -37,6 +39,12 @@ export interface RunDeps {
   cooldownUntil: Map<string, number>;
   now: () => number;
   dryRun: boolean;
+  // Mutable holder (persists across cycles) so the "session expired" alert fires once
+  // per outage, not every poll.
+  sessionAlertSent: { value: boolean };
+  // Day (YYYY-MM-DD) for which the "quota exhausted" alert was already sent, so it fires
+  // at most once per day.
+  quotaAlertedDay: { value: string };
 }
 
 /**
@@ -56,14 +64,50 @@ function cooldown(deps: RunDeps, coin: string): void {
 export async function runOnce(deps: RunDeps): Promise<void> {
   const watchlist = await deps.api.getWatchlist();
   if (!watchlist.autoScalpEnabled) { console.log("auto_scalp disabled — idle"); return; }
+
+  // Verify the Neurobro session is alive before scanning. A Cloudflare/login wall makes
+  // every coin fail; detect it once, alert the operator, and pause this cycle instead of
+  // hammering the wall coin-by-coin.
+  if (!(await isNeurobroReady(deps.nbPage, deps.cfg))) {
+    if (!deps.sessionAlertSent.value) {
+      await notifyTelegram(deps.cfg, "⚠️ Neurobro session expired / Cloudflare wall — auto-scalp paused. Re-run `npm run login` to restore it.");
+      deps.sessionAlertSent.value = true;
+    }
+    console.warn("Neurobro not ready (Cloudflare/login wall) — skipping cycle");
+    return;
+  }
+  if (deps.sessionAlertSent.value) {
+    await notifyTelegram(deps.cfg, "✅ Neurobro session restored — auto-scalp resumed.");
+    deps.sessionAlertSent.value = false;
+  }
+
+  // Neurobro quota guard. Each analysis spends 1 "light" chat; the daily cap (persisted)
+  // hard-stops the loop before it overspends. Bail the whole cycle if nothing is left.
+  const today = dayKey(deps.now());
+  if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) {
+    if (deps.quotaAlertedDay.value !== today) {
+      await notifyTelegram(deps.cfg, `🪫 Neurobro daily quota (${deps.cfg.maxAnalysesPerDay}) reached — auto-scalp paused until reset.`);
+      deps.quotaAlertedDay.value = today;
+    }
+    console.warn("Neurobro daily quota exhausted — skipping cycle");
+    return;
+  }
+
   const openPositions = await deps.api.getPositions();
   const eligibleCoins = freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions);
 
+  let analysesThisCycle = 0;
   for (const coin of eligibleCoins) {
+    // Optional per-cycle cap (0 = unlimited → scan all eligible coins this cycle, e.g. a
+    // startup burst). The daily cap below is the hard budget protection regardless.
+    if (deps.cfg.maxAnalysesPerCycle > 0 && analysesThisCycle >= deps.cfg.maxAnalysesPerCycle) break;
+    if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) break;
     try {
       const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);
       const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshot);
-      const setup = extractSetup(responseHtml);
+      recordAnalysis(deps.cfg.quotaStatePath, today); // an analysis was spent the moment Neurobro responded
+      analysesThisCycle += 1;
+      const setup = extractSetup(responseHtml, coin);
 
       if (!setup) {
         console.warn(`${coin}: no parseable setup — skip`);

@@ -8,10 +8,10 @@ export async function screenshotChart(page: Page, cfg: Config, coin: string): Pr
 }
 
 export async function readMark(page: Page): Promise<number> {
-  // The trade page shows "Mark" with the price beneath it. Read the page text and
-  // parse the mark value. Validate this selector live; fall back to page title which
-  // contains the price (e.g. "app.hyperliquid.xyz / 6.2845 | AVAX").
+  // The HL trade page sets its document title to "<price> | <COIN> | Hyperliquid"
+  // (live-updating), which is the most stable mark-price source. Parse the leading
+  // number; returns NaN if absent so the slippage gate fails closed.
   const title = await page.title();
-  const m = title.match(/\/\s*([\d.]+)\s*\|/);
-  return m ? Number(m[1]) : NaN;
+  const m = title.match(/^\s*([\d,]+(?:\.\d+)?)\s*\|/);
+  return m ? Number(m[1].replace(/,/g, "")) : NaN;
 }
