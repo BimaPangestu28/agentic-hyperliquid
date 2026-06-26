@@ -98,8 +98,9 @@ export async function runOnce(deps: RunDeps): Promise<void> {
 
   let analysesThisCycle = 0;
   for (const coin of eligibleCoins) {
-    // Spread usage: cap analyses per cycle, and stop the moment the daily budget is gone.
-    if (analysesThisCycle >= deps.cfg.maxAnalysesPerCycle) break;
+    // Optional per-cycle cap (0 = unlimited → scan all eligible coins this cycle, e.g. a
+    // startup burst). The daily cap below is the hard budget protection regardless.
+    if (deps.cfg.maxAnalysesPerCycle > 0 && analysesThisCycle >= deps.cfg.maxAnalysesPerCycle) break;
     if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) break;
     try {
       const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);

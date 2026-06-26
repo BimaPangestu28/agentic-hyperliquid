@@ -39,7 +39,9 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     // per-cycle cap spreads usage instead of burning the budget in the first minutes.
     // Lower maxPerDay if you also use Neurobro manually (dry-run/once count too).
     maxAnalysesPerDay: Number(env.MAX_ANALYSES_PER_DAY ?? "100"),
-    maxAnalysesPerCycle: Number(env.MAX_ANALYSES_PER_CYCLE ?? "1"),
+    // 0 = unlimited per cycle (scan all eligible — burst at startup, recycle on close).
+    // The daily cap is the real budget guard; cooldown paces per-coin re-checks.
+    maxAnalysesPerCycle: Number(env.MAX_ANALYSES_PER_CYCLE ?? "0"),
     quotaStatePath: env.NEUROBRO_QUOTA_STATE ?? "./neurobro-quota.json",
   };
 }

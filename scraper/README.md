@@ -116,10 +116,15 @@ the poll interval to spread usage across the day. Sizing:
 - The counter only tracks the scraper. If you also use Neurobro by hand, set
   `MAX_ANALYSES_PER_DAY` **below** your light quota to leave headroom (the k8s manifest
   uses `90`).
-- Pace via `POLL_INTERVAL_SECS`: ~90/day ≈ one every ~16 min (`900`). A short interval
-  (e.g. 60s) burns the whole budget in the first hour, then idles.
-- With N watchlist coins sharing the budget, each coin gets ~`cap/N` checks/day — keep
-  the watchlist small for scalping to stay fresh.
+- **Burst-and-recycle** (`MAX_ANALYSES_PER_CYCLE=0`): each cycle scans every eligible
+  coin, so all watchlist coins are analysed at startup and a coin is re-scanned the
+  moment its TP/SL frees it. The daily cap is the budget ceiling; `COOLDOWN_SECS` paces
+  how often a *skipped* coin (e.g. conf<7) is retried.
+- With N coins sharing the budget, each coin gets ~`cap/N` checks/day. To keep the worst
+  case (all coins skipping) under budget, set `COOLDOWN_SECS ≥ 86400 × N ÷ cap`. Example:
+  10 coins, cap 90 → ≥ ~9600s; the manifest uses `10800` (3h) → ~80/day.
+- Held coins don't consume budget (not scanned until they close), so real usage is
+  usually well under the worst case.
 
 When the cap is hit, the loop pauses and sends one Telegram alert; it resumes after the
 daily reset.
