@@ -121,11 +121,6 @@ pub trait Exchange: Send + Sync {
     async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
     /// USDC deposits/withdrawals from the non-funding ledger, oldest first.
     async fn usdc_flows(&self) -> anyhow::Result<Vec<LedgerFlow>>;
-    /// Returns the number of resting/open orders for `coin` (case-insensitive).
-    ///
-    /// Used by `process_signal` to skip a new signal when a prior limit entry
-    /// for the same coin is still sitting unfilled in the order book.
-    async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize>;
 }
 
 // ── Test utilities ────────────────────────────────────────────────────────────
@@ -168,7 +163,7 @@ pub mod mock {
         /// Pre-loaded fills returned by `user_fills`.
         pub fills: Mutex<Vec<super::Fill>>,
         /// Coins that have resting/open orders; each entry is a coin name.
-        /// `open_order_count` counts entries matching the queried coin (case-insensitive).
+        /// `cancel_orders_for_coin` cancels entries matching the queried coin (case-insensitive).
         pub open_orders: Mutex<Vec<String>>,
         /// Pre-loaded open positions returned by `positions()`.
         pub positions: Mutex<Vec<super::OpenPosition>>,
@@ -316,16 +311,6 @@ pub mod mock {
         async fn usdc_flows(&self) -> anyhow::Result<Vec<super::LedgerFlow>> {
             Ok(self.flows.lock().unwrap().clone())
         }
-
-        async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
-            Ok(self
-                .open_orders
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|c| c.eq_ignore_ascii_case(coin))
-                .count())
-        }
     }
 
     #[test]
@@ -373,16 +358,6 @@ pub mod mock {
         assert!(result.filled);
         assert_eq!(exchange.entries.lock().unwrap().len(), 1);
         assert_eq!(exchange.position_size("PENDLE").await.unwrap(), 10.0);
-    }
-
-    #[tokio::test]
-    async fn mock_open_order_count_filters_by_coin() {
-        let exchange = MockExchange::default();
-        exchange.open_orders.lock().unwrap().push("BTC".to_string());
-        exchange.open_orders.lock().unwrap().push("btc".to_string());
-        exchange.open_orders.lock().unwrap().push("ETH".to_string());
-        assert_eq!(exchange.open_order_count("BTC").await.unwrap(), 2);
-        assert_eq!(exchange.open_order_count("SOL").await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -930,19 +905,6 @@ impl Exchange for HyperliquidExchange {
         Ok(open_positions)
     }
 
-    /// Returns the number of resting/open orders for `coin` (case-insensitive).
-    ///
-    /// Queries the account's full open-order list and filters by coin name so
-    /// `process_signal` can skip a new signal when an unfilled limit entry for
-    /// the same coin is already sitting in the book.
-    async fn open_order_count(&self, coin: &str) -> anyhow::Result<usize> {
-        let orders: Vec<OpenOrdersResponse> = self.info.open_orders(self.address).await?;
-        Ok(orders
-            .iter()
-            .filter(|order| order.coin.eq_ignore_ascii_case(coin))
-            .count())
-    }
-
     /// Market-closes the full `size` for `coin` using the SDK's `market_close`,
     /// which fetches the mid-price, applies 1% slippage, and auto-selects the
     /// reduce-only side from the live position.
@@ -962,10 +924,9 @@ impl Exchange for HyperliquidExchange {
         parse_order_response(response)
     }
 
-    /// Cancels every resting order for `coin`. Queries the full open-order list
-    /// (as `open_order_count` does), filters by coin, and cancels each by oid.
-    /// A per-order cancel failure is logged and skipped so one bad order does
-    /// not abort the rest.
+    /// Cancels every resting order for `coin`. Queries the full open-order list,
+    /// filters by coin, and cancels each by oid. A per-order cancel failure is
+    /// logged and skipped so one bad order does not abort the rest.
     async fn cancel_orders_for_coin(&self, coin: &str) -> anyhow::Result<usize> {
         let orders: Vec<OpenOrdersResponse> = self.info.open_orders(self.address).await?;
         let mut cancelled = 0usize;

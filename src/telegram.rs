@@ -1073,32 +1073,9 @@ pub async fn process_setups<E: Exchange + 'static>(
             }
         };
 
-        // Position stacking is allowed: a new signal on a coin you already hold
-        // opens an additional position instead of being skipped.
-
-        // Skip if there's already a resting/open order for this coin (e.g. an unfilled limit entry).
-        match context.exchange.open_order_count(&setup.coin).await {
-            Ok(count) if count > 0 => {
-                bot.send_message(
-                    chat_id,
-                    format!(
-                        "Already have {} open order(s) for {} — skipped. Cancel them first to re-enter.",
-                        count, setup.coin
-                    ),
-                )
-                .await?;
-                continue;
-            }
-            Ok(_) => {} // no resting orders — proceed
-            Err(error) => {
-                bot.send_message(
-                    chat_id,
-                    format!("Could not verify open orders for {} ({error}) — skipped.", setup.coin),
-                )
-                .await?;
-                continue;
-            }
-        }
+        // Position stacking is allowed: a new signal on a coin you already hold —
+        // or one that still has a resting/unfilled order — opens an additional
+        // position instead of being skipped.
 
         let profile = RiskProfile::Moderate;
         let settings = context.settings.lock().unwrap().clone();
