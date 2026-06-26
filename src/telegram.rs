@@ -992,29 +992,8 @@ pub async fn process_setups<E: Exchange + 'static>(
             }
         };
 
-        // Skip if we already hold a position in this coin (avoid averaging/stacking).
-        match context.exchange.position_size(&setup.coin).await {
-            Ok(size) if size > 0.0 => {
-                bot.send_message(
-                    chat_id,
-                    format!(
-                        "Already holding {} (size {}) — skipped to avoid stacking. Close it first to re-enter.",
-                        setup.coin, size
-                    ),
-                )
-                .await?;
-                continue;
-            }
-            Ok(_) => {} // flat — proceed
-            Err(error) => {
-                bot.send_message(
-                    chat_id,
-                    format!("Could not verify existing position for {} ({error}) — skipped.", setup.coin),
-                )
-                .await?;
-                continue;
-            }
-        }
+        // Position stacking is allowed: a new signal on a coin you already hold
+        // opens an additional position instead of being skipped.
 
         // Skip if there's already a resting/open order for this coin (e.g. an unfilled limit entry).
         match context.exchange.open_order_count(&setup.coin).await {
