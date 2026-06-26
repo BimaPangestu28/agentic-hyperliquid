@@ -311,6 +311,38 @@ pub fn render_settings(settings: &Settings) -> String {
     )
 }
 
+/// Returns a new list with `coin` (upper-cased) appended if absent.
+pub fn add_coin(list: &[String], coin: &str) -> Vec<String> {
+    let coin = coin.trim().to_uppercase();
+    let mut next = list.to_vec();
+    if !coin.is_empty() && !next.iter().any(|c| c.eq_ignore_ascii_case(&coin)) {
+        next.push(coin);
+    }
+    next
+}
+
+/// Returns a new list with `coin` removed (case-insensitive).
+pub fn remove_coin(list: &[String], coin: &str) -> Vec<String> {
+    let coin = coin.trim();
+    list.iter().filter(|c| !c.eq_ignore_ascii_case(coin)).cloned().collect()
+}
+
+/// Renders the watchlist + auto-scalp status for the `/watch` command.
+pub fn render_watch(settings: &Settings) -> String {
+    let coins = if settings.watchlist.is_empty() {
+        "(kosong)".to_string()
+    } else {
+        settings.watchlist.join(", ")
+    };
+    let status = if settings.auto_scalp_enabled { "ON 🟢" } else { "OFF 🔴" };
+    format!(
+        "👁️ Watchlist auto-scalp\n\nCoin: {coins}\nAuto-scalp: {status}\nMax posisi: {}\n\n\
+         /watch add <COIN>  ·  /watch remove <COIN>\n\
+         /set auto_scalp_enabled on|off  ·  /set max_open_positions <n>",
+        settings.max_open_positions
+    )
+}
+
 /// Returns a new `LeverageMap` with `profile`'s leverage stepped by `delta`,
 /// clamped to the inclusive range [1, 50]. Other profiles are unchanged.
 pub fn adjust_leverage(map: &LeverageMap, profile: RiskProfile, delta: i32) -> LeverageMap {
@@ -867,6 +899,46 @@ async fn on_message<E: Exchange + 'static>(
         bot.send_message(message.chat.id, render_settings(&settings))
             .reply_markup(settings_keyboard(settings.entry_mode, &settings.leverage))
             .await?;
+        return Ok(());
+    }
+
+    // /watch [add|remove <COIN>] — manage the auto-scalp watchlist.
+    if first_command_word(text) == "/watch" {
+        let mut parts = text.split_whitespace();
+        let _cmd = parts.next();
+        let action = parts.next().map(|a| a.to_lowercase());
+        let coin = parts.next();
+        match (action.as_deref(), coin) {
+            (Some("add"), Some(coin)) => {
+                let next = {
+                    let mut guard = context.settings.lock().unwrap();
+                    guard.watchlist = add_coin(&guard.watchlist, coin);
+                    guard.clone()
+                };
+                if let Err(error) = context.settings_store.persist(&next) {
+                    tracing::warn!(%error, "failed to persist watchlist add");
+                }
+                bot.send_message(message.chat.id, render_watch(&next)).await?;
+            }
+            (Some("remove"), Some(coin)) => {
+                let next = {
+                    let mut guard = context.settings.lock().unwrap();
+                    guard.watchlist = remove_coin(&guard.watchlist, coin);
+                    guard.clone()
+                };
+                if let Err(error) = context.settings_store.persist(&next) {
+                    tracing::warn!(%error, "failed to persist watchlist remove");
+                }
+                bot.send_message(message.chat.id, render_watch(&next)).await?;
+            }
+            (None, _) => {
+                let settings = context.settings.lock().unwrap().clone();
+                bot.send_message(message.chat.id, render_watch(&settings)).await?;
+            }
+            _ => {
+                bot.send_message(message.chat.id, "Pakai: /watch  ·  /watch add <COIN>  ·  /watch remove <COIN>").await?;
+            }
+        }
         return Ok(());
     }
 
@@ -2140,5 +2212,29 @@ mod tests {
         let eth = outcomes.iter().find(|o| o.coin == "ETH").unwrap();
         assert!(!btc.ok);
         assert!(eth.ok);
+    }
+
+    #[test]
+    fn add_coin_normalizes_and_dedupes() {
+        let list = vec!["BTC".to_string()];
+        assert_eq!(super::add_coin(&list, "eth"), vec!["BTC".to_string(), "ETH".to_string()]);
+        assert_eq!(super::add_coin(&list, "btc"), vec!["BTC".to_string()]); // dedupe, case-insensitive
+    }
+
+    #[test]
+    fn remove_coin_is_case_insensitive() {
+        let list = vec!["BTC".to_string(), "ETH".to_string()];
+        assert_eq!(super::remove_coin(&list, "btc"), vec!["ETH".to_string()]);
+        assert_eq!(super::remove_coin(&list, "sol"), list); // absent → unchanged
+    }
+
+    #[test]
+    fn render_watch_shows_coins_and_switch() {
+        let mut s = crate::settings::sample();
+        s.watchlist = vec!["BTC".into(), "ETH".into()];
+        s.auto_scalp_enabled = true;
+        let text = super::render_watch(&s);
+        assert!(text.contains("BTC") && text.contains("ETH"));
+        assert!(text.to_lowercase().contains("auto"));
     }
 }
