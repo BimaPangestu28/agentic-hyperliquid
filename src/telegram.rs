@@ -1,5 +1,6 @@
 //! Telegram rendering helpers and (Task 8) handlers.
 
+use crate::config::LeverageMap;
 use crate::hyperliquid::{EntryOrder, Exchange, OpenPosition, TriggerOrder};
 use crate::monitor::format_pnl;
 use crate::parser::Direction;
@@ -24,6 +25,7 @@ pub const CB_CLOSE_ONE_PREFIX: &str = "close_one:";
 pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
 pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
+pub const CB_LEV_PREFIX: &str = "lev:";
 
 /// True when a trigger entry would fire immediately because price is already past
 /// the trigger (long with trigger ≤ mark, or short with trigger ≥ mark) — i.e. it
@@ -309,16 +311,41 @@ pub fn render_settings(settings: &Settings) -> String {
     )
 }
 
-/// Inline keyboard with the three entry-mode buttons, ✓ on the active one.
-pub fn settings_keyboard(active: EntryMode) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback(
-            label("Risk-based", active == EntryMode::RiskBased), CB_MODE_RISK),
-        InlineKeyboardButton::callback(
-            label("% Balance", active == EntryMode::PercentBalance), CB_MODE_PERCENT),
-        InlineKeyboardButton::callback(
-            label("Fixed USD", active == EntryMode::FixedUsd), CB_MODE_FIXED),
-    ]])
+/// Returns a new `LeverageMap` with `profile`'s leverage stepped by `delta`,
+/// clamped to the inclusive range [1, 50]. Other profiles are unchanged.
+pub fn adjust_leverage(map: &LeverageMap, profile: RiskProfile, delta: i32) -> LeverageMap {
+    let mut next = *map;
+    let current = match profile {
+        RiskProfile::Conservative => &mut next.conservative,
+        RiskProfile::Moderate => &mut next.moderate,
+        RiskProfile::Aggressive => &mut next.aggressive,
+    };
+    let stepped = (*current as i32 + delta).clamp(1, 50);
+    *current = stepped as u32;
+    next
+}
+
+/// Inline keyboard: entry-mode buttons (✓ on active) plus a −/+ stepper row
+/// per leverage profile showing the current value.
+pub fn settings_keyboard(active: EntryMode, leverage: &LeverageMap) -> InlineKeyboardMarkup {
+    let mode_row = vec![
+        InlineKeyboardButton::callback(label("Risk-based", active == EntryMode::RiskBased), CB_MODE_RISK),
+        InlineKeyboardButton::callback(label("% Balance", active == EntryMode::PercentBalance), CB_MODE_PERCENT),
+        InlineKeyboardButton::callback(label("Fixed USD", active == EntryMode::FixedUsd), CB_MODE_FIXED),
+    ];
+    let lev_row = |name: &str, value: u32| {
+        vec![
+            InlineKeyboardButton::callback("➖".to_string(), format!("{CB_LEV_PREFIX}{name}:dec")),
+            InlineKeyboardButton::callback(format!("{name} {value}x"), format!("{CB_LEV_PREFIX}{name}:noop")),
+            InlineKeyboardButton::callback("➕".to_string(), format!("{CB_LEV_PREFIX}{name}:inc")),
+        ]
+    };
+    InlineKeyboardMarkup::new(vec![
+        mode_row,
+        lev_row("conservative", leverage.conservative),
+        lev_row("moderate", leverage.moderate),
+        lev_row("aggressive", leverage.aggressive),
+    ])
 }
 
 fn entry_mode_from_callback(data: &str) -> Option<EntryMode> {
@@ -818,7 +845,7 @@ async fn on_message<E: Exchange + 'static>(
     if first_command_word(text) == "/settings" {
         let settings = context.settings.lock().unwrap().clone();
         bot.send_message(message.chat.id, render_settings(&settings))
-            .reply_markup(settings_keyboard(settings.entry_mode))
+            .reply_markup(settings_keyboard(settings.entry_mode, &settings.leverage))
             .await?;
         return Ok(());
     }
@@ -1121,7 +1148,7 @@ async fn on_callback<E: Exchange + 'static>(
             tracing::warn!(%error, "failed to persist entry_mode change");
         }
         bot.edit_message_text(message.chat.id, message.id, render_settings(&next))
-            .reply_markup(settings_keyboard(mode))
+            .reply_markup(settings_keyboard(mode, &next.leverage))
             .await?;
         bot.answer_callback_query(&query.id).await?;
         return Ok(());
@@ -1653,7 +1680,9 @@ mod tests {
 
     #[test]
     fn settings_keyboard_marks_active_mode() {
-        let markup = super::settings_keyboard(EntryMode::FixedUsd);
+        use crate::config::LeverageMap;
+        let leverage = LeverageMap { conservative: 5, moderate: 10, aggressive: 20 };
+        let markup = super::settings_keyboard(EntryMode::FixedUsd, &leverage);
         let row = &markup.inline_keyboard[0];
         assert!(row[2].text.contains('✓')); // Fixed USD marked
         assert!(!row[0].text.contains('✓'));
@@ -1663,6 +1692,40 @@ mod tests {
     fn entry_mode_callback_parses() {
         assert_eq!(super::entry_mode_from_callback(super::CB_MODE_PERCENT), Some(EntryMode::PercentBalance));
         assert_eq!(super::entry_mode_from_callback("nope"), None);
+    }
+
+    #[test]
+    fn adjust_leverage_steps_and_clamps() {
+        use crate::config::LeverageMap;
+        use crate::sizing::RiskProfile;
+        let base = LeverageMap { conservative: 5, moderate: 10, aggressive: 20 };
+
+        let up = super::adjust_leverage(&base, RiskProfile::Moderate, 1);
+        assert_eq!(up.moderate, 11);
+        assert_eq!(up.conservative, 5); // others untouched
+
+        let down = super::adjust_leverage(&base, RiskProfile::Conservative, -1);
+        assert_eq!(down.conservative, 4);
+
+        // clamp floor at 1
+        let floor = LeverageMap { conservative: 1, moderate: 10, aggressive: 20 };
+        assert_eq!(super::adjust_leverage(&floor, RiskProfile::Conservative, -1).conservative, 1);
+
+        // clamp ceiling at 50
+        let ceil = LeverageMap { conservative: 5, moderate: 10, aggressive: 50 };
+        assert_eq!(super::adjust_leverage(&ceil, RiskProfile::Aggressive, 1).aggressive, 50);
+    }
+
+    #[test]
+    fn settings_keyboard_includes_leverage_callbacks() {
+        use crate::config::LeverageMap;
+        use teloxide::types::InlineKeyboardButtonKind;
+        let leverage = LeverageMap { conservative: 5, moderate: 10, aggressive: 20 };
+        let keyboard = super::settings_keyboard(EntryMode::RiskBased, &leverage);
+        let has_lev_button = keyboard.inline_keyboard.iter().flatten().any(|button| {
+            matches!(&button.kind, InlineKeyboardButtonKind::CallbackData(data) if data.starts_with(super::CB_LEV_PREFIX))
+        });
+        assert!(has_lev_button, "settings keyboard must include leverage stepper buttons");
     }
 
     fn sample_positions() -> Vec<crate::hyperliquid::OpenPosition> {
