@@ -1,0 +1,69 @@
+name: Build and deploy scraper
+
+# Build the Neurobro scraper image (real Chrome + Xvfb), push to GHCR, then SSH to the
+# VPS to apply the manifests and pin the deployment to the new :sha.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scraper/**"
+      - "k8s/scraper-deployment.yaml"
+      - "k8s/bot-service.yaml"
+      - ".github/workflows/deploy-scraper.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: scraper/Dockerfile
+          platforms: linux/amd64
+          push: true
+          # GHCR paths must be lowercase.
+          tags: |
+            ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:latest
+            ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy scraper to k3s
+    runs-on: ubuntu-latest
+    needs: build
+    # Serialize with the bot deploy so two rollouts can't interleave on the shared node.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply manifests and pin the new image
+        env:
+          SSHPASS: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+          SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+          # Apply the bot Service + scraper Deployment (idempotent; creates them on first
+          # run, updates them after). Piped over stdin so no repo checkout is needed on
+          # the VPS.
+          { cat k8s/bot-service.yaml; echo; echo '---'; cat k8s/scraper-deployment.yaml; } \
+            | sshpass -e ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "kubectl apply -f -"
+          # Pin the immutable :sha (not :latest) so what runs is exactly what was built.
+          sshpass -e ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" "
+            set -euo pipefail
+            kubectl -n agentic-hyperliquid set image deploy/scraper scraper=ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:$GITHUB_SHA
+            kubectl -n agentic-hyperliquid rollout status deploy/scraper --timeout=420s
+          "

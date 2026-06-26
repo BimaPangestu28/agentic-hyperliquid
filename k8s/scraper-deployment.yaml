@@ -24,8 +24,16 @@ spec:
           image: ghcr.io/bimapangestu28/agentic-hyperliquid-scraper:latest   # CI re-pins to :sha
           envFrom:
             - secretRef:
-                name: agentic-hyperliquid-env   # same secret as the bot; provides BOT_API_TOKEN
+                name: agentic-hyperliquid-env   # shared secret (TELEGRAM_BOT_TOKEN, etc.)
           env:
+            # The scraper expects BOT_API_TOKEN; the shared secret stores the same value
+            # under the bot's name PORTFOLIO_API_TOKEN. Map it. (The secret MUST contain
+            # PORTFOLIO_API_TOKEN — that key also enables the bot's HTTP API.)
+            - name: BOT_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agentic-hyperliquid-env
+                  key: PORTFOLIO_API_TOKEN
             # BOT_API_URL: in-cluster address of the bot's HTTP API (axum) server.
             # NOTE: the bot has no Service manifest yet and binds 127.0.0.1:8088 by
             # default. Before deploying the scraper: (1) set the bot's HTTP_BIND_ADDR to
