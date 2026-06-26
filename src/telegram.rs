@@ -281,6 +281,7 @@ pub fn render_settings(settings: &Settings) -> String {
         Some(value) => format!("{value}%"),
         None => "disabled".to_string(),
     };
+    let auto_scalp = if settings.auto_scalp_enabled { "ON 🟢" } else { "OFF 🔴" };
     format!(
         "⚙️ Settings\n\n\
          Entry mode: {}\n\
@@ -293,7 +294,9 @@ pub fn render_settings(settings: &Settings) -> String {
          leverage_aggressive: {}x\n\
          entry_fill_timeout_secs: {}s\n\
          trigger_expiry_secs: {}s\n\
-         pnl_push_secs: {}s\n\n\
+         pnl_push_secs: {}s\n\
+         auto_scalp_enabled: {}\n\
+         max_open_positions: {}\n\n\
          Change a number:  /set <key> <value>\n\
          e.g.  /set entry_pct 10\n\
          Switch entry mode with the buttons below.",
@@ -308,6 +311,8 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.entry_fill_timeout_secs,
         settings.trigger_expiry_secs,
         settings.pnl_push_secs,
+        auto_scalp,
+        settings.max_open_positions,
     )
 }
 
