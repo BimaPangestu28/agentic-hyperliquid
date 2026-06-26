@@ -24,10 +24,20 @@ export async function isNeurobroReady(page: Page, cfg: Config): Promise<boolean>
 export async function requestSetup(page: Page, cfg: Config, coin: string, screenshot: Buffer): Promise<string> {
   // Navigate only when not already on Neurobro. Re-issuing goto() every cycle reloads
   // the SPA and re-triggers the Cloudflare challenge; staying on the loaded SPA reuses
-  // the already-cleared session. New cards are picked via .last() below.
+  // the already-cleared session.
   if (!page.url().startsWith(cfg.neurobroUrl)) {
     await page.goto(cfg.neurobroUrl, { waitUntil: "networkidle" });
   }
+
+  // Start a fresh conversation each cycle (the "new chat" square-pen button). Without
+  // this, every cycle piles into one ever-growing thread, which slows the SPA and makes
+  // card lookups flaky. Done in-SPA (no reload) so the Cloudflare session is preserved.
+  const newChat = page.locator('button:has(svg.lucide-square-pen)').first();
+  if (await newChat.isVisible().catch(() => false)) {
+    await newChat.click();
+    await page.waitForTimeout(800);
+  }
+  await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 30_000 });
 
   // Attach the screenshot directly to the hidden image file input. Neurobro keeps a
   // <input type="file" accept="image/*" class="hidden"> in the DOM; Playwright sets
@@ -43,29 +53,34 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
   await input.fill(PROMPT(coin));
   await input.press("Enter");
 
-  // The setup arrives as an expandable accordion (toggle button carries aria-expanded,
-  // unlike the collapsed grid-preview card with the same label). Expand it if collapsed
-  // so its table renders visibly.
-  const accordion = page.locator('button[aria-expanded]:has(span:text-is("Setup Trading"))').last();
-  await accordion.waitFor({ state: "visible", timeout: 120_000 });
-  if ((await accordion.getAttribute("aria-expanded")) !== "true") {
-    await accordion.click();
-  }
+  // Wait for the setup table to FINISH streaming. The AI types the response token by
+  // token, so an early read catches a half-filled row (missing columns, literal "**"
+  // markdown). Require: a visible table whose data row has all columns, no streaming
+  // "**", and a rendered "n/10" confidence. Independent of "$" and header language.
+  await page.waitForFunction(() => {
+    const tables = [...document.querySelectorAll("table")].filter((t) => (t as HTMLElement).offsetParent);
+    return tables.some((t) => {
+      const headerCount = t.querySelectorAll("thead th").length;
+      const row = t.querySelector("tbody tr");
+      if (!row || headerCount < 4) return false;
+      const cells = [...row.querySelectorAll("td")].map((td) => td.textContent || "");
+      if (cells.length < headerCount) return false;        // every column present
+      const text = cells.join(" ");
+      if (text.includes("**")) return false;               // markdown still streaming
+      return /\d\s*\/\s*10/.test(text);                    // confidence finished rendering
+    });
+  }, { timeout: 150_000 });
+  await page.waitForTimeout(800); // settle
 
-  // The setup renders as a markdown table headed by "Arah". Target it directly (radix
-  // panel ids regenerate per render, so don't rely on aria-controls), then wait for a
-  // "$" price cell to confirm the values finished loading.
-  const setupTable = page.locator('table:has(th:has-text("Arah"))').last();
-  await setupTable.waitFor({ state: "visible", timeout: 120_000 });
-  await setupTable.locator('td:has-text("$")').first().waitFor({ state: "visible", timeout: 60_000 });
-
-  // Return a container that holds both the table and the "Tesis singkat" blockquote so
-  // the parser gets the thesis too; climb from the table until a blockquote is in scope.
+  // Return the smallest container holding the finished table (+ thesis when nearby).
+  // extractSetup picks the setup table by its headers, so a tight scope is enough.
+  const setupTable = page.locator("table:visible").last();
   const html = await setupTable.evaluate((tableEl) => {
     let node: HTMLElement = tableEl as HTMLElement;
-    for (let i = 0; i < 6 && node.parentElement; i++) {
-      node = node.parentElement;
-      if (node.querySelector("blockquote")) break;
+    for (let i = 0; i < 4 && node.parentElement; i++) {
+      const parent = node.parentElement;
+      node = parent;
+      if (parent.querySelector("blockquote") || /tesis/i.test(parent.textContent || "")) break;
     }
     return node.outerHTML;
   });
