@@ -18,6 +18,8 @@ pub const CB_MARKET: &str = "confirm:market";
 pub const CB_TRIGGER: &str = "confirm:trigger";
 pub const CB_CANCEL: &str = "cancel";
 pub const CB_CANCEL_FILL_PREFIX: &str = "cancel_fill:";
+pub const CB_CLOSE_ALL: &str = "close_all";
+pub const CB_CLOSE_ONE_PREFIX: &str = "close_one:";
 pub const CB_MODE_RISK: &str = "entry_mode:risk";
 pub const CB_MODE_PERCENT: &str = "entry_mode:percent";
 pub const CB_MODE_FIXED: &str = "entry_mode:fixed";
@@ -192,6 +194,84 @@ pub fn render_account(
         out.push_str(&position_line(position));
     }
     out
+}
+
+/// Outcome of attempting to close one position.
+pub struct CloseOutcome {
+    pub coin: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Confirmation prompt listing every open position and the combined uPnL.
+pub fn render_close_all_prompt(positions: &[OpenPosition]) -> String {
+    use crate::monitor::format_pnl;
+    let mut out = String::from("⚠️ Tutup SEMUA posisi?\n\n");
+    let mut total = 0.0;
+    for position in positions {
+        total += position.unrealized_pnl;
+        out.push_str(&format!(
+            "• {} {} {} — {}\n",
+            position.coin,
+            position.direction,
+            position.size,
+            format_pnl(position.unrealized_pnl),
+        ));
+    }
+    out.push_str(&format!("\nTotal uPnL: {}", format_pnl(total)));
+    out
+}
+
+/// Confirmation prompt for closing a single position.
+pub fn render_close_one_prompt(position: &OpenPosition) -> String {
+    use crate::monitor::format_pnl;
+    format!(
+        "⚠️ Tutup posisi {} {} {} — uPnL {}?",
+        position.coin,
+        position.direction,
+        position.size,
+        format_pnl(position.unrealized_pnl),
+    )
+}
+
+/// Result summary after an `execute_close` run.
+pub fn render_close_result(outcomes: &[CloseOutcome]) -> String {
+    let mut lines = Vec::new();
+    for outcome in outcomes {
+        if outcome.ok {
+            lines.push(format!("✅ {} ditutup", outcome.coin));
+        } else {
+            let reason = outcome.error.as_deref().unwrap_or("error");
+            lines.push(format!("⚠️ {} gagal: {}", outcome.coin, reason));
+        }
+    }
+    lines.join("\n")
+}
+
+/// A `[✅ <label>] [❌ Batal]` confirmation keyboard. `close_data` is the
+/// callback fired by the confirm button (`CB_CLOSE_ALL` or `CB_CLOSE_ONE_PREFIX` + coin).
+pub fn close_confirm_keyboard(close_data: &str, button_label: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(button_label.to_string(), close_data.to_string()),
+        InlineKeyboardButton::callback("❌ Batal", CB_CANCEL),
+    ]])
+}
+
+/// Closes each target position best-effort: cancels its resting orders first
+/// (orphan SL/TP cleanup), then market-closes. One failure never aborts the rest.
+pub async fn execute_close<E: Exchange>(exchange: &E, targets: &[OpenPosition]) -> Vec<CloseOutcome> {
+    let mut outcomes = Vec::new();
+    for position in targets {
+        if let Err(error) = exchange.cancel_orders_for_coin(&position.coin).await {
+            tracing::warn!("execute_close: cancel orders for {} failed: {error}", position.coin);
+        }
+        let outcome = match exchange.close_position(&position.coin, position.size).await {
+            Ok(_) => CloseOutcome { coin: position.coin.clone(), ok: true, error: None },
+            Err(error) => CloseOutcome { coin: position.coin.clone(), ok: false, error: Some(error.to_string()) },
+        };
+        outcomes.push(outcome);
+    }
+    outcomes
 }
 
 /// Plain-text settings card (no MarkdownV2 — sent without parse_mode).
@@ -1793,5 +1873,61 @@ mod tests {
         let events = reporter.events.lock().unwrap();
         assert!(!events.iter().any(|e| matches!(e, super::ExecutionEvent::EntryCancelled { .. })),
             "must not report a cancel when the order filled");
+    }
+
+    #[test]
+    fn close_all_prompt_lists_each_position_and_total() {
+        let text = super::render_close_all_prompt(&sample_positions());
+        // sample_positions has BTC and ETH (see account tests)
+        assert!(text.contains("BTC"));
+        assert!(text.contains("ETH"));
+        assert!(text.to_lowercase().contains("total"));
+    }
+
+    #[test]
+    fn close_one_prompt_names_the_coin() {
+        let position = sample_positions().into_iter().next().unwrap();
+        let text = super::render_close_one_prompt(&position);
+        assert!(text.contains(&position.coin));
+    }
+
+    #[test]
+    fn close_result_marks_success_and_failure() {
+        let outcomes = vec![
+            super::CloseOutcome { coin: "BTC".into(), ok: true, error: None },
+            super::CloseOutcome { coin: "SOL".into(), ok: false, error: Some("boom".into()) },
+        ];
+        let text = super::render_close_result(&outcomes);
+        assert!(text.contains("BTC"));
+        assert!(text.contains("SOL"));
+        assert!(text.contains("✅"));
+        assert!(text.contains("⚠️"));
+    }
+
+    #[tokio::test]
+    async fn execute_close_cancels_then_closes_each_target() {
+        use crate::hyperliquid::testing::MockExchange;
+        let exchange = MockExchange::default();
+        exchange.open_orders.lock().unwrap().push("BTC".to_string()); // an orphan SL/TP
+        let targets = sample_positions(); // BTC, ETH
+        let outcomes = super::execute_close(&exchange, &targets).await;
+        assert!(outcomes.iter().all(|o| o.ok));
+        // BTC's resting order was cancelled
+        assert_eq!(exchange.cancels.lock().unwrap().len(), 1);
+        // both positions were closed
+        assert_eq!(exchange.closes.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_close_is_best_effort_on_failure() {
+        use crate::hyperliquid::testing::MockExchange;
+        let exchange = MockExchange::default();
+        exchange.fail_close_coins.lock().unwrap().push("BTC".to_string());
+        let targets = sample_positions(); // BTC (fails), ETH (ok)
+        let outcomes = super::execute_close(&exchange, &targets).await;
+        let btc = outcomes.iter().find(|o| o.coin == "BTC").unwrap();
+        let eth = outcomes.iter().find(|o| o.coin == "ETH").unwrap();
+        assert!(!btc.ok);
+        assert!(eth.ok);
     }
 }
