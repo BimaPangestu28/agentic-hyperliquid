@@ -37,6 +37,7 @@ async function main(): Promise<void> {
     cooldownUntil: new Map<string, number>(),
     now: () => Date.now() / 1000,
     dryRun,
+    sessionAlertSent: { value: false },
   };
 
   if (dryRun) {

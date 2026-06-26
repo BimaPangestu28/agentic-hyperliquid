@@ -4,6 +4,23 @@ import type { Config } from "./config.js";
 const PROMPT = (coin: string) =>
   `Analisa chart ${coin} ini buat scalping di Hyperliquid perpetual. Kasih SATU setup scalping hit-and-run: tentukan arah (LONG/SHORT), harga Masuk, Stop Loss, dan SATU Take Profit aja (TP1 100%, JANGAN ada TP2/TP3). Wajib sertakan angka harga eksplisit, tingkat Keyakinan (x/10), dan tesis singkat. Tampilkan sebagai kartu "Setup Trading".`;
 
+/**
+ * True when Neurobro's chat composer is reachable — i.e. the saved session is still
+ * valid. False when a Cloudflare challenge or login wall stands in the way (in both
+ * cases the composer textarea never appears). Used to alert + pause before scanning.
+ */
+export async function isNeurobroReady(page: Page, cfg: Config): Promise<boolean> {
+  if (!page.url().startsWith(cfg.neurobroUrl)) {
+    await page.goto(cfg.neurobroUrl, { waitUntil: "networkidle" });
+  }
+  try {
+    await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 20_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function requestSetup(page: Page, cfg: Config, coin: string, screenshot: Buffer): Promise<string> {
   // Navigate only when not already on Neurobro. Re-issuing goto() every cycle reloads
   // the SPA and re-triggers the Cloudflare challenge; staying on the loaded SPA reuses

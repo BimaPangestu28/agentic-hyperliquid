@@ -3,7 +3,8 @@ import type { Page } from "playwright";
 import type { Config } from "./config.js";
 import { extractSetup } from "./extract.js";
 import { screenshotChart, readMark } from "./hyperliquid.js";
-import { requestSetup as neurobroRequestSetup } from "./neurobro.js";
+import { requestSetup as neurobroRequestSetup, isNeurobroReady } from "./neurobro.js";
+import { notifyTelegram } from "./notify.js";
 
 /**
  * Coins eligible to scan this cycle: in the watchlist, with no open position,
@@ -37,6 +38,9 @@ export interface RunDeps {
   cooldownUntil: Map<string, number>;
   now: () => number;
   dryRun: boolean;
+  // Mutable holder (persists across cycles) so the "session expired" alert fires once
+  // per outage, not every poll.
+  sessionAlertSent: { value: boolean };
 }
 
 /**
@@ -56,6 +60,23 @@ function cooldown(deps: RunDeps, coin: string): void {
 export async function runOnce(deps: RunDeps): Promise<void> {
   const watchlist = await deps.api.getWatchlist();
   if (!watchlist.autoScalpEnabled) { console.log("auto_scalp disabled — idle"); return; }
+
+  // Verify the Neurobro session is alive before scanning. A Cloudflare/login wall makes
+  // every coin fail; detect it once, alert the operator, and pause this cycle instead of
+  // hammering the wall coin-by-coin.
+  if (!(await isNeurobroReady(deps.nbPage, deps.cfg))) {
+    if (!deps.sessionAlertSent.value) {
+      await notifyTelegram(deps.cfg, "⚠️ Neurobro session expired / Cloudflare wall — auto-scalp paused. Re-run `npm run login` to restore it.");
+      deps.sessionAlertSent.value = true;
+    }
+    console.warn("Neurobro not ready (Cloudflare/login wall) — skipping cycle");
+    return;
+  }
+  if (deps.sessionAlertSent.value) {
+    await notifyTelegram(deps.cfg, "✅ Neurobro session restored — auto-scalp resumed.");
+    deps.sessionAlertSent.value = false;
+  }
+
   const openPositions = await deps.api.getPositions();
   const eligibleCoins = freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions);
 

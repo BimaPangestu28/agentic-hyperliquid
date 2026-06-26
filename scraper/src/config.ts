@@ -3,6 +3,7 @@ export interface Config {
   hyperliquidUrl: string; neurobroUrl: string; storageStatePath: string;
   userDataDir: string; headless: boolean; browserChannel: string;
   pollIntervalSecs: number; cooldownSecs: number; maxDeviation: number;
+  telegramBotToken: string; telegramChatId: string;
 }
 
 function required(env: Record<string, string | undefined>, key: string): string {
@@ -28,5 +29,9 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     pollIntervalSecs: Number(env.POLL_INTERVAL_SECS ?? "60"),
     cooldownSecs: Number(env.COOLDOWN_SECS ?? "300"),
     maxDeviation: Number(env.MAX_DEVIATION ?? "0.004"),
+    // Optional: alert the operator when the Neurobro session dies (Cloudflare/login wall).
+    // Reuse the bot's Telegram bot token + your user/chat id. Empty → alerts just logged.
+    telegramBotToken: env.TELEGRAM_BOT_TOKEN ?? "",
+    telegramChatId: env.TELEGRAM_CHAT_ID ?? "",
   };
 }
