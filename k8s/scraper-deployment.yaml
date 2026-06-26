@@ -26,27 +26,36 @@ spec:
             - secretRef:
                 name: agentic-hyperliquid-env   # same secret as the bot; provides BOT_API_TOKEN
           env:
-            # BOT_API_URL: in-cluster address of the bot's HTTP API server.
-            # NOTE: the bot Deployment is outbound-only and has no Service manifest yet.
-            # Before deploying the scraper, create k8s/bot-service.yaml (ClusterIP, port 8080)
-            # and ensure the bot listens on that port. Replace this placeholder accordingly.
+            # BOT_API_URL: in-cluster address of the bot's HTTP API (axum) server.
+            # NOTE: the bot has no Service manifest yet and binds 127.0.0.1:8088 by
+            # default. Before deploying the scraper: (1) set the bot's HTTP_BIND_ADDR to
+            # 0.0.0.0:8088 so it accepts in-cluster traffic, and (2) create a ClusterIP
+            # Service named "bot" exposing port 8088. Then this URL resolves.
             - name: BOT_API_URL
-              value: "http://bot:8080"
-            # Path to the Playwright session file on the shared PVC.
-            # Bootstrap once: npm run login → kubectl cp neurobro-session.json
-            #   <pod>:/data/neurobro-session.json -n agentic-hyperliquid
-            - name: NEUROBRO_STORAGE_STATE
-              value: /data/neurobro-session.json
+              value: "http://bot:8088"
+            # Persistent Chrome profile on the shared PVC — holds the Cloudflare
+            # cf_clearance cookie + Neurobro auth. THIS is what the loop reuses.
+            # Bootstrap once: run `npm run login` locally, then copy the profile up:
+            #   kubectl cp ./neurobro-profile <pod>:/data/neurobro-profile -n agentic-hyperliquid
+            - name: NEUROBRO_USER_DATA_DIR
+              value: /data/neurobro-profile
+            # Headful under Xvfb (set in the image) — headless is blocked by Cloudflare.
+            - name: HEADLESS
+              value: "false"
+            # Optional session-death alerts. TELEGRAM_BOT_TOKEN comes from the shared
+            # secret (envFrom); set the recipient chat id here (or add it to the secret).
+            - name: TELEGRAM_CHAT_ID
+              value: ""   # ← put your Telegram user/chat id to enable "session expired" alerts
           volumeMounts:
             - name: data
               mountPath: /data
           resources:
             requests:
-              cpu: "100m"
-              memory: "512Mi"   # Chromium headless needs ~256-512 MB baseline
+              cpu: "250m"
+              memory: "1Gi"    # real Chrome headful + Xvfb needs more than headless
             limits:
-              cpu: "1000m"
-              memory: "1Gi"
+              cpu: "1500m"
+              memory: "2Gi"
       volumes:
         - name: data
           persistentVolumeClaim:

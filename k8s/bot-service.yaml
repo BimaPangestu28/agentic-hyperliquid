@@ -1,0 +1,23 @@
+# ClusterIP Service exposing the bot's read-only HTTP API (axum) inside the cluster so
+# the Neurobro scraper can reach it at http://bot:8088.
+#
+# PREREQUISITE: the bot binds 127.0.0.1:8088 by default, which only accepts loopback
+# traffic. Set HTTP_BIND_ADDR=0.0.0.0:8088 in the bot's env (the agentic-hyperliquid-env
+# secret) so it accepts in-cluster connections. The API only starts when
+# PORTFOLIO_API_TOKEN is set — that same token is the scraper's BOT_API_TOKEN.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bot
+  namespace: agentic-hyperliquid
+  labels:
+    app: agentic-hyperliquid
+spec:
+  type: ClusterIP
+  selector:
+    app: agentic-hyperliquid   # matches the bot Deployment's pod label
+  ports:
+    - name: http-api
+      port: 8088
+      targetPort: 8088
+      protocol: TCP

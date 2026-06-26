@@ -6,6 +6,9 @@ import { runForever, runOnce } from "./loop.js";
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
   const dryRun = process.argv.includes("--dry-run");
+  // --once runs a single cycle then exits (real execute, unlike --dry-run). Useful for
+  // a first live test against the bot and for cron-style scheduling instead of a daemon.
+  const once = dryRun || process.argv.includes("--once");
 
   // Reuse the persistent Chrome profile established by `npm run login` so the
   // Cloudflare cf_clearance cookie + Neurobro auth carry over. Real Chrome channel
@@ -40,7 +43,7 @@ async function main(): Promise<void> {
     sessionAlertSent: { value: false },
   };
 
-  if (dryRun) {
+  if (once) {
     await runOnce(deps);
     await context.close();
     return;

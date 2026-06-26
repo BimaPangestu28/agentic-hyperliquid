@@ -6,6 +6,7 @@
     "test": "vitest run",
     "login": "node --env-file-if-exists=.env --import tsx src/login.ts",
     "dry-run": "node --env-file-if-exists=.env --import tsx src/index.ts --dry-run",
+    "once": "node --env-file-if-exists=.env --import tsx src/index.ts --once",
     "start": "node --env-file-if-exists=.env --import tsx src/index.ts"
   },
   "dependencies": {

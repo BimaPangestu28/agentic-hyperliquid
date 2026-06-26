@@ -1,13 +1,22 @@
 # Build context: repo root (docker build -f scraper/Dockerfile .)
 #
-# Base image: mcr.microsoft.com/playwright:v1.61.0-jammy
-# Pinned to match the npm package installed version (1.61.1).
-# The brief template referenced v1.48.0-jammy, but the lockfile resolves
-# playwright@^1.48.0 to 1.61.1 — using a base image older than the npm
-# package causes browser-binary mismatch on first launch.
+# Base: mcr.microsoft.com/playwright:v1.61.0-jammy — pinned to the installed
+# playwright (1.61.1); an older base mismatches the browser binaries.
 FROM mcr.microsoft.com/playwright:v1.61.0-jammy
 WORKDIR /app
+
+# Real Google Chrome + a virtual display. Cloudflare Turnstile flags both Playwright's
+# bundled "Chrome for Testing" and headless mode, so production must run REAL Chrome
+# (channel: chrome) HEADFUL under Xvfb. `playwright install chrome` pulls Google Chrome
+# stable; xvfb provides the display the headful browser needs on a server.
+RUN npx playwright install chrome \
+  && apt-get update && apt-get install -y --no-install-recommends xvfb \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY scraper/package.json scraper/package-lock.json* ./
 RUN npm install --omit=dev && npm install tsx typescript
 COPY scraper/ ./
-CMD ["npx", "tsx", "src/index.ts"]
+
+# HEADLESS=false (the app default) + Xvfb. xvfb-run gives Chrome a display :99.
+ENV HEADLESS=false
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1280x1024x24", "npx", "tsx", "src/index.ts"]
