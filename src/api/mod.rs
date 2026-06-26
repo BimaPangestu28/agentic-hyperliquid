@@ -20,6 +20,13 @@ pub struct ApiState {
     pub exchange: Arc<dyn Exchange>,
     pub db_path: String,
     pub token: String,
+    /// Default settings used to seed `SettingsStore::load` when reading current
+    /// settings from the DB per request.
+    pub settings_seed: crate::settings::Settings,
+    /// Telegram bot token used to construct a `Bot` for auto-open notifications.
+    pub telegram_bot_token: String,
+    /// Chat ids that receive auto-open notifications.
+    pub allowed_user_ids: Vec<i64>,
 }
 
 /// Reject any request whose `Authorization: Bearer <token>` does not match the
@@ -205,6 +212,9 @@ mod tests {
             exchange: Arc::new(MockExchange::with_equity(equity)),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         }
     }
 
@@ -244,6 +254,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         }
     }
 
@@ -350,6 +363,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         let response = app
             .oneshot(
@@ -393,6 +409,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         let response = app
             .oneshot(
@@ -430,6 +449,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         let response = app
             .oneshot(
@@ -457,6 +479,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         }
     }
 
@@ -594,6 +619,9 @@ mod tests {
             exchange: Arc::new(mock),
             db_path: ":memory:".into(),
             token: "t".into(),
+            settings_seed: crate::settings::sample(),
+            telegram_bot_token: "test-token".to_string(),
+            allowed_user_ids: vec![1],
         });
         // Filter since=5000 — only SOL should come back.
         let response = app
