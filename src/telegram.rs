@@ -158,21 +158,24 @@ fn position_line(position: &OpenPosition) -> String {
     )
 }
 
-/// Running-P&L push: total + per-position unrealized PnL, best performers first.
-pub fn render_pnl_summary(equity: f64, positions: &[OpenPosition]) -> String {
-    let mut out = String::from("📊 Running P&L\n");
-    out.push_str(&format!("Equity: ${:.2}\n", equity));
-    out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
-    // Rank by unrealized PnL, highest first (NaN sorts last via Equal fallback).
+/// Position rows ranked by unrealized PnL, highest first (NaN sorts last via the Equal
+/// fallback). Shared by the P&L push and /account so both list best performers on top.
+fn ranked_position_lines(positions: &[OpenPosition]) -> String {
     let mut ranked: Vec<&OpenPosition> = positions.iter().collect();
     ranked.sort_by(|a, b| {
         b.unrealized_pnl
             .partial_cmp(&a.unrealized_pnl)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for position in ranked {
-        out.push_str(&position_line(position));
-    }
+    ranked.into_iter().map(position_line).collect()
+}
+
+/// Running-P&L push: total + per-position unrealized PnL, best performers first.
+pub fn render_pnl_summary(equity: f64, positions: &[OpenPosition]) -> String {
+    let mut out = String::from("📊 Running P&L\n");
+    out.push_str(&format!("Equity: ${:.2}\n", equity));
+    out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
+    out.push_str(&ranked_position_lines(positions));
     out
 }
 
@@ -200,9 +203,7 @@ pub fn render_account(
     }
     out.push_str(&format!("\nOpen positions ({}):\n", positions.len()));
     out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
-    for position in positions {
-        out.push_str(&position_line(position));
-    }
+    out.push_str(&ranked_position_lines(positions));
     out
 }
 
