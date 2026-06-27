@@ -21,6 +21,37 @@ export async function isNeurobroReady(page: Page, cfg: Config): Promise<boolean>
   }
 }
 
+/**
+ * Dismisses a blocking modal/dialog overlay that intercepts clicks on the composer or
+ * new-chat controls. Neurobro renders shadcn/Radix dialogs as a full-screen
+ * `fixed inset-0` backdrop (z-[9999], backdrop-blur); these close on Escape. Falls back
+ * to a visible close/confirm button. Logs the overlay's text once so an unexpected
+ * dialog (announcement, quota notice, etc.) can be identified from the pod logs.
+ * Returns true when nothing is blocking afterwards.
+ */
+async function dismissOverlay(page: Page): Promise<boolean> {
+  const overlay = page.locator("div.fixed.inset-0").first();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!(await overlay.isVisible().catch(() => false))) return true;
+    const text = ((await overlay.textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim().slice(0, 200);
+    console.warn(`Neurobro overlay blocking (attempt ${attempt + 1}/3): "${text}"`);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    if (!(await overlay.isVisible().catch(() => false))) return true;
+    const closeButton = page.locator(
+      '[role="dialog"] button[aria-label*="close" i], button[aria-label*="close" i], ' +
+      '[role="dialog"] button:has-text("Tutup"), [role="dialog"] button:has-text("Close"), ' +
+      '[role="dialog"] button:has-text("OK"), [role="dialog"] button:has-text("Got it"), ' +
+      '[role="dialog"] button:has-text("Mengerti"), [role="dialog"] button:has-text("Lanjut")',
+    ).first();
+    if (await closeButton.isVisible().catch(() => false)) {
+      await closeButton.click().catch(() => {});
+      await page.waitForTimeout(500);
+    }
+  }
+  return !(await overlay.isVisible().catch(() => false));
+}
+
 export async function requestSetup(page: Page, cfg: Config, coin: string, screenshot: Buffer): Promise<string> {
   // Navigate only when not already on Neurobro. Re-issuing goto() every cycle reloads
   // the SPA and re-triggers the Cloudflare challenge; staying on the loaded SPA reuses

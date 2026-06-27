@@ -1,22 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { timeframeLabels } from "../src/hyperliquid.js";
+import { rangeTabSelectors } from "../src/hyperliquid.js";
 
-describe("timeframeLabels", () => {
-  it("maps minute timeframes to their own label", () => {
-    expect(timeframeLabels("15m")).toEqual(["15m"]);
-    expect(timeframeLabels("5m")).toEqual(["5m"]);
+describe("rangeTabSelectors", () => {
+  it("targets the TradingView date-range tab by data-name and value", () => {
+    const selectors = rangeTabSelectors("1D");
+    expect(selectors).toContain('button[data-name="date-range-tab-1D"]');
+    expect(selectors).toContain('button[value="1D"]');
   });
-  it("is case-insensitive and trims", () => {
-    expect(timeframeLabels("  15M ")).toEqual(["15m"]);
-  });
-  it("offers alternate labels for hourly", () => {
-    expect(timeframeLabels("1h")).toContain("1h");
-    expect(timeframeLabels("1h")).toContain("60m");
-  });
-  it("maps daily to the chart's D label", () => {
-    expect(timeframeLabels("1d")).toContain("D");
-  });
-  it("falls back to the raw value for unknown keys", () => {
-    expect(timeframeLabels("7m")).toEqual(["7m"]);
+  it("trims whitespace around the range", () => {
+    expect(rangeTabSelectors("  5D ")[0]).toBe('button[data-name="date-range-tab-5D"]');
   });
 });

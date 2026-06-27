@@ -2,52 +2,48 @@ import type { Page } from "playwright";
 import type { Config } from "./config.js";
 
 /**
- * Maps a timeframe key (e.g. "15m", "1d") to the candidate button labels
- * Hyperliquid's chart may render it as. Daily is shown as "D"; hourly sometimes
- * as "60m". Returns the key itself as a fallback for unmapped values.
+ * Candidate selectors for the chart's date-range tab. Hyperliquid embeds TradingView,
+ * whose date-range tabs render as `<button data-name="date-range-tab-1D" value="1D">`
+ * (e.g. "1D" = one day of 1-minute candles). The hashed class names change between
+ * builds, so we target the stable data-name / value attributes.
  */
-export function timeframeLabels(timeframe: string): string[] {
-  const key = timeframe.trim().toLowerCase();
-  const map: Record<string, string[]> = {
-    "1m": ["1m"], "3m": ["3m"], "5m": ["5m"], "15m": ["15m"], "30m": ["30m"],
-    "1h": ["1h", "60m"], "2h": ["2h", "120m"], "4h": ["4h", "240m"],
-    "8h": ["8h"], "12h": ["12h"],
-    "1d": ["D", "1D", "1d"], "d": ["D", "1D"],
-    "1w": ["W", "1W"], "w": ["W", "1W"],
-  };
-  return map[key] ?? [timeframe];
+export function rangeTabSelectors(range: string): string[] {
+  const value = range.trim();
+  return [
+    `button[data-name="date-range-tab-${value}"]`,
+    `button[value="${value}"]`,
+  ];
 }
 
 /**
- * Best-effort click of the chart timeframe selector. A label change must not kill
- * the scan, so a miss only logs a warning and the chart's default timeframe is used.
+ * Best-effort click of the chart date-range tab (e.g. "1D"). TradingView may live in the
+ * main document or an embedded frame, so we try both. A miss must not kill the scan —
+ * it only logs a warning and the chart's current range is used.
  */
-async function selectTimeframe(page: Page, timeframe: string): Promise<boolean> {
-  for (const label of timeframeLabels(timeframe)) {
-    for (const locator of [
-      page.getByRole("button", { name: label, exact: true }),
-      page.getByText(label, { exact: true }),
-    ]) {
+async function selectChartRange(page: Page, range: string): Promise<boolean> {
+  for (const selector of rangeTabSelectors(range)) {
+    const locators = [page.locator(selector), ...page.frames().map((frame) => frame.locator(selector))];
+    for (const locator of locators) {
       try {
         const element = locator.first();
         if (await element.isVisible({ timeout: 1000 })) {
-          await element.click();
-          await page.waitForTimeout(1500); // let the candles redraw at the new interval
+          await element.click({ timeout: 2000 });
+          await page.waitForTimeout(1500); // let the candles redraw for the new range
           return true;
         }
       } catch {
-        // try the next locator/label
+        // try the next locator / frame
       }
     }
   }
-  console.warn(`HL timeframe "${timeframe}" button not found — using chart default`);
+  console.warn(`HL chart range "${range}" tab not found — using chart default`);
   return false;
 }
 
 export async function screenshotChart(page: Page, cfg: Config, coin: string): Promise<Buffer> {
   await page.goto(`${cfg.hyperliquidUrl}/trade/${coin}`, { waitUntil: "networkidle" });
   await page.waitForTimeout(4000); // let the chart canvas render
-  await selectTimeframe(page, cfg.hlTimeframe); // set the analysis timeframe (e.g. 15m) before capture
+  await selectChartRange(page, cfg.hlTimeframe); // set the date range (e.g. 1D = 1-min candles, 1 day) before capture
   return await page.screenshot({ fullPage: false }); // viewport screenshot (chart + book + price)
 }
 

@@ -47,10 +47,11 @@ spec:
             #   kubectl cp ./neurobro-profile <pod>:/data/neurobro-profile -n agentic-hyperliquid
             - name: NEUROBRO_USER_DATA_DIR
               value: /data/neurobro-profile
-            # Chart timeframe the scraper selects before screenshotting for Neurobro.
-            # 15m suits scalping; accepts 1m/5m/15m/1h/4h/1d etc.
+            # TradingView date-range tab clicked before screenshotting for Neurobro.
+            # "1D" = one day of 1-minute candles (scalping). Matches the button's value /
+            # data-name="date-range-tab-<VALUE>" (e.g. 1D, 5D, 1M).
             - name: HL_TIMEFRAME
-              value: "15m"
+              value: "1D"
             # Headful under Xvfb (set in the image) — headless is blocked by Cloudflare.
             - name: HEADLESS
               value: "false"

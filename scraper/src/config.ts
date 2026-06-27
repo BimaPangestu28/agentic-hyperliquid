@@ -34,9 +34,10 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     botApiUrl: required(env, "BOT_API_URL"),
     botApiToken: required(env, "BOT_API_TOKEN"),
     hyperliquidUrl: env.HYPERLIQUID_URL ?? "https://app.hyperliquid.xyz",
-    // Chart timeframe the scraper selects before screenshotting for Neurobro analysis.
-    // 15m suits scalping. Accepts 1m/5m/15m/1h/4h/1d etc. (see timeframeLabels).
-    hlTimeframe: env.HL_TIMEFRAME ?? "15m",
+    // TradingView date-range tab the scraper clicks before screenshotting for Neurobro.
+    // "1D" = one day of 1-minute candles (good for scalping). Matches the button's
+    // value / data-name="date-range-tab-<VALUE>" (e.g. 1D, 5D, 1M).
+    hlTimeframe: env.HL_TIMEFRAME ?? "1D",
     neurobroUrl: env.NEUROBRO_URL ?? "https://app.neurobro.ai",
     storageStatePath: env.NEUROBRO_STORAGE_STATE ?? "./neurobro-session.json",
     // Persistent Chrome profile dir: cf_clearance (Cloudflare) + Neurobro auth live
