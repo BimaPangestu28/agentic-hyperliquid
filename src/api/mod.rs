@@ -55,6 +55,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/balance", get(balance))
         .route("/positions", get(positions))
         .route("/watchlist", get(watchlist))
+        .route("/manual-scans", get(manual_scans))
         .route("/trades", get(trades))
         .route("/flows", get(flows))
         .route("/execute", axum::routing::post(execute))
@@ -79,6 +80,11 @@ struct WatchlistResponse {
     coins: Vec<String>,
     auto_scalp_enabled: bool,
     max_open_positions: u32,
+}
+
+#[derive(Serialize)]
+struct ManualScansResponse {
+    coins: Vec<String>,
 }
 
 async fn balance(State(state): State<ApiState>) -> Result<Json<BalanceResponse>, StatusCode> {
@@ -206,6 +212,15 @@ async fn watchlist(State(state): State<ApiState>) -> Result<Json<WatchlistRespon
     }))
 }
 
+/// Drains the manual `/scan` queue: returns the pending coins and marks them processed,
+/// so the scraper picks up each request exactly once. Same SQLite file as the journal.
+async fn manual_scans(State(state): State<ApiState>) -> Result<Json<ManualScansResponse>, StatusCode> {
+    let store = crate::manual_scan_store::ManualScanStore::open(&state.db_path)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let coins = store.drain_pending().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ManualScansResponse { coins }))
+}
+
 #[derive(serde::Deserialize)]
 struct ExecuteRequest {
     coin: String,
@@ -216,6 +231,11 @@ struct ExecuteRequest {
     confidence: u8,
     #[serde(default)]
     thesis: String,
+    /// Set by a manual `/scan` request: bypasses only the auto-scalp kill-switch (the
+    /// user asked for this trade explicitly). Confidence, position-cap and margin gates
+    /// still apply.
+    #[serde(default)]
+    manual: bool,
 }
 
 /// Error returned by the [`execute`] handler.
@@ -277,8 +297,8 @@ async fn execute(
         .load(state.settings_seed.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Gate 1: master kill-switch.
-    if !settings.auto_scalp_enabled {
+    // Gate 1: master kill-switch — bypassed for an explicit manual /scan request.
+    if !settings.auto_scalp_enabled && !req.manual {
         return Err(ExecuteError::reason(StatusCode::CONFLICT, "kill_switch"));
     }
     // Gate 2: confidence threshold.
@@ -411,7 +431,8 @@ async fn execute(
     use teloxide::prelude::Requester;
     let bot = teloxide::Bot::new(&state.telegram_bot_token);
     let msg = format!(
-        "🤖 Auto-buka {} {} {} @ {} · SL {} · TP {} · conf {}/10\n{}",
+        "{} {} {} {} @ {} · SL {} · TP {} · conf {}/10\n{}",
+        if req.manual { "🖐 Manual-buka" } else { "🤖 Auto-buka" },
         setup.coin,
         if matches!(setup.direction, crate::parser::Direction::Long) { "LONG" } else { "SHORT" },
         plan.size,
@@ -979,6 +1000,47 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT); // 409 kill-switch
         assert_eq!(rejection_reason(res).await, "kill_switch");
+    }
+
+    #[tokio::test]
+    async fn execute_manual_request_bypasses_kill_switch() {
+        // auto_scalp is off (seed default false). A normal request returns kill_switch; a
+        // manual one must get PAST gate 1 — it then fails later (no asset meta on the mock),
+        // so the one thing we assert is that the reason is NOT kill_switch.
+        let app = router(state_with(1000.0));
+        let body = r#"{"coin":"AVAX","direction":"long","entry":6.12,"stop_loss":5.99,"take_profit":6.32,"confidence":8,"thesis":"t","manual":true}"#;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(rejection_reason(res).await, "kill_switch");
+    }
+
+    #[tokio::test]
+    async fn manual_scans_requires_auth_and_returns_coins_array() {
+        let app = router(state_with(1000.0));
+        // no bearer → 401
+        let res = app.clone().oneshot(
+            Request::builder().uri("/manual-scans").body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // with bearer → 200 + {"coins": []} (fresh :memory: queue is empty)
+        let res = app.oneshot(
+            Request::builder().uri("/manual-scans").header("authorization", "Bearer t")
+                .body(axum::body::Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["coins"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

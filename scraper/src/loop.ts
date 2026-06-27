@@ -87,14 +87,125 @@ function cooldown(deps: RunDeps, coin: string): void {
  * reads the mark price, requests a Neurobro setup, and — if all gates pass —
  * executes the trade (or logs it in dry-run mode).
  */
+/**
+ * Analyses one coin via Neurobro and, if every gate passes, executes it (or logs in
+ * dry-run). Owns its quota accounting, Telegram notifications, cooldown, and error
+ * isolation so one coin's failure never aborts the cycle.
+ *
+ * @param manual - True for an explicit /scan request: passed to execute() so the bot
+ *   bypasses the kill-switch, and reflected in the notifications.
+ * @returns Whether a Neurobro analysis was actually spent (for the per-cycle cap count).
+ */
+async function processCoin(
+  deps: RunDeps, coin: string, today: string, cooldownMins: number, manual: boolean,
+): Promise<boolean> {
+  const tag = manual ? "🖐" : "🔎";
+  let spent = false;
+  try {
+    // Capture HTF (trend bias) + LTF (entry timing) when a higher timeframe is configured;
+    // otherwise a single LTF image. Buffers are ordered HTF-first for the prompt.
+    const ranges = deps.cfg.hlTimeframeHtf
+      ? [deps.cfg.hlTimeframeHtf, deps.cfg.hlTimeframe]
+      : [deps.cfg.hlTimeframe];
+    const screenshots = await screenshotCharts(deps.hlPage, deps.cfg, coin, ranges);
+    // Ground the prompt in real numbers: live mark (off the page) + recent ATR (public API).
+    const preMark = await readMark(deps.hlPage);
+    const market = await fetchMarketContext(coin, deps.cfg, deps.now());
+    const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshots, {
+      markPrice: preMark,
+      atrPercent: market.atrPercent,
+      multiTimeframe: ranges.length > 1,
+    });
+    recordAnalysis(deps.cfg.quotaStatePath, today); // an analysis was spent the moment Neurobro responded
+    spent = true;
+    const setup = extractSetup(responseHtml, coin);
+
+    if (!setup) {
+      console.warn(`${coin}: no parseable setup — skip`);
+      await notifyTelegram(deps.cfg, `${tag} ${coin}: Neurobro nggak kasih setup yang kebaca — skip (cooldown ${cooldownMins}m)`);
+      cooldown(deps, coin);
+      return spent;
+    }
+    // Deterministic guardrail: reject setups whose own numbers are inconsistent (wrong
+    // SL/TP ordering, RR below floor, stop too wide) before spending any execution call.
+    const validation = validateSetup(setup, {
+      minRiskReward: deps.cfg.minRiskReward,
+      maxStopLossPct: deps.cfg.maxStopLossPct,
+    });
+    if (!validation.ok) {
+      console.log(`${coin}: setup ditolak — ${validation.reason}`);
+      await notifyTelegram(deps.cfg, `${tag} ${coin}: setup ditolak (${validation.reason}) — skip (cooldown ${cooldownMins}m)`);
+      cooldown(deps, coin);
+      return spent;
+    }
+    if (setup.confidence < 7) {
+      console.log(`${coin}: conf ${setup.confidence} < 7 — skip`);
+      await notifyTelegram(deps.cfg, `${tag} ${coin}: confidence ${setup.confidence}/10 < 7 — skip (cooldown ${cooldownMins}m)`);
+      cooldown(deps, coin);
+      return spent;
+    }
+    // Re-read the mark fresh: entry came from a chart snapshot up to ~2 min ago, so
+    // measure slippage against the live price right before executing.
+    await deps.hlPage.bringToFront();
+    const markPrice = await readMark(deps.hlPage);
+    if (!passesSlippage(markPrice, setup.entry, deps.cfg.maxDeviation)) {
+      console.log(`${coin}: slippage mark=${markPrice} entry=${setup.entry} — skip`);
+      await notifyTelegram(deps.cfg, `${tag} ${coin}: harga geser jauh dari entry (mark ${markPrice}, entry ${setup.entry}) — skip (cooldown ${cooldownMins}m)`);
+      cooldown(deps, coin);
+      return spent;
+    }
+    if (deps.dryRun) {
+      console.log(`[dry-run] would execute`, setup);
+      return spent;
+    }
+    // Log the exact setup sent so per-coin entry/SL/TP mismatches (e.g. a stale card
+    // read from another coin's thread) are visible in the run output, not just on skip.
+    console.log(`${coin}: sending ${setup.direction} entry=${setup.entry} SL=${setup.stopLoss} TP=${setup.takeProfit} conf=${setup.confidence} manual=${manual}`);
+    const result = await deps.api.execute(setup, manual);
+    console.log(`${coin}: execute → ${result.status} ok=${result.ok}`);
+    const direction = setup.direction.toUpperCase();
+    if (result.ok) {
+      // Cooldown on success too: otherwise the moment this position closes (SL/TP) the
+      // coin is eligible again and gets re-entered next scan — churning the same coin
+      // and stacking overlapping brackets, which is what makes the bot's close-fill
+      // labels (SL/TP) misattribute against the newest bracket.
+      cooldown(deps, coin);
+      await notifyTelegram(deps.cfg, `${manual ? "🖐" : "✅"} ${coin} ${direction} dieksekusi${manual ? " (manual)" : ""} — entry ${setup.entry}, SL ${setup.stopLoss}, TP ${setup.takeProfit} (conf ${setup.confidence}/10) · cooldown ${cooldownMins}m`);
+    } else {
+      const why = describeExecuteError(result.status, result.error);
+      await notifyTelegram(deps.cfg, `❌ ${coin} ${direction}: eksekusi gagal (${result.status}: ${why}) — cooldown ${cooldownMins}m`);
+      cooldown(deps, coin);
+    }
+  } catch (error) {
+    console.error(`${coin}: error`, error);
+    cooldown(deps, coin);
+  }
+  return spent;
+}
+
 export async function runOnce(deps: RunDeps): Promise<void> {
   const watchlist = await deps.api.getWatchlist();
-  if (!watchlist.autoScalpEnabled) { console.log("auto_scalp disabled — idle"); return; }
+  // Drain manual /scan requests up front (a cheap bot-API call). Manual scans must run even
+  // when auto-scalp is off, so the kill-switch alone can't short-circuit the cycle. Tolerate
+  // an older bot without the endpoint: treat a fetch failure as "no manual scans".
+  let manualCoins: string[] = [];
+  try {
+    manualCoins = await deps.api.getManualScans();
+  } catch (error) {
+    console.warn("manual-scans fetch failed (older bot?) — continuing", error);
+  }
+  if (!watchlist.autoScalpEnabled && manualCoins.length === 0) {
+    console.log("auto_scalp disabled, no manual scans — idle");
+    return;
+  }
 
   // Verify the Neurobro session is alive before scanning. A Cloudflare/login wall makes
   // every coin fail; detect it once, alert the operator, and pause this cycle instead of
-  // hammering the wall coin-by-coin.
+  // hammering the wall coin-by-coin. (Applies to manual + auto.)
   if (!(await isNeurobroReady(deps.nbPage, deps.cfg))) {
+    if (manualCoins.length > 0) {
+      await notifyTelegram(deps.cfg, `⚠️ Neurobro session down — scan manual (${manualCoins.join(", ")}) dibatalkan. Re-run \`npm run login\`, lalu /scan lagi.`);
+    }
     if (!deps.sessionAlertSent.value) {
       await notifyTelegram(deps.cfg, "⚠️ Neurobro session expired / Cloudflare wall — auto-scalp paused. Re-run `npm run login` to restore it.");
       deps.sessionAlertSent.value = true;
@@ -111,6 +222,9 @@ export async function runOnce(deps: RunDeps): Promise<void> {
   // hard-stops the loop before it overspends. Bail the whole cycle if nothing is left.
   const today = dayKey(deps.now());
   if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) {
+    if (manualCoins.length > 0) {
+      await notifyTelegram(deps.cfg, `🪫 Quota Neurobro habis — scan manual (${manualCoins.join(", ")}) dibatalkan sampai reset.`);
+    }
     if (deps.quotaAlertedDay.value !== today) {
       await notifyTelegram(deps.cfg, `🪫 Neurobro daily quota (${deps.cfg.maxAnalysesPerDay}) reached — auto-scalp paused until reset.`);
       deps.quotaAlertedDay.value = today;
@@ -120,100 +234,46 @@ export async function runOnce(deps: RunDeps): Promise<void> {
   }
 
   const openPositions = await deps.api.getPositions();
-  const eligibleCoins = freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions);
+  const held = new Set(openPositions.map((position) => position.coin.toUpperCase()));
+  const cooldownMins = Math.round(deps.cfg.cooldownSecs / 60);
 
-  // Visibility: tell the operator a scan is starting and which coins it will analyse.
-  // Skipped (silent) when nothing is eligible so quiet cycles don't spam Telegram.
+  // Manual coins run first, bypassing cooldown. Skip ones already held — don't stack the
+  // same coin (the position-cap gate enforces the global limit server-side).
+  const manualToScan = manualCoins.filter((coin) => !held.has(coin));
+  for (const heldCoin of manualCoins.filter((coin) => held.has(coin))) {
+    await notifyTelegram(deps.cfg, `🖐 ${heldCoin}: sudah ada posisi terbuka — scan manual dilewati.`);
+  }
+
+  // Auto-scalp eligible coins, minus any also requested manually (handled above).
+  const manualSet = new Set(manualToScan);
+  const eligibleCoins = watchlist.autoScalpEnabled
+    ? freeCoins(watchlist.coins, openPositions, deps.cooldownUntil, deps.now(), watchlist.maxOpenPositions)
+        .filter((coin) => !manualSet.has(coin))
+    : [];
+
+  // Visibility: announce what will be scanned. Quiet when nothing is eligible.
+  if (manualToScan.length > 0) {
+    await notifyTelegram(deps.cfg, `🖐 Scan manual ${manualToScan.length} coin: ${manualToScan.join(", ")}`);
+  }
   if (eligibleCoins.length > 0) {
     await notifyTelegram(deps.cfg, `🔄 Scan ${eligibleCoins.length} coin: ${eligibleCoins.join(", ")}`);
   }
 
-  const cooldownMins = Math.round(deps.cfg.cooldownSecs / 60);
+  // Manual scans: no per-cycle cap (explicit user request), but still bounded by the daily quota.
+  for (const coin of manualToScan) {
+    if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) {
+      await notifyTelegram(deps.cfg, `🪫 ${coin}: quota Neurobro habis — scan manual dilewati.`);
+      break;
+    }
+    await processCoin(deps, coin, today, cooldownMins, true);
+  }
+
+  // Auto-scalp coins: respect the optional per-cycle cap and the hard daily quota.
   let analysesThisCycle = 0;
   for (const coin of eligibleCoins) {
-    // Optional per-cycle cap (0 = unlimited → scan all eligible coins this cycle, e.g. a
-    // startup burst). The daily cap below is the hard budget protection regardless.
     if (deps.cfg.maxAnalysesPerCycle > 0 && analysesThisCycle >= deps.cfg.maxAnalysesPerCycle) break;
     if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) break;
-    try {
-      // Capture HTF (trend bias) + LTF (entry timing) when a higher timeframe is configured;
-      // otherwise a single LTF image. Buffers are ordered HTF-first for the prompt.
-      const ranges = deps.cfg.hlTimeframeHtf
-        ? [deps.cfg.hlTimeframeHtf, deps.cfg.hlTimeframe]
-        : [deps.cfg.hlTimeframe];
-      const screenshots = await screenshotCharts(deps.hlPage, deps.cfg, coin, ranges);
-      // Ground the prompt in real numbers: live mark (off the page) + recent ATR (public API).
-      const preMark = await readMark(deps.hlPage);
-      const market = await fetchMarketContext(coin, deps.cfg, deps.now());
-      const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshots, {
-        markPrice: preMark,
-        atrPercent: market.atrPercent,
-        multiTimeframe: ranges.length > 1,
-      });
-      recordAnalysis(deps.cfg.quotaStatePath, today); // an analysis was spent the moment Neurobro responded
-      analysesThisCycle += 1;
-      const setup = extractSetup(responseHtml, coin);
-
-      if (!setup) {
-        console.warn(`${coin}: no parseable setup — skip`);
-        await notifyTelegram(deps.cfg, `🔎 ${coin}: Neurobro nggak kasih setup yang kebaca — skip (cooldown ${cooldownMins}m)`);
-        cooldown(deps, coin);
-        continue;
-      }
-      // Deterministic guardrail: reject setups whose own numbers are inconsistent (wrong
-      // SL/TP ordering, RR below floor, stop too wide) before spending any execution call.
-      const validation = validateSetup(setup, {
-        minRiskReward: deps.cfg.minRiskReward,
-        maxStopLossPct: deps.cfg.maxStopLossPct,
-      });
-      if (!validation.ok) {
-        console.log(`${coin}: setup ditolak — ${validation.reason}`);
-        await notifyTelegram(deps.cfg, `🔎 ${coin}: setup ditolak (${validation.reason}) — skip (cooldown ${cooldownMins}m)`);
-        cooldown(deps, coin);
-        continue;
-      }
-      if (setup.confidence < 7) {
-        console.log(`${coin}: conf ${setup.confidence} < 7 — skip`);
-        await notifyTelegram(deps.cfg, `🔎 ${coin}: confidence ${setup.confidence}/10 < 7 — skip (cooldown ${cooldownMins}m)`);
-        cooldown(deps, coin);
-        continue;
-      }
-      // Re-read the mark fresh: entry came from a chart snapshot up to ~2 min ago, so
-      // measure slippage against the live price right before executing.
-      await deps.hlPage.bringToFront();
-      const markPrice = await readMark(deps.hlPage);
-      if (!passesSlippage(markPrice, setup.entry, deps.cfg.maxDeviation)) {
-        console.log(`${coin}: slippage mark=${markPrice} entry=${setup.entry} — skip`);
-        await notifyTelegram(deps.cfg, `🔎 ${coin}: harga geser jauh dari entry (mark ${markPrice}, entry ${setup.entry}) — skip (cooldown ${cooldownMins}m)`);
-        cooldown(deps, coin);
-        continue;
-      }
-      if (deps.dryRun) {
-        console.log(`[dry-run] would execute`, setup);
-        continue;
-      }
-      // Log the exact setup sent so per-coin entry/SL/TP mismatches (e.g. a stale card
-      // read from another coin's thread) are visible in the run output, not just on skip.
-      console.log(`${coin}: sending ${setup.direction} entry=${setup.entry} SL=${setup.stopLoss} TP=${setup.takeProfit} conf=${setup.confidence}`);
-      const result = await deps.api.execute(setup);
-      console.log(`${coin}: execute → ${result.status} ok=${result.ok}`);
-      const direction = setup.direction.toUpperCase();
-      if (result.ok) {
-        // Cooldown on success too: otherwise the moment this position closes (SL/TP) the
-        // coin is eligible again and gets re-entered next scan — churning the same coin
-        // and stacking overlapping brackets, which is what makes the bot's close-fill
-        // labels (SL/TP) misattribute against the newest bracket.
-        cooldown(deps, coin);
-        await notifyTelegram(deps.cfg, `✅ ${coin} ${direction} dieksekusi — entry ${setup.entry}, SL ${setup.stopLoss}, TP ${setup.takeProfit} (conf ${setup.confidence}/10) · cooldown ${cooldownMins}m`);
-      } else {
-        const why = describeExecuteError(result.status, result.error);
-        await notifyTelegram(deps.cfg, `❌ ${coin} ${direction}: eksekusi gagal (${result.status}: ${why}) — cooldown ${cooldownMins}m`);
-        cooldown(deps, coin);
-      }
-    } catch (error) {
-      console.error(`${coin}: error`, error);
-      cooldown(deps, coin);
-    }
+    if (await processCoin(deps, coin, today, cooldownMins, false)) analysesThisCycle += 1;
   }
 }
 

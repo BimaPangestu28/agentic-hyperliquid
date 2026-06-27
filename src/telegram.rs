@@ -10,7 +10,7 @@ use crate::state::PendingTrade;
 use std::time::Duration;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /closeall, /close <COIN>, /watch, /settings, /set <key> <value>\n\n/closeall — tutup semua posisi\n/close <COIN> — tutup satu posisi (contoh: /close BTC)\n/watch — lihat watchlist & status auto-scalp · /watch add <COIN> · /watch remove <COIN>\n/set auto_scalp_enabled on|off — nyalakan/matikan auto-scalp · /set max_open_positions <n> — batas posisi terbuka";
+const WELCOME_TEXT: &str = "\u{1F44B} Agentic Hyperliquid\n\nPaste a trading-setup card and I'll size it with risk-based position sizing, then ask you to confirm before executing a long/short with SL/TP brackets on Hyperliquid.\n\nExample card:\n\nTrading setup for PENDLE\nDirection\nLONG\nTimeframe\nswing\nRisk : Reward\n2.8 : 1\nConfidence\n8/10\nSL\n$1.25\nEntry\n$1.40\nTP1\n$1.70\n60%\nTP2\n$2.00\n40%\n\nAfter you paste it: pick a risk profile (Conservative/Moderate/Aggressive), then Confirm Limit or Confirm Market -- or Cancel.\n\nCommands: /start, /help, /stats, /account, /closeall, /close <COIN>, /scan <COIN>, /watch, /settings, /set <key> <value>\n\n/closeall — tutup semua posisi\n/close <COIN> — tutup satu posisi (contoh: /close BTC)\n/scan <COIN> — analisa manual 1 coin via Neurobro di poll berikutnya (bypass cooldown & kill-switch)\n/watch — lihat watchlist & status auto-scalp · /watch add <COIN> · /watch remove <COIN>\n/set auto_scalp_enabled on|off — nyalakan/matikan auto-scalp · /set max_open_positions <n> — batas posisi terbuka";
 
 pub const CB_CONSERVATIVE: &str = "profile:conservative";
 pub const CB_MODERATE: &str = "profile:moderate";
@@ -695,6 +695,8 @@ pub struct BotContext<E: Exchange + 'static> {
     pub settings: Arc<Mutex<Settings>>,
     pub settings_store: Arc<SettingsStore>,
     pub triggers: Arc<crate::trigger_store::TriggerStore>,
+    /// Queue of manual `/scan <COIN>` requests drained by the scraper's `/manual-scans` poll.
+    pub manual_scans: Arc<crate::manual_scan_store::ManualScanStore>,
     pub http: reqwest::Client,
     /// Coin (upper-cased) → cancel signal for an in-flight resting-limit fill-wait.
     /// Lets the cancel button signal the `execute_plan` loop that owns the order id.
@@ -983,6 +985,34 @@ async fn on_message<E: Exchange + 'static>(
                         bot.send_message(message.chat.id, error_message).await?;
                     }
                 }
+            }
+        }
+        return Ok(());
+    }
+
+    // /scan <COIN> — queue a one-off manual analysis. The scraper drains the queue on its
+    // next poll and runs it bypassing the per-coin cooldown and the auto-scalp kill-switch
+    // (a manual override); the confidence, position-cap and margin gates still apply.
+    if first_command_word(text) == "/scan" {
+        let coin_arg = text.split_whitespace().nth(1).map(|c| c.to_uppercase());
+        let coin = match coin_arg {
+            Some(coin) if !coin.is_empty() => coin,
+            _ => {
+                bot.send_message(message.chat.id, "Pakai: /scan <COIN>  (contoh: /scan PENDLE)").await?;
+                return Ok(());
+            }
+        };
+        match context.manual_scans.enqueue(&coin) {
+            Ok(_) => {
+                bot.send_message(
+                    message.chat.id,
+                    format!("🔍 {coin} masuk antrian scan manual — scraper akan analisa di poll berikutnya (bypass cooldown & kill-switch)."),
+                )
+                .await?;
+            }
+            Err(error) => {
+                tracing::warn!(%error, %coin, "failed to enqueue manual scan");
+                bot.send_message(message.chat.id, format!("Gagal antri scan {coin}: {error}")).await?;
             }
         }
         return Ok(());
@@ -1590,6 +1620,9 @@ pub async fn run<E: Exchange + 'static>(
     let seeded = settings_store.load(Settings::from_config(&config))?;
     // Single shared TriggerStore — BotContext and run_trigger_monitor both use this Arc.
     let trigger_store = Arc::new(crate::trigger_store::TriggerStore::open(&journal_path)?);
+    // Manual-scan queue: /scan enqueues here, the scraper drains it via /manual-scans. Same
+    // SQLite file as the journal/settings (separate connection + table).
+    let manual_scan_store = Arc::new(crate::manual_scan_store::ManualScanStore::open(&journal_path)?);
     let context: Arc<BotContext<E>> = Arc::new(BotContext {
         config,
         exchange,
@@ -1598,6 +1631,7 @@ pub async fn run<E: Exchange + 'static>(
         settings: Arc::new(Mutex::new(seeded)),
         settings_store,
         triggers: trigger_store.clone(),
+        manual_scans: manual_scan_store,
         http,
         pending_fills: Arc::new(Mutex::new(HashMap::new())),
     });

@@ -3,6 +3,7 @@ mod config;
 mod hyperliquid;
 mod journal;
 mod llm_parser;
+mod manual_scan_store;
 mod monitor;
 mod parser;
 mod risk;

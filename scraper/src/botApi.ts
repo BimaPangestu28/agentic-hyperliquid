@@ -58,6 +58,18 @@ export class BotApi {
   }
 
   /**
+   * Drains the bot's manual-scan queue (coins requested via the Telegram `/scan` command).
+   * Each returned coin is handed out exactly once — the endpoint marks them processed — so
+   * a coin must be acted on this cycle or the request is lost. Returns upper-cased symbols.
+   */
+  async getManualScans(): Promise<string[]> {
+    const res = await this.request("/manual-scans");
+    if (!res.ok) throw new Error(`manual-scans ${res.status}`);
+    const j = await res.json() as any;
+    return ((j.coins as string[]) ?? []).map((coin) => String(coin).toUpperCase());
+  }
+
+  /**
    * Sends a setup to the bot's `/execute` endpoint.
    *
    * On rejection the endpoint returns a JSON body `{ ok: false, reason, ... }`
@@ -66,13 +78,15 @@ export class BotApi {
    * can report the actual cause instead of a bare status code.
    *
    * @param setup - The trade setup parsed from a Neurobro analysis.
+   * @param manual - When true, flags an explicit /scan request so the bot bypasses the
+   *   auto-scalp kill-switch (other gates still apply).
    * @returns Whether it succeeded, the HTTP status, and the parsed error body on failure.
    */
-  async execute(setup: Setup): Promise<{ ok: boolean; status: number; error?: ExecuteError }> {
+  async execute(setup: Setup, manual = false): Promise<{ ok: boolean; status: number; error?: ExecuteError }> {
     const body = JSON.stringify({
       coin: setup.coin, direction: setup.direction, entry: setup.entry,
       stop_loss: setup.stopLoss, take_profit: setup.takeProfit,
-      confidence: setup.confidence, thesis: setup.thesis,
+      confidence: setup.confidence, thesis: setup.thesis, manual,
     });
     const res = await this.request("/execute", { method: "POST", body });
     if (res.ok) return { ok: true, status: res.status };
