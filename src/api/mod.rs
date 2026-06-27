@@ -290,7 +290,15 @@ async fn execute(
         leverage: &settings.leverage,
         asset_meta: &asset_meta,
     })
-    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+    .map_err(|error| {
+        // Log the concrete sizing rejection (wrong stop side, below-min leg, leverage cap,
+        // …) — without this a 422 is opaque in the pod logs.
+        tracing::warn!(
+            coin = %setup.coin, entry = setup.entry, stop = setup.stop_loss, tp = req.take_profit,
+            "auto-scalp sizing rejected: {error}"
+        );
+        StatusCode::UNPROCESSABLE_ENTITY
+    })?;
 
     // Execute: market entry + SL/TP bracket, no confirm.
     crate::telegram::execute_plan(
@@ -302,7 +310,17 @@ async fn execute(
         &crate::telegram::NoopReporter,
     )
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|error| {
+        // The Hyperliquid order placement (leverage / market entry / bracket) failed. This
+        // is the LINK-style 500 — surface the underlying exchange error instead of dropping
+        // it, so the cause (tick size, min notional, margin, TP side, …) is visible.
+        tracing::error!(
+            coin = %setup.coin, size = plan.size, entry = plan.entry,
+            stop = plan.stop_loss.price, leverage = plan.leverage,
+            "auto-scalp execution failed: {error:#}"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Notify via Telegram (best-effort: individual send failures are swallowed).
     use teloxide::prelude::Requester;
