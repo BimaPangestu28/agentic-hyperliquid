@@ -9,7 +9,7 @@ use axum::{
     extract::State,
     http::{header::AUTHORIZATION, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -218,10 +218,58 @@ struct ExecuteRequest {
     thesis: String,
 }
 
+/// Error returned by the [`execute`] handler.
+///
+/// Carries a machine-readable `reason` (and, where useful, contextual fields)
+/// in the JSON body so the caller can tell *which* gate rejected the request.
+/// A bare `409 CONFLICT` is ambiguous between the kill-switch and the position
+/// cap; this lets the scraper report the actual cause instead of guessing.
+struct ExecuteError {
+    status: StatusCode,
+    body: serde_json::Value,
+}
+
+impl ExecuteError {
+    /// Builds an error whose body is `{ "ok": false, "reason": <reason> }`.
+    fn reason(status: StatusCode, reason: &str) -> Self {
+        Self {
+            status,
+            body: serde_json::json!({ "ok": false, "reason": reason }),
+        }
+    }
+
+    /// Builds an error with a caller-supplied JSON body (for extra context such
+    /// as the open/max counts on a position-cap rejection).
+    fn detailed(status: StatusCode, body: serde_json::Value) -> Self {
+        Self { status, body }
+    }
+}
+
+/// Lets `?` convert the bare `StatusCode` returned by infrastructure failures
+/// (DB/exchange errors mapped via `map_err`/`ok_or`) into an [`ExecuteError`]
+/// with a generic reason derived from the status.
+impl From<StatusCode> for ExecuteError {
+    fn from(status: StatusCode) -> Self {
+        let reason = match status {
+            StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
+            StatusCode::UNPROCESSABLE_ENTITY => "unprocessable",
+            StatusCode::BAD_REQUEST => "bad_request",
+            _ => "error",
+        };
+        Self::reason(status, reason)
+    }
+}
+
+impl IntoResponse for ExecuteError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
 async fn execute(
     State(state): State<ApiState>,
     Json(req): Json<ExecuteRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ExecuteError> {
     // Load current settings from the DB.
     let store = crate::settings::SettingsStore::open(&state.db_path)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -231,11 +279,14 @@ async fn execute(
 
     // Gate 1: master kill-switch.
     if !settings.auto_scalp_enabled {
-        return Err(StatusCode::CONFLICT);
+        return Err(ExecuteError::reason(StatusCode::CONFLICT, "kill_switch"));
     }
     // Gate 2: confidence threshold.
     if req.confidence < 7 {
-        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        return Err(ExecuteError::reason(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "low_confidence",
+        ));
     }
     // Gate 3: position cap.
     let open_positions = state
@@ -244,14 +295,22 @@ async fn execute(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if open_positions.len() as u32 >= settings.max_open_positions {
-        return Err(StatusCode::CONFLICT);
+        return Err(ExecuteError::detailed(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "ok": false,
+                "reason": "position_cap",
+                "open": open_positions.len(),
+                "max": settings.max_open_positions,
+            }),
+        ));
     }
 
     // Build the TradeSetup (single TP, 100% allocation).
     let direction = match req.direction.to_lowercase().as_str() {
         "long" => crate::parser::Direction::Long,
         "short" => crate::parser::Direction::Short,
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => return Err(ExecuteError::reason(StatusCode::BAD_REQUEST, "bad_direction")),
     };
     let setup = crate::parser::TradeSetup {
         coin: req.coin.to_uppercase(),
@@ -315,7 +374,15 @@ async fn execute(
             coin = %setup.coin, required_margin = plan.margin, free_collateral,
             "auto-scalp skipped: insufficient free collateral (account near capacity)"
         );
-        return Err(StatusCode::CONFLICT);
+        return Err(ExecuteError::detailed(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "ok": false,
+                "reason": "insufficient_margin",
+                "required_margin": plan.margin,
+                "free_collateral": free_collateral,
+            }),
+        ));
     }
 
     // Execute: market entry + SL/TP bracket, no confirm.
@@ -464,6 +531,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["reason"].as_str().unwrap(), "insufficient_margin");
     }
 
     fn state_with_positions(open_positions: Vec<crate::hyperliquid::OpenPosition>) -> ApiState {
@@ -883,6 +953,14 @@ mod tests {
         )
     }
 
+    /// Parses the JSON body of an `/execute` rejection and returns its `reason`,
+    /// so tests can assert *which* gate fired rather than only the status code.
+    async fn rejection_reason(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["reason"].as_str().unwrap_or_default().to_string()
+    }
+
     #[tokio::test]
     async fn execute_rejected_when_auto_scalp_disabled() {
         // state_with leaves auto_scalp_enabled at the seed default (false).
@@ -900,6 +978,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT); // 409 kill-switch
+        assert_eq!(rejection_reason(res).await, "kill_switch");
     }
 
     #[tokio::test]
@@ -920,5 +999,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY); // 422 conf<7
+        assert_eq!(rejection_reason(res).await, "low_confidence");
+    }
+
+    #[tokio::test]
+    async fn execute_rejected_at_position_cap_reports_open_and_max() {
+        // Auto-scalp on, but open positions already at the cap → 409 position_cap.
+        let mut seed = crate::settings::sample();
+        seed.auto_scalp_enabled = true;
+        seed.max_open_positions = 1;
+        let mock = MockExchange::with_equity(1000.0);
+        mock.set_positions(vec![crate::hyperliquid::OpenPosition {
+            coin: "BTC".into(),
+            direction: "long".into(),
+            size: 0.1,
+            entry_px: 60000.0,
+            mark_px: 60000.0,
+            unrealized_pnl: 0.0,
+            leverage: 10.0,
+            notional: 6000.0,
+        }]);
+        let state = ApiState {
+            exchange: Arc::new(mock),
+            db_path: ":memory:".into(),
+            token: "t".into(),
+            settings_seed: seed,
+            telegram_bot_token: "test-token".into(),
+            allowed_user_ids: vec![1],
+        };
+        let res = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(execute_body(8)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT); // 409 position cap
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["reason"].as_str().unwrap(), "position_cap");
+        assert_eq!(json["open"].as_u64().unwrap(), 1);
+        assert_eq!(json["max"].as_u64().unwrap(), 1);
     }
 }

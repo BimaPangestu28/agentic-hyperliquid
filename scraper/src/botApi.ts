@@ -3,6 +3,20 @@ import type { Setup } from "./extract.js";
 
 export interface OpenPosition { coin: string }
 
+/**
+ * Body returned by `/execute` when a request is rejected. `reason` identifies
+ * which gate fired; the remaining fields carry context for specific reasons
+ * (open/max for `position_cap`, required/free for `insufficient_margin`).
+ */
+export interface ExecuteError {
+  ok: false;
+  reason?: string;
+  open?: number;
+  max?: number;
+  required_margin?: number;
+  free_collateral?: number;
+}
+
 // Hard cap per request so a dead bot API (or a tunnel whose upstream is down) fails fast
 // with a clear error instead of hanging the whole loop forever — the SSH forward keeps the
 // local port open even when nothing answers behind it, so an un-timed fetch never returns.
@@ -43,13 +57,27 @@ export class BotApi {
     return arr.map((p: any) => ({ coin: String(p.coin).toUpperCase() }));
   }
 
-  async execute(setup: Setup): Promise<{ ok: boolean; status: number }> {
+  /**
+   * Sends a setup to the bot's `/execute` endpoint.
+   *
+   * On rejection the endpoint returns a JSON body `{ ok: false, reason, ... }`
+   * identifying which gate fired (kill_switch, position_cap, insufficient_margin,
+   * low_confidence, bad_direction). The body is surfaced via `error` so callers
+   * can report the actual cause instead of a bare status code.
+   *
+   * @param setup - The trade setup parsed from a Neurobro analysis.
+   * @returns Whether it succeeded, the HTTP status, and the parsed error body on failure.
+   */
+  async execute(setup: Setup): Promise<{ ok: boolean; status: number; error?: ExecuteError }> {
     const body = JSON.stringify({
       coin: setup.coin, direction: setup.direction, entry: setup.entry,
       stop_loss: setup.stopLoss, take_profit: setup.takeProfit,
       confidence: setup.confidence, thesis: setup.thesis,
     });
     const res = await this.request("/execute", { method: "POST", body });
-    return { ok: res.ok, status: res.status };
+    if (res.ok) return { ok: true, status: res.status };
+    let error: ExecuteError | undefined;
+    try { error = await res.json() as ExecuteError; } catch { /* non-JSON body — leave undefined */ }
+    return { ok: false, status: res.status, error };
   }
 }

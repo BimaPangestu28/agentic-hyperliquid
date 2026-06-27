@@ -1,4 +1,4 @@
-import type { OpenPosition, BotApi } from "./botApi.js";
+import type { OpenPosition, BotApi, ExecuteError } from "./botApi.js";
 import type { Page } from "playwright";
 import type { Config } from "./config.js";
 import { extractSetup } from "./extract.js";
@@ -24,6 +24,27 @@ export function freeCoins(
     .filter((c) => !held.has(c))
     .filter((c) => (cooldownUntil.get(c) ?? 0) <= now);
   return eligible.slice(0, slots);
+}
+
+/**
+ * Renders a human-readable Indonesian explanation for an `/execute` rejection,
+ * so the Telegram alert names the gate that fired (kill-switch, cap, margin, …)
+ * instead of a bare HTTP status the operator has to guess at.
+ *
+ * @param status - The HTTP status returned by the bot API.
+ * @param error - The parsed `{ reason, ... }` body, when present.
+ * @returns A short phrase describing why the trade was rejected.
+ */
+export function describeExecuteError(status: number, error?: ExecuteError): string {
+  switch (error?.reason) {
+    case "kill_switch": return "auto-scalp OFF (kill-switch)";
+    case "position_cap": return `posisi penuh (${error.open}/${error.max})`;
+    case "insufficient_margin":
+      return `margin kurang (butuh $${error.required_margin?.toFixed(2)}, free $${error.free_collateral?.toFixed(2)})`;
+    case "low_confidence": return "confidence < 7";
+    case "bad_direction": return "arah trade invalid";
+    default: return error?.reason ?? `HTTP ${status}`;
+  }
 }
 
 export function passesSlippage(mark: number, entry: number, maxDeviation: number): boolean {
@@ -156,7 +177,8 @@ export async function runOnce(deps: RunDeps): Promise<void> {
         cooldown(deps, coin);
         await notifyTelegram(deps.cfg, `✅ ${coin} ${direction} dieksekusi — entry ${setup.entry}, SL ${setup.stopLoss}, TP ${setup.takeProfit} (conf ${setup.confidence}/10) · cooldown ${cooldownMins}m`);
       } else {
-        await notifyTelegram(deps.cfg, `❌ ${coin} ${direction}: eksekusi gagal (${result.status}) — cooldown ${cooldownMins}m`);
+        const why = describeExecuteError(result.status, result.error);
+        await notifyTelegram(deps.cfg, `❌ ${coin} ${direction}: eksekusi gagal (${result.status}: ${why}) — cooldown ${cooldownMins}m`);
         cooldown(deps, coin);
       }
     } catch (error) {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { freeCoins, passesSlippage } from "../src/loop.js";
+import { freeCoins, passesSlippage, describeExecuteError } from "../src/loop.js";
 
 describe("freeCoins", () => {
   it("excludes coins with positions, cooldown, and respects the cap", () => {
@@ -24,5 +24,20 @@ describe("passesSlippage", () => {
     expect(passesSlippage(100, NaN, 0.01)).toBe(false);
     expect(passesSlippage(Infinity, 100, 0.01)).toBe(false);
     expect(passesSlippage(100, 0, 0.01)).toBe(false);
+  });
+});
+
+describe("describeExecuteError", () => {
+  it("names each gate and includes context for cap and margin", () => {
+    expect(describeExecuteError(409, { ok: false, reason: "kill_switch" }))
+      .toBe("auto-scalp OFF (kill-switch)");
+    expect(describeExecuteError(409, { ok: false, reason: "position_cap", open: 10, max: 10 }))
+      .toBe("posisi penuh (10/10)");
+    expect(describeExecuteError(409, { ok: false, reason: "insufficient_margin", required_margin: 30.5, free_collateral: 1.2 }))
+      .toBe("margin kurang (butuh $30.50, free $1.20)");
+    expect(describeExecuteError(422, { ok: false, reason: "low_confidence" })).toBe("confidence < 7");
+  });
+  it("falls back to the raw status when no parseable body is present", () => {
+    expect(describeExecuteError(502, undefined)).toBe("HTTP 502");
   });
 });
