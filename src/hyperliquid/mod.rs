@@ -355,6 +355,28 @@ pub mod mock {
         assert_eq!(super::usdc_total(&balances).unwrap(), 0.0);
     }
 
+    #[test]
+    fn usdc_available_subtracts_hold() {
+        let balances = vec![hyperliquid_rust_sdk::UserTokenBalance {
+            coin: "USDC".into(),
+            hold: "43.95".into(),
+            total: "302.03".into(),
+            entry_ntl: "0.0".into(),
+        }];
+        assert!((super::usdc_available(&balances).unwrap() - 258.08).abs() < 1e-9);
+    }
+
+    #[test]
+    fn usdc_available_clamps_negative_to_zero() {
+        let balances = vec![hyperliquid_rust_sdk::UserTokenBalance {
+            coin: "USDC".into(),
+            hold: "10.0".into(),
+            total: "5.0".into(),
+            entry_ntl: "0.0".into(),
+        }];
+        assert_eq!(super::usdc_available(&balances).unwrap(), 0.0);
+    }
+
     #[tokio::test]
     async fn mock_records_entry_and_trigger_orders() {
         let exchange = MockExchange {
@@ -554,6 +576,29 @@ fn usdc_total(balances: &[hyperliquid_rust_sdk::UserTokenBalance]) -> anyhow::Re
     }
 }
 
+/// Free USDC collateral in the spot balance: `total - hold`, where `hold` is the amount
+/// already reserved to back open perp positions and resting orders. In unified-account
+/// mode Hyperliquid auto-draws spot USDC to margin perps, so this — not the perp
+/// clearinghouse `withdrawable` (which reads ~0, since only the in-use margin sits in the
+/// perp sub-account) — is the collateral actually available to open a new position.
+/// Clamped at 0 so a transient `hold > total` never yields a negative figure.
+fn usdc_available(balances: &[hyperliquid_rust_sdk::UserTokenBalance]) -> anyhow::Result<f64> {
+    match balances.iter().find(|b| b.coin.eq_ignore_ascii_case("USDC")) {
+        Some(b) => {
+            let total = b
+                .total
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("cannot parse USDC total {:?}: {e}", b.total))?;
+            let hold = b
+                .hold
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("cannot parse USDC hold {:?}: {e}", b.hold))?;
+            Ok((total - hold).max(0.0))
+        }
+        None => Ok(0.0),
+    }
+}
+
 /// Live connection to Hyperliquid via the SDK.
 ///
 /// # Deviations from the brief's SDK sketch
@@ -660,15 +705,27 @@ impl Exchange for HyperliquidExchange {
         }
     }
 
-    /// Reads `user_state.withdrawable` — the exchange's own free-collateral figure
-    /// (account value minus margin already used by open positions). Used to reject a new
-    /// order up-front when there is no room, instead of letting it 500 at the exchange.
+    /// Free collateral available to open a new position.
+    ///
+    /// In **unified-account mode** collateral lives in SPOT USDC (Hyperliquid auto-draws it
+    /// to margin perps), so the free figure is spot USDC `total - hold` — the perp
+    /// clearinghouse `withdrawable` reads ~0 because only in-use margin sits in the perp
+    /// sub-account, which would wrongly block trades while plenty of spot USDC is free.
+    ///
+    /// In **standard mode** the perp account holds the collateral directly, so
+    /// `user_state.withdrawable` (account value minus margin used, with the exchange's own
+    /// maintenance-margin buffer) is the correct figure.
     async fn free_collateral(&self) -> anyhow::Result<f64> {
-        let state = self.info.user_state(self.address).await?;
-        state
-            .withdrawable
-            .parse::<f64>()
-            .map_err(|e| anyhow::anyhow!("cannot parse withdrawable: {e}"))
+        if self.unified {
+            let balances = self.info.user_token_balances(self.address).await?;
+            usdc_available(&balances.balances)
+        } else {
+            let state = self.info.user_state(self.address).await?;
+            state
+                .withdrawable
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("cannot parse withdrawable: {e}"))
+        }
     }
 
     /// Returns sizing metadata for `coin`, or `Ok(None)` when the coin is not

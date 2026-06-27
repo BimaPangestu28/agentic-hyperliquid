@@ -221,6 +221,10 @@ async fn manual_scans(State(state): State<ApiState>) -> Result<Json<ManualScansR
     Ok(Json(ManualScansResponse { coins }))
 }
 
+/// How long an auto-scalp LIMIT entry may rest before it's cancelled as unfilled. Kept
+/// short: a scalp entry is time-sensitive, and the scraper re-scans on its own interval.
+const AUTO_SCALP_FILL_TIMEOUT_SECS: u64 = 60;
+
 #[derive(serde::Deserialize)]
 struct ExecuteRequest {
     coin: String,
@@ -405,12 +409,16 @@ async fn execute(
         ));
     }
 
-    // Execute: market entry + SL/TP bracket, no confirm.
+    // Execute: LIMIT entry at the setup price + SL/TP bracket, no confirm. A limit (maker)
+    // matches the manual SETUP flow — exact entry, cheaper fees, no market slippage. If it
+    // doesn't fill within AUTO_SCALP_FILL_TIMEOUT_SECS the order is cancelled and no
+    // position is opened (a stale scalp entry shouldn't rest — the scraper retries later).
+    // NOT settings.entry_fill_timeout_secs, which is the manual flow's (much longer) value.
     crate::telegram::execute_plan(
         state.exchange.as_ref(),
         &plan,
-        false,
-        settings.entry_fill_timeout_secs,
+        true,
+        AUTO_SCALP_FILL_TIMEOUT_SECS,
         std::sync::Arc::new(tokio::sync::Notify::new()),
         &crate::telegram::NoopReporter,
     )
