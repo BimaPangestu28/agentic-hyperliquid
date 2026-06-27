@@ -13,11 +13,40 @@ export async function isNeurobroReady(page: Page, cfg: Config): Promise<boolean>
   if (!page.url().startsWith(cfg.neurobroUrl)) {
     await page.goto(cfg.neurobroUrl, { waitUntil: "domcontentloaded" });
   }
+  // Neurobro shows a full-screen "Initializing / Setting up your secure session" gate
+  // (a Cloudflare-style handshake) before the app loads. Give it time to resolve on its
+  // own — pressing keys does nothing to it. Only once it clears is the composer real.
+  try {
+    await page.waitForFunction(() => {
+      const overlay = document.querySelector("div.fixed.inset-0");
+      if (!overlay || (overlay as HTMLElement).offsetParent === null) return true; // gone
+      return !/secure session|initializing/i.test(overlay.textContent || "");
+    }, { timeout: 60_000 });
+  } catch {
+    await dumpDebugShot(page, "secure-session-gate");
+    return false; // still gated after 60s → walled (likely Cloudflare on the datacenter IP)
+  }
   try {
     await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 20_000 });
     return true;
   } catch {
+    await dumpDebugShot(page, "no-composer");
     return false;
+  }
+}
+
+/**
+ * Best-effort full-page screenshot to NEUROBRO_DEBUG_SHOT (default /data/neurobro-debug.png)
+ * so the operator can see exactly what blocked the session (Cloudflare challenge, login,
+ * etc.). Never throws.
+ */
+async function dumpDebugShot(page: Page, label: string): Promise<void> {
+  try {
+    const path = process.env.NEUROBRO_DEBUG_SHOT ?? "/data/neurobro-debug.png";
+    await page.screenshot({ path, fullPage: false });
+    console.warn(`Neurobro blocked (${label}) — wrote debug screenshot to ${path}`);
+  } catch {
+    // ignore — diagnostics are optional
   }
 }
 
