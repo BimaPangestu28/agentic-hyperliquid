@@ -185,16 +185,28 @@ impl Journal {
         Ok(total)
     }
 
-    /// Returns the SL + TP prices of the most recent trade for `coin`
-    /// (case-insensitive), or `Ok(None)` if no trade was journaled for it.
+    /// Returns the SL + TP prices of the trade for `coin` (case-insensitive) that was
+    /// the most recently opened **at or before** `at_or_before_ms`, or `Ok(None)` if none.
     ///
-    /// Used by the fill monitor to label which bracket leg closed a position.
-    pub fn latest_bracket_for_coin(&self, coin: &str) -> anyhow::Result<Option<Bracket>> {
+    /// Used by the fill monitor to label which bracket leg closed a position. Bounding by
+    /// the fill's own timestamp matches the close to the trade that was actually live when
+    /// it happened — not the globally newest trade for the coin, which may have been opened
+    /// by a *later* re-entry and would mislabel the leg (a profit-taking close attributed
+    /// to the re-entry's SL, etc.). `opened_at` is unix seconds; NULL (pre-migration rows)
+    /// is treated as 0 so it always sorts oldest.
+    ///
+    /// Limitation: `opened_at` has second granularity, so a re-entry opened in the *same
+    /// second* as the prior trade's close could still be picked. The scraper's
+    /// post-execute cooldown makes same-coin re-entries that close are spaced well apart,
+    /// so this edge does not arise in practice.
+    pub fn bracket_for_coin_at(&self, coin: &str, at_or_before_ms: i64) -> anyhow::Result<Option<Bracket>> {
+        let at_or_before_secs = at_or_before_ms / 1000;
         let connection = self.connection.lock().unwrap();
         let row = connection.query_row(
             "SELECT stop_loss, tp_prices FROM trades
-             WHERE coin = ?1 COLLATE NOCASE ORDER BY id DESC LIMIT 1",
-            rusqlite::params![coin],
+             WHERE coin = ?1 COLLATE NOCASE AND COALESCE(opened_at, 0) <= ?2
+             ORDER BY COALESCE(opened_at, 0) DESC, id DESC LIMIT 1",
+            rusqlite::params![coin, at_or_before_secs],
             |row| {
                 let stop_loss: f64 = row.get(0)?;
                 let tp_json: Option<String> = row.get(1)?;
@@ -329,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_bracket_for_coin_returns_newest_sl_and_tps() {
+    fn bracket_for_coin_at_returns_sl_and_tps() {
         let journal = Journal::open_in_memory().unwrap();
         let plan = ExecutionPlan {
             coin: "TAO".into(),
@@ -348,12 +360,48 @@ mod tests {
             ],
             warnings: vec![],
         };
-        journal.record(&plan, None, None, None, None, "Moderate", 1_700_000_000).unwrap();
+        let opened_at = 1_700_000_000_i64;
+        journal.record(&plan, None, None, None, None, "Moderate", opened_at).unwrap();
 
-        let bracket = journal.latest_bracket_for_coin("TAO").unwrap().expect("bracket present");
+        // A fill that happens after the entry resolves to that trade's bracket.
+        let bracket = journal
+            .bracket_for_coin_at("TAO", (opened_at + 60) * 1000)
+            .unwrap()
+            .expect("bracket present");
         assert_eq!(bracket.stop_loss, 280.0);
         assert_eq!(bracket.take_profits, vec![340.0, 380.0]);
-        assert!(journal.latest_bracket_for_coin("ETH").unwrap().is_none());
+        assert!(journal.bracket_for_coin_at("ETH", (opened_at + 60) * 1000).unwrap().is_none());
+    }
+
+    #[test]
+    fn bracket_for_coin_at_ignores_a_later_reentry() {
+        // Regression: an old trade's close fill must be labelled against the OLD bracket,
+        // not a re-entry opened after the fill (which previously stole the label).
+        let journal = Journal::open_in_memory().unwrap();
+        let make = |sl: f64, tp: f64| ExecutionPlan {
+            coin: "HYPE".into(),
+            direction: Direction::Short,
+            size: 1.0,
+            entry: 63.5,
+            leverage: 3,
+            notional: 63.5,
+            margin: 21.0,
+            risk_amount: 1.0,
+            liquidation_price: 80.0,
+            stop_loss: BracketLeg { price: sl, size: 1.0 },
+            take_profits: vec![BracketLeg { price: tp, size: 1.0 }],
+            warnings: vec![],
+        };
+        let first_open = 1_700_000_000_i64;
+        let reentry_open = first_open + 200; // opened later, after the first trade's close
+        journal.record(&make(64.5, 62.5), None, None, None, None, "Moderate", first_open).unwrap();
+        journal.record(&make(65.0, 63.0), None, None, None, None, "Moderate", reentry_open).unwrap();
+
+        // A fill timestamped between the two entries must resolve to the FIRST bracket.
+        let fill_ms = (first_open + 100) * 1000;
+        let bracket = journal.bracket_for_coin_at("HYPE", fill_ms).unwrap().expect("bracket present");
+        assert_eq!(bracket.stop_loss, 64.5);
+        assert_eq!(bracket.take_profits, vec![62.5]);
     }
 
     #[test]

@@ -138,13 +138,12 @@ pub async fn run_fill_monitor<E: Exchange + 'static>(
                     continue;
                 }
             }
-            // Labelling uses the NEWEST journaled bracket for the coin. If multiple
-            // trades on the same coin are open concurrently, an older trade's close
-            // may be labelled against the newer trade's SL/TP prices. The PnL value
-            // from `closed_pnl` is always correct; only the leg label (SL/TP) may
-            // be misattributed in that multi-trade scenario.
+            // Label against the bracket of the trade that was live when this fill
+            // happened (most recent entry at or before fill.time_ms), so a re-entry
+            // opened later on the same coin can't steal the label. `closed_pnl` is always
+            // correct; this keeps the leg label (SL/TP) attributed to the right trade.
             let label = journal
-                .latest_bracket_for_coin(&fill.coin)
+                .bracket_for_coin_at(&fill.coin, fill.time_ms)
                 .ok()
                 .flatten()
                 .map(|bracket| classify_close_fill(fill.px, &bracket));
