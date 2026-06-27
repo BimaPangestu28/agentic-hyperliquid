@@ -6,7 +6,9 @@ metadata:
   labels:
     app: neurobro-scraper
 spec:
-  replicas: 1
+  # 0 while the scraper is run locally (`make up`) during testing — two scrapers against
+  # one bot would double-execute the same coins. Set back to 1 to run it in-cluster.
+  replicas: 0
   strategy:
     type: Recreate     # singleton: one scraper at a time; avoids PVC RWO contention
   selector:
