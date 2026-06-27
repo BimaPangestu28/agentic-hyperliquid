@@ -1,0 +1,18 @@
+[Unit]
+Description=SSH tunnel to the Hyperliquid bot API (localhost:8088 -> VPS bot ClusterIP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Edit the two placeholders before installing:
+#   VPS_HOST        = your VPS user@host (e.g. root@your.vps.ip)
+#   BOT_CLUSTER_IP  = the bot Service ClusterIP, from:
+#     ssh VPS_HOST "kubectl -n agentic-hyperliquid get svc bot -o jsonpath='{.spec.clusterIP}'"
+# Requires passwordless SSH (key auth) to the VPS — see README. ServerAlive* keeps the
+# tunnel healthy; ExitOnForwardFailure makes a failed forward exit so systemd restarts it.
+ExecStart=/usr/bin/ssh -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -L 8088:BOT_CLUSTER_IP:8088 VPS_HOST
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

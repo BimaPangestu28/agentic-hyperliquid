@@ -1,0 +1,17 @@
+[Unit]
+Description=Neurobro auto-scalp scraper
+After=bot-tunnel.service network-online.target
+Wants=bot-tunnel.service network-online.target
+
+[Service]
+# Adjust WorkingDirectory if you cloned somewhere other than ~/agentic-hyperliquid.
+WorkingDirectory=%h/agentic-hyperliquid/scraper
+# bash -lc loads your shell profile so node/npm (incl. nvm) are on PATH. entrypoint.sh
+# starts Xvfb on :99 and execs `node --import tsx src/index.ts` — headful Chrome on a
+# virtual display, independent of the desktop session (needs `xvfb`, see README).
+ExecStart=/bin/bash -lc 'exec sh entrypoint.sh'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
