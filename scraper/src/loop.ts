@@ -142,6 +142,9 @@ export async function runOnce(deps: RunDeps): Promise<void> {
         console.log(`[dry-run] would execute`, setup);
         continue;
       }
+      // Log the exact setup sent so per-coin entry/SL/TP mismatches (e.g. a stale card
+      // read from another coin's thread) are visible in the run output, not just on skip.
+      console.log(`${coin}: sending ${setup.direction} entry=${setup.entry} SL=${setup.stopLoss} TP=${setup.takeProfit} conf=${setup.confidence}`);
       const result = await deps.api.execute(setup);
       console.log(`${coin}: execute → ${result.status} ok=${result.ok}`);
       const direction = setup.direction.toUpperCase();

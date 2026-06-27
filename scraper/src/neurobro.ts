@@ -51,15 +51,21 @@ async function dumpDebugShot(page: Page, label: string): Promise<void> {
 }
 
 /**
- * Dismisses a blocking modal/dialog overlay that intercepts clicks on the composer or
- * new-chat controls. Neurobro renders shadcn/Radix dialogs as a full-screen
- * `fixed inset-0` backdrop (z-[9999], backdrop-blur); these close on Escape. Falls back
- * to a visible close/confirm button. Logs the overlay's text once so an unexpected
- * dialog (announcement, quota notice, etc.) can be identified from the pod logs.
- * Returns true when nothing is blocking afterwards.
+ * Dismisses a blocking overlay that intercepts clicks on the composer or new-chat
+ * controls. Two kinds occur:
+ *   1. shadcn/Radix dialogs — a full-screen `fixed inset-0` backdrop (z-[9999],
+ *      backdrop-blur).
+ *   2. An open Radix dropdown/popover menu — it mounts a dismissable layer that makes the
+ *      WHOLE document intercept pointer events ("<html> intercepts pointer events"), so a
+ *      click on anything beneath it silently fails.
+ * Both close on Escape. Falls back to a visible close/confirm button. Logs the overlay's
+ * text once so an unexpected dialog (announcement, quota notice, etc.) can be identified
+ * from the pod logs. Returns true when nothing is blocking afterwards.
  */
 async function dismissOverlay(page: Page): Promise<boolean> {
-  const overlay = page.locator("div.fixed.inset-0").first();
+  const overlay = page
+    .locator('div.fixed.inset-0, [data-radix-popper-content-wrapper], [role="menu"][data-state="open"]')
+    .first();
   for (let attempt = 0; attempt < 3; attempt++) {
     if (!(await overlay.isVisible().catch(() => false))) return true;
     const text = ((await overlay.textContent().catch(() => "")) || "").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -81,6 +87,40 @@ async function dismissOverlay(page: Page): Promise<boolean> {
   return !(await overlay.isVisible().catch(() => false));
 }
 
+/**
+ * Best-effort "new chat" so each cycle starts fresh instead of piling into one
+ * ever-growing thread (which slows the SPA and makes card lookups flaky). Done in-SPA (no
+ * reload) so the Cloudflare session is preserved.
+ *
+ * The control is the sidebar "Chat" entry carrying a plus badge — a button with both a
+ * `lucide-message-square` and a `lucide-plus` svg, and no `aria-haspopup`. (The
+ * `lucide-square-pen` button is a DIFFERENT sidebar menu trigger that only opens a
+ * dropdown; clicking it mounts a dismissable layer that makes the whole document intercept
+ * pointer events, which is why targeting it always timed out.) Never throws: if the button
+ * isn't reachable we reuse the current thread, which is far better than aborting every coin.
+ */
+async function startNewChat(page: Page): Promise<void> {
+  const newChat = page.locator('button:has(svg.lucide-message-square):has(svg.lucide-plus)').first();
+  if (!(await newChat.isVisible().catch(() => false))) return;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // An open Radix popper/menu makes the document intercept pointer events; Escape closes
+    // it. Clear any leftover overlay before each attempt.
+    await page.keyboard.press("Escape").catch(() => {});
+    await dismissOverlay(page);
+    try {
+      await newChat.click({ timeout: 8_000 });
+      await page.waitForTimeout(800);
+      return;
+    } catch (error) {
+      if (attempt === 2) {
+        await dumpDebugShot(page, "new-chat-blocked");
+        const msg = (error as Error).message?.split("\n")[0] ?? String(error);
+        console.warn(`Neurobro new-chat skipped (${msg}) — reusing current thread`);
+      }
+    }
+  }
+}
+
 export async function requestSetup(page: Page, cfg: Config, coin: string, screenshot: Buffer): Promise<string> {
   // Navigate only when not already on Neurobro. Re-issuing goto() every cycle reloads
   // the SPA and re-triggers the Cloudflare challenge; staying on the loaded SPA reuses
@@ -89,29 +129,15 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
     await page.goto(cfg.neurobroUrl, { waitUntil: "domcontentloaded" });
   }
 
-  // A modal/dialog overlay (announcement, quota notice, etc.) can cover the composer and
-  // intercept clicks — dismiss it before interacting with the new-chat control.
+  // A modal/dialog overlay (announcement, quota notice, etc.) or a leftover open dropdown
+  // can cover the composer and intercept clicks — clear it before interacting.
   await dismissOverlay(page);
 
-  // Start a fresh conversation each cycle (the "new chat" square-pen button). Without
-  // this, every cycle piles into one ever-growing thread, which slows the SPA and makes
-  // card lookups flaky. Done in-SPA (no reload) so the Cloudflare session is preserved.
-  const newChat = page.locator('button:has(svg.lucide-square-pen)').first();
-  if (await newChat.isVisible().catch(() => false)) {
-    try {
-      await newChat.click({ timeout: 10_000 });
-    } catch {
-      // An overlay likely re-appeared and intercepted the click — dismiss and retry once.
-      await dismissOverlay(page);
-      try {
-        await newChat.click({ timeout: 10_000 });
-      } catch (error) {
-        await dumpDebugShot(page, "new-chat-blocked");
-        throw error;
-      }
-    }
-    await page.waitForTimeout(800);
-  }
+  // Start a fresh conversation each cycle if a real compose button is present. Best-effort:
+  // if it can't be clicked we fall back to reusing the current thread rather than aborting
+  // the whole coin — the composer wait below is the actual requirement.
+  await startNewChat(page);
+
   await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 30_000 });
 
   // Attach the screenshot directly to the hidden image file input. Neurobro keeps a
@@ -122,30 +148,40 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
   await imageInput.setInputFiles({ name: `${coin}.png`, mimeType: "image/png", buffer: screenshot });
   await page.waitForTimeout(1500); // let the image preview/upload register
 
+  // Count the response tables already on screen BEFORE submitting. When the new-chat reset
+  // is skipped (square-pen not clickable), prior coins' setup tables stay in the same
+  // thread — so we must wait for THIS coin's table to appear *beyond* those. Otherwise the
+  // wait returns instantly on a stale, already-finished table and we'd read the previous
+  // coin's entry (e.g. AVAX inheriting AAVE's entry=95.15).
+  const tablesBefore = await page.evaluate(
+    () => [...document.querySelectorAll("table")].filter((t) => (t as HTMLElement).offsetParent).length,
+  );
+
   // Type the prompt and submit. The composer renders twice (one hidden); pick the
   // visible one — same composer whose image input we set above (both are index 0).
   const input = page.locator('textarea[name="input"]:visible').first();
   await input.fill(PROMPT(coin));
   await input.press("Enter");
 
-  // Wait for the setup table to FINISH streaming. The AI types the response token by
-  // token, so an early read catches a half-filled row (missing columns, literal "**"
-  // markdown). Require: a visible table whose data row has all columns, no streaming
-  // "**", and a rendered "n/10" confidence. Independent of "$" and header language.
+  // Wait for THIS coin's setup table to FINISH streaming. The AI types the response token
+  // by token, so an early read catches a half-filled row (missing columns, literal "**"
+  // markdown). Require: a NEW table (count grew past tablesBefore) whose latest row has all
+  // columns, no streaming "**", and a rendered "n/10" confidence. Independent of "$" and
+  // header language.
   try {
-    await page.waitForFunction(() => {
+    await page.waitForFunction((prevCount) => {
       const tables = [...document.querySelectorAll("table")].filter((t) => (t as HTMLElement).offsetParent);
-      return tables.some((t) => {
-        const headerCount = t.querySelectorAll("thead th").length;
-        const row = t.querySelector("tbody tr");
-        if (!row || headerCount < 4) return false;
-        const cells = [...row.querySelectorAll("td")].map((td) => td.textContent || "");
-        if (cells.length < headerCount) return false;        // every column present
-        const text = cells.join(" ");
-        if (text.includes("**")) return false;               // markdown still streaming
-        return /\d\s*\/\s*10/.test(text);                    // confidence finished rendering
-      });
-    }, { timeout: 150_000 });
+      if (tables.length <= prevCount) return false;          // our response table not added yet
+      const t = tables[tables.length - 1];                   // newest table = this coin's response
+      const headerCount = t.querySelectorAll("thead th").length;
+      const row = t.querySelector("tbody tr");
+      if (!row || headerCount < 4) return false;
+      const cells = [...row.querySelectorAll("td")].map((td) => td.textContent || "");
+      if (cells.length < headerCount) return false;          // every column present
+      const text = cells.join(" ");
+      if (text.includes("**")) return false;                 // markdown still streaming
+      return /\d\s*\/\s*10/.test(text);                      // confidence finished rendering
+    }, tablesBefore, { timeout: 150_000 });
   } catch (error) {
     if (process.env.NEUROBRO_DEBUG_SHOT) {
       const shot = process.env.NEUROBRO_DEBUG_SHOT;

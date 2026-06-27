@@ -31,7 +31,10 @@ async function main(): Promise<void> {
     // form (more context for Neurobro). Match the window size to the viewport for capture.
     viewport: { width: 1920, height: 1080 },
     // Stop announcing automation (drops navigator.webdriver + the automation banner).
-    args: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+    // Pin ozone to X11 so Chrome uses the display in DISPLAY (the Xvfb :99 under `make up`,
+    // or XWayland :0 on a Wayland desktop). Without this, ozone auto-detects WAYLAND_DISPLAY
+    // and hangs under Xvfb because the virtual display is X11-only.
+    args: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080", "--ozone-platform=x11"],
     ignoreDefaultArgs: ["--enable-automation"],
   });
 
