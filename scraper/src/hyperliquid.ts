@@ -9,9 +9,13 @@ import type { Config } from "./config.js";
  */
 export function rangeTabSelectors(range: string): string[] {
   const value = range.trim();
+  // CSS attribute selectors are case-sensitive by default. HL renders the tabs lowercase
+  // (1d, 5d, 1m, …) while the underlying data-name/value casing can differ between builds,
+  // so the `i` flag matches regardless of case — "1d" and "1D" both resolve. Without it a
+  // case mismatch silently falls back to the chart's current range.
   return [
-    `button[data-name="date-range-tab-${value}"]`,
-    `button[value="${value}"]`,
+    `button[data-name="date-range-tab-${value}" i]`,
+    `button[value="${value}" i]`,
   ];
 }
 
