@@ -21,22 +21,26 @@ export interface ExecuteError {
 // with a clear error instead of hanging the whole loop forever — the SSH forward keeps the
 // local port open even when nothing answers behind it, so an un-timed fetch never returns.
 const REQUEST_TIMEOUT_MS = 15_000;
+// /execute blocks while a LIMIT entry waits to fill on the exchange (up to the bot's
+// AUTO_SCALP_FILL_TIMEOUT_SECS), so it needs a longer client timeout than the quick reads —
+// must exceed the bot's fill window plus order/bracket overhead.
+const EXECUTE_TIMEOUT_MS = 35_000;
 
 export class BotApi {
   constructor(private cfg: Config) {}
   private headers() { return { authorization: `Bearer ${this.cfg.botApiToken}`, "content-type": "application/json" }; }
 
   // Wraps fetch with an abort-based timeout and a uniform, actionable error message.
-  private async request(path: string, init?: RequestInit): Promise<Response> {
+  private async request(path: string, init?: RequestInit, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
     try {
       return await fetch(`${this.cfg.botApiUrl}${path}`, {
         ...init,
         headers: this.headers(),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       if (error instanceof Error && error.name === "TimeoutError") {
-        throw new Error(`bot API ${path} no response within ${REQUEST_TIMEOUT_MS}ms (is the tunnel + bot API up?)`);
+        throw new Error(`bot API ${path} no response within ${timeoutMs}ms (is the tunnel + bot API up?)`);
       }
       throw error;
     }
@@ -88,7 +92,7 @@ export class BotApi {
       stop_loss: setup.stopLoss, take_profit: setup.takeProfit,
       confidence: setup.confidence, thesis: setup.thesis, manual,
     });
-    const res = await this.request("/execute", { method: "POST", body });
+    const res = await this.request("/execute", { method: "POST", body }, EXECUTE_TIMEOUT_MS);
     if (res.ok) return { ok: true, status: res.status };
     let error: ExecuteError | undefined;
     try { error = await res.json() as ExecuteError; } catch { /* non-JSON body — leave undefined */ }

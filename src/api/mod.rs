@@ -222,8 +222,10 @@ async fn manual_scans(State(state): State<ApiState>) -> Result<Json<ManualScansR
 }
 
 /// How long an auto-scalp LIMIT entry may rest before it's cancelled as unfilled. Kept
-/// short: a scalp entry is time-sensitive, and the scraper re-scans on its own interval.
-const AUTO_SCALP_FILL_TIMEOUT_SECS: u64 = 60;
+/// short: the /execute call blocks the scraper synchronously while it waits, and a scalp
+/// entry is time-sensitive (the scraper re-scans on its own interval). Must stay under the
+/// scraper's EXECUTE_TIMEOUT_MS so the client doesn't give up before the order resolves.
+const AUTO_SCALP_FILL_TIMEOUT_SECS: u64 = 20;
 
 #[derive(serde::Deserialize)]
 struct ExecuteRequest {
