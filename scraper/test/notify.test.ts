@@ -7,9 +7,10 @@ afterEach(() => server?.close());
 
 function baseCfg() {
   return {
-    botApiUrl: "", botApiToken: "", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "", hlTimeframe: "15m",
+    botApiUrl: "", botApiToken: "", hyperliquidUrl: "", hyperliquidInfoUrl: "", neurobroUrl: "", storageStatePath: "",
+    hlTimeframe: "15m", hlTimeframeHtf: "", atrInterval: "5m", atrPeriod: 14,
     userDataDir: "", headless: true, browserChannel: "chrome",
-    pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004,
+    pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004, minRiskReward: 1.5, maxStopLossPct: 0.03,
     telegramBotToken: "", telegramChatId: "",
     maxAnalysesPerDay: 100, maxAnalysesPerCycle: 1, quotaStatePath: "",
   };

@@ -6,6 +6,57 @@ export interface Setup {
   confidence: number; thesis: string;
 }
 
+export interface ValidateOptions {
+  /** Minimum reward/risk ratio; setups below this are rejected. */
+  minRiskReward: number;
+  /** Maximum stop-loss distance as a fraction of entry (e.g. 0.03 = 3%). */
+  maxStopLossPct: number;
+}
+
+export type ValidationResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Deterministic sanity checks on a parsed setup — never trusts the model's own claims.
+ * Verifies the SL/entry/TP ordering matches the direction, that there is a real
+ * reward:risk, and that the stop distance is plausible for a scalp. Fail-closed: any
+ * violation returns `ok: false` with a short Indonesian reason for the operator alert.
+ *
+ * @param setup - The parsed setup to check.
+ * @param options - Risk guardrails (min RR, max stop distance).
+ * @returns `{ ok: true }` when every guardrail passes, else `{ ok: false, reason }`.
+ */
+export function validateSetup(setup: Setup, options: ValidateOptions): ValidationResult {
+  const { entry, stopLoss, takeProfit, direction } = setup;
+  if (![entry, stopLoss, takeProfit].every(Number.isFinite) || entry <= 0) {
+    return { ok: false, reason: "harga tidak valid" };
+  }
+
+  const longOrdered = stopLoss < entry && entry < takeProfit;
+  const shortOrdered = stopLoss > entry && entry > takeProfit;
+  if (direction === "long" && !longOrdered) {
+    return { ok: false, reason: "LONG butuh SL < entry < TP" };
+  }
+  if (direction === "short" && !shortOrdered) {
+    return { ok: false, reason: "SHORT butuh SL > entry > TP" };
+  }
+
+  const risk = Math.abs(entry - stopLoss);
+  const reward = Math.abs(takeProfit - entry);
+  if (risk === 0) return { ok: false, reason: "stop loss = entry" };
+
+  const riskReward = reward / risk;
+  if (riskReward < options.minRiskReward) {
+    return { ok: false, reason: `RR ${riskReward.toFixed(2)} < ${options.minRiskReward}` };
+  }
+
+  const stopPct = risk / entry;
+  if (stopPct > options.maxStopLossPct) {
+    return { ok: false, reason: `SL ${(stopPct * 100).toFixed(2)}% > ${(options.maxStopLossPct * 100).toFixed(1)}%` };
+  }
+
+  return { ok: true };
+}
+
 /** Parses "$6.38" / "6.38" → 6.38; returns NaN if no number. */
 function money(text: string | undefined): number {
   if (!text) return NaN;

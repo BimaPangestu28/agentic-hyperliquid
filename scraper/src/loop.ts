@@ -1,8 +1,9 @@
 import type { OpenPosition, BotApi, ExecuteError } from "./botApi.js";
 import type { Page } from "playwright";
 import type { Config } from "./config.js";
-import { extractSetup } from "./extract.js";
-import { screenshotChart, readMark } from "./hyperliquid.js";
+import { extractSetup, validateSetup } from "./extract.js";
+import { screenshotCharts, readMark } from "./hyperliquid.js";
+import { fetchMarketContext } from "./marketData.js";
 import { requestSetup as neurobroRequestSetup, isNeurobroReady } from "./neurobro.js";
 import { notifyTelegram } from "./notify.js";
 import { dayKey, readQuota, remaining, recordAnalysis } from "./quota.js";
@@ -131,8 +132,20 @@ export async function runOnce(deps: RunDeps): Promise<void> {
     if (deps.cfg.maxAnalysesPerCycle > 0 && analysesThisCycle >= deps.cfg.maxAnalysesPerCycle) break;
     if (remaining(readQuota(deps.cfg.quotaStatePath, today), deps.cfg.maxAnalysesPerDay) <= 0) break;
     try {
-      const screenshot = await screenshotChart(deps.hlPage, deps.cfg, coin);
-      const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshot);
+      // Capture HTF (trend bias) + LTF (entry timing) when a higher timeframe is configured;
+      // otherwise a single LTF image. Buffers are ordered HTF-first for the prompt.
+      const ranges = deps.cfg.hlTimeframeHtf
+        ? [deps.cfg.hlTimeframeHtf, deps.cfg.hlTimeframe]
+        : [deps.cfg.hlTimeframe];
+      const screenshots = await screenshotCharts(deps.hlPage, deps.cfg, coin, ranges);
+      // Ground the prompt in real numbers: live mark (off the page) + recent ATR (public API).
+      const preMark = await readMark(deps.hlPage);
+      const market = await fetchMarketContext(coin, deps.cfg, deps.now());
+      const responseHtml = await neurobroRequestSetup(deps.nbPage, deps.cfg, coin, screenshots, {
+        markPrice: preMark,
+        atrPercent: market.atrPercent,
+        multiTimeframe: ranges.length > 1,
+      });
       recordAnalysis(deps.cfg.quotaStatePath, today); // an analysis was spent the moment Neurobro responded
       analysesThisCycle += 1;
       const setup = extractSetup(responseHtml, coin);
@@ -140,6 +153,18 @@ export async function runOnce(deps: RunDeps): Promise<void> {
       if (!setup) {
         console.warn(`${coin}: no parseable setup — skip`);
         await notifyTelegram(deps.cfg, `🔎 ${coin}: Neurobro nggak kasih setup yang kebaca — skip (cooldown ${cooldownMins}m)`);
+        cooldown(deps, coin);
+        continue;
+      }
+      // Deterministic guardrail: reject setups whose own numbers are inconsistent (wrong
+      // SL/TP ordering, RR below floor, stop too wide) before spending any execution call.
+      const validation = validateSetup(setup, {
+        minRiskReward: deps.cfg.minRiskReward,
+        maxStopLossPct: deps.cfg.maxStopLossPct,
+      });
+      if (!validation.ok) {
+        console.log(`${coin}: setup ditolak — ${validation.reason}`);
+        await notifyTelegram(deps.cfg, `🔎 ${coin}: setup ditolak (${validation.reason}) — skip (cooldown ${cooldownMins}m)`);
         cooldown(deps, coin);
         continue;
       }

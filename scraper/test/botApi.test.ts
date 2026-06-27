@@ -19,7 +19,7 @@ function stub(handler: (url: string, body: string) => { status: number; json: un
   });
 }
 
-const cfg = (url: string) => ({ botApiUrl: url, botApiToken: "t", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "", hlTimeframe: "15m", userDataDir: "", headless: true, browserChannel: "chrome", pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004, telegramBotToken: "", telegramChatId: "", maxAnalysesPerDay: 100, maxAnalysesPerCycle: 1, quotaStatePath: "" });
+const cfg = (url: string) => ({ botApiUrl: url, botApiToken: "t", hyperliquidUrl: "", neurobroUrl: "", storageStatePath: "", hlTimeframe: "15m", hlTimeframeHtf: "", hyperliquidInfoUrl: "", atrInterval: "5m", atrPeriod: 14, userDataDir: "", headless: true, browserChannel: "chrome", pollIntervalSecs: 60, cooldownSecs: 300, maxDeviation: 0.004, minRiskReward: 1.5, maxStopLossPct: 0.03, telegramBotToken: "", telegramChatId: "", maxAnalysesPerDay: 100, maxAnalysesPerCycle: 1, quotaStatePath: "" });
 
 describe("BotApi", () => {
   it("getWatchlist parses the response", async () => {

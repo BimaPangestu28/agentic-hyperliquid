@@ -40,14 +40,37 @@ async function selectChartRange(page: Page, range: string): Promise<boolean> {
   return false;
 }
 
-export async function screenshotChart(page: Page, cfg: Config, coin: string): Promise<Buffer> {
+/**
+ * Captures one viewport screenshot per requested date-range, in order. Used to send
+ * Neurobro a higher-timeframe (trend bias) and lower-timeframe (entry timing) view of the
+ * same coin. Navigates once, then switches range + recaptures for each entry, so the
+ * returned buffers line up 1:1 with `ranges`.
+ *
+ * @param page - The Hyperliquid browser page.
+ * @param cfg - Scraper config (base URL).
+ * @param coin - Perp symbol to open (e.g. "BTC").
+ * @param ranges - TradingView date-range tab values, in capture order (e.g. ["5D","1D"]).
+ * @returns One screenshot buffer per range, in the same order.
+ */
+export async function screenshotCharts(page: Page, cfg: Config, coin: string, ranges: string[]): Promise<Buffer[]> {
   // domcontentloaded, not networkidle: HL streams live prices over a websocket that
   // never goes idle, so networkidle would always hit the timeout. The explicit waits
   // below give the chart time to render.
   await page.goto(`${cfg.hyperliquidUrl}/trade/${coin}`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(4000); // let the chart canvas render
-  await selectChartRange(page, cfg.hlTimeframe); // set the date range (e.g. 1D = 1-min candles, 1 day) before capture
-  return await page.screenshot({ fullPage: false }); // viewport screenshot (chart + book + price)
+  const shots: Buffer[] = [];
+  for (const range of ranges) {
+    await selectChartRange(page, range); // set the date range (e.g. 1D = 1-min candles, 1 day) before capture
+    await page.waitForTimeout(800); // let the candles settle after the range switch
+    shots.push(await page.screenshot({ fullPage: false })); // viewport screenshot (chart + book + price)
+  }
+  return shots;
+}
+
+/** Single-range convenience wrapper around {@link screenshotCharts}. */
+export async function screenshotChart(page: Page, cfg: Config, coin: string): Promise<Buffer> {
+  const [shot] = await screenshotCharts(page, cfg, coin, [cfg.hlTimeframe]);
+  return shot;
 }
 
 export async function readMark(page: Page): Promise<number> {

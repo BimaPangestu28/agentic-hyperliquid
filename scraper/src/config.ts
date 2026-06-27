@@ -1,8 +1,11 @@
 export interface Config {
   botApiUrl: string; botApiToken: string;
-  hyperliquidUrl: string; neurobroUrl: string; storageStatePath: string; hlTimeframe: string;
+  hyperliquidUrl: string; hyperliquidInfoUrl: string; neurobroUrl: string; storageStatePath: string;
+  hlTimeframe: string; hlTimeframeHtf: string;
+  atrInterval: string; atrPeriod: number;
   userDataDir: string; headless: boolean; browserChannel: string;
   pollIntervalSecs: number; cooldownSecs: number; maxDeviation: number;
+  minRiskReward: number; maxStopLossPct: number;
   telegramBotToken: string; telegramChatId: string;
   maxAnalysesPerDay: number; maxAnalysesPerCycle: number; quotaStatePath: string;
 }
@@ -34,10 +37,21 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     botApiUrl: required(env, "BOT_API_URL"),
     botApiToken: required(env, "BOT_API_TOKEN"),
     hyperliquidUrl: env.HYPERLIQUID_URL ?? "https://app.hyperliquid.xyz",
+    // Public, auth-free info endpoint used to fetch recent candles for a volatility (ATR)
+    // hint injected into the Neurobro prompt. Best-effort: a failure just omits the hint.
+    hyperliquidInfoUrl: env.HYPERLIQUID_INFO_URL ?? "https://api.hyperliquid.xyz/info",
     // TradingView date-range tab the scraper clicks before screenshotting for Neurobro.
     // "1D" = one day of 1-minute candles (good for scalping). Matches the button's
-    // value / data-name="date-range-tab-<VALUE>" (e.g. 1D, 5D, 1M).
+    // value / data-name="date-range-tab-<VALUE>" (e.g. 1D, 5D, 1M). This is the lower
+    // timeframe (entry timing).
     hlTimeframe: env.HL_TIMEFRAME ?? "1D",
+    // Higher-timeframe range captured as a SECOND screenshot for trend-bias context. Both
+    // images go to Neurobro (HTF first, LTF second) so it aligns entries with the larger
+    // trend. Set empty ("") to disable multi-timeframe and send a single LTF image.
+    hlTimeframeHtf: env.HL_TIMEFRAME_HTF ?? "5D",
+    // Candle interval + period for the ATR volatility hint (via the public info API).
+    atrInterval: env.ATR_INTERVAL ?? "5m",
+    atrPeriod: Number(env.ATR_PERIOD ?? "14"),
     neurobroUrl: env.NEUROBRO_URL ?? "https://app.neurobro.ai",
     storageStatePath: env.NEUROBRO_STORAGE_STATE ?? "./neurobro-session.json",
     // Persistent Chrome profile dir: cf_clearance (Cloudflare) + Neurobro auth live
@@ -50,6 +64,11 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     pollIntervalSecs: Number(env.POLL_INTERVAL_SECS ?? "60"),
     cooldownSecs: Number(env.COOLDOWN_SECS ?? "300"),
     maxDeviation: Number(env.MAX_DEVIATION ?? "0.004"),
+    // Deterministic guardrails applied to every parsed setup before execution, independent
+    // of the model's own claims: reject anything below this risk:reward, or whose stop
+    // distance exceeds this fraction of entry (a too-wide SL = tiny size / wrong read).
+    minRiskReward: Number(env.MIN_RISK_REWARD ?? "1.5"),
+    maxStopLossPct: Number(env.MAX_STOP_LOSS_PCT ?? "0.03"),
     // Optional: alert the operator when the Neurobro session dies (Cloudflare/login wall).
     // Reuse the bot's Telegram bot token + your user/chat id. Empty → alerts just logged.
     telegramBotToken: env.TELEGRAM_BOT_TOKEN ?? "",

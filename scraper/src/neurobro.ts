@@ -1,15 +1,43 @@
 import type { Page } from "playwright";
 import type { Config } from "./config.js";
 
-// Sent to Neurobro alongside the chart screenshot. Sharpened to push higher-quality
+/** Grounding facts injected ahead of the prompt body so the model reasons from real
+ *  numbers instead of guessing them off the chart axis. All fields are optional — each is
+ *  emitted only when present so a missing data point never weakens the rest of the prompt. */
+export interface SetupContext {
+  /** Live mark price; makes the ~0.3% entry constraint exact rather than eyeballed. */
+  markPrice?: number;
+  /** Recent ATR as a percent of price; grounds the Stop Loss distance in real volatility. */
+  atrPercent?: number;
+  /** True when two images (HTF then LTF) are attached, so the prompt explains each. */
+  multiTimeframe?: boolean;
+}
+
+/** Builds the grounding preamble from whatever context is available (may be empty). */
+function contextPreamble(ctx: SetupContext): string {
+  const lines: string[] = [];
+  if (ctx.multiTimeframe) {
+    lines.push("Ada 2 gambar chart: Gambar 1 = timeframe BESAR (untuk bias tren), Gambar 2 = timeframe KECIL (untuk timing entry). Entry di timeframe kecil HARUS searah tren timeframe besar.");
+  }
+  if (Number.isFinite(ctx.markPrice)) {
+    lines.push(`Harga sekarang = ${ctx.markPrice}. Harga Masuk WAJIB dalam ±0.3% dari angka ini.`);
+  }
+  if (Number.isFinite(ctx.atrPercent)) {
+    lines.push(`Volatilitas terkini sekitar ${ctx.atrPercent!.toFixed(2)}% (ATR). Jarak Stop Loss kira-kira sebesar 1x ATR ini — jangan jauh lebih lebar.`);
+  }
+  return lines.length ? lines.join("\n") + "\n\n" : "";
+}
+
+// Sent to Neurobro alongside the chart screenshot(s). Sharpened to push higher-quality
 // setups while staying compatible with extract.ts (table columns Arah/Masuk/Stop Loss/
 // Take Profit/Keyakinan + a "Tesis" blockquote) and the streaming-done check (an "x/10"
 // confidence). Two pipeline-aware constraints: entry must sit within ~0.3% of the last
 // price so it clears the bot's MAX_DEVIATION (0.4%) slippage gate without wasting quota,
 // and weak setups are routed to a LOW Keyakinan so the existing confidence>=7 gate filters
-// them — a soft "no-trade" that never drops the table the extractor depends on.
-const PROMPT = (coin: string) =>
-  `Kamu scalper hit-and-run di Hyperliquid perpetual. Analisa chart ${coin} pada timeframe yang ditampilkan dan beri SATU setup scalping terbaik.
+// them — a soft "no-trade" that never drops the table the extractor depends on. A grounding
+// preamble (mark price, ATR, multi-timeframe note) is prepended when that context is known.
+const PROMPT = (coin: string, ctx: SetupContext) =>
+  `${contextPreamble(ctx)}Kamu scalper hit-and-run di Hyperliquid perpetual. Analisa chart ${coin} dan beri SATU setup scalping terbaik.
 
 Aturan wajib:
 - Arah (LONG/SHORT) sesuai bias struktur & momentum di chart. Jangan lawan tren kuat tanpa sinyal pembalikan yang jelas.
@@ -138,7 +166,7 @@ async function startNewChat(page: Page): Promise<void> {
   }
 }
 
-export async function requestSetup(page: Page, cfg: Config, coin: string, screenshot: Buffer): Promise<string> {
+export async function requestSetup(page: Page, cfg: Config, coin: string, screenshots: Buffer[], ctx: SetupContext = {}): Promise<string> {
   // Navigate only when not already on Neurobro. Re-issuing goto() every cycle reloads
   // the SPA and re-triggers the Cloudflare challenge; staying on the loaded SPA reuses
   // the already-cleared session.
@@ -157,13 +185,19 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
 
   await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 30_000 });
 
-  // Attach the screenshot directly to the hidden image file input. Neurobro keeps a
+  // Attach the screenshot(s) directly to the hidden image file input. Neurobro keeps a
   // <input type="file" accept="image/*" class="hidden"> in the DOM; Playwright sets
   // files on hidden inputs, so we skip the "+" menu button (it renders twice — one
-  // hidden — and is ambiguous). accept*="image" disambiguates from the docs input.
+  // hidden — and is ambiguous). accept*="image" disambiguates from the docs input. With
+  // multi-timeframe on, buffers arrive HTF-first; name them so the order is explicit.
   const imageInput = page.locator('input[type="file"][accept*="image"]').first();
-  await imageInput.setInputFiles({ name: `${coin}.png`, mimeType: "image/png", buffer: screenshot });
-  await page.waitForTimeout(1500); // let the image preview/upload register
+  const files = screenshots.map((buffer, index) => ({
+    name: screenshots.length > 1 ? `${coin}-${index === 0 ? "htf" : "ltf"}.png` : `${coin}.png`,
+    mimeType: "image/png",
+    buffer,
+  }));
+  await imageInput.setInputFiles(files);
+  await page.waitForTimeout(1500 + (screenshots.length - 1) * 1000); // let each image preview/upload register
 
   // Count the response tables already on screen BEFORE submitting. When the new-chat reset
   // is skipped (square-pen not clickable), prior coins' setup tables stay in the same
@@ -177,7 +211,7 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
   // Type the prompt and submit. The composer renders twice (one hidden); pick the
   // visible one — same composer whose image input we set above (both are index 0).
   const input = page.locator('textarea[name="input"]:visible').first();
-  await input.fill(PROMPT(coin));
+  await input.fill(PROMPT(coin, ctx));
   await input.press("Enter");
 
   // Wait for THIS coin's setup table to FINISH streaming. The AI types the response token
