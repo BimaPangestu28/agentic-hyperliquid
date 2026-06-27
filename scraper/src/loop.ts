@@ -7,6 +7,7 @@ import { fetchMarketContext } from "./marketData.js";
 import { requestSetup as neurobroRequestSetup, isNeurobroReady } from "./neurobro.js";
 import { notifyTelegram } from "./notify.js";
 import { dayKey, readQuota, remaining, recordAnalysis } from "./quota.js";
+import type { Wake } from "./trigger.js";
 
 /**
  * Coins eligible to scan this cycle: in the watchlist, with no open position,
@@ -67,6 +68,9 @@ export interface RunDeps {
   // Day (YYYY-MM-DD) for which the "quota exhausted" alert was already sent, so it fires
   // at most once per day.
   quotaAlertedDay: { value: string };
+  // Optional manual-trigger primitive: when present, runForever waits on it between cycles
+  // so an external signal (SIGUSR2) can cut the poll wait short and force an immediate scan.
+  wake?: Wake;
 }
 
 /**
@@ -224,6 +228,9 @@ export async function runForever(deps: RunDeps): Promise<void> {
     } catch (error) {
       console.error("runOnce failed", error);
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, deps.cfg.pollIntervalSecs * 1000));
+    // Wait out the poll interval, but let a manual trigger (deps.wake.fire via SIGUSR2)
+    // cut it short and start the next cycle immediately.
+    const intervalMs = deps.cfg.pollIntervalSecs * 1000;
+    await (deps.wake ? deps.wake.wait(intervalMs) : new Promise<void>((resolve) => setTimeout(resolve, intervalMs)));
   }
 }

@@ -6,8 +6,9 @@ LOCAL_PORT ?= 8088
 VPS_HOST       := $(shell grep -E '^VPS_HOST=' .env 2>/dev/null | cut -d= -f2-)
 BOT_CLUSTER_IP := $(shell grep -E '^BOT_CLUSTER_IP=' .env 2>/dev/null | cut -d= -f2-)
 SSH_OPTS := -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new
+SERVICE ?= neurobro-scraper.service
 
-.PHONY: help login tunnel start start-xvfb up check check-env
+.PHONY: help login tunnel start start-xvfb up check check-env scan scan-local
 
 help:
 	@echo "Targets:"
@@ -17,6 +18,8 @@ help:
 	@echo "  make start-xvfb  - run the scraper INVISIBLE under Xvfb (real Chrome, no window)"
 	@echo "  make up          - tunnel + scraper (Xvfb) together; Ctrl-C stops both"
 	@echo "  make check       - verify the tunnel reaches the bot API"
+	@echo "  make scan        - force an immediate scan on the systemd scraper (SIGUSR2)"
+	@echo "  make scan-local  - force a scan on a locally-running scraper (make start/up)"
 
 check-env:
 	@test -n "$(VPS_HOST)" || { echo "ERROR: VPS_HOST not set in .env"; exit 1; }
@@ -45,6 +48,22 @@ up: check-env
 	@ssh -N $(SSH_OPTS) -L $(LOCAL_PORT):$(BOT_CLUSTER_IP):8088 $(VPS_HOST) & \
 	TUN=$$!; trap 'kill $$TUN 2>/dev/null' EXIT INT TERM; \
 	sleep 3; sh entrypoint.sh
+
+# Force an immediate scan without restarting: SIGUSR2 makes the daemon cut its poll wait
+# short and run a cycle now. Targets the systemd service's MainPID (the node process, since
+# entrypoint.sh execs node) so the signal reaches the loop's handler, not Chrome/Xvfb.
+scan:
+	@PID=$$(systemctl --user show -p MainPID --value $(SERVICE) 2>/dev/null); \
+	if [ -n "$$PID" ] && [ "$$PID" -gt 0 ] 2>/dev/null; then \
+		kill -USR2 $$PID && echo "scan triggered (pid $$PID)"; \
+	else \
+		echo "$(SERVICE) not running (is it a --user service? try: systemctl --user status $(SERVICE))"; \
+	fi
+
+# Same trigger for a scraper started in the foreground (make start / make up), which has
+# no systemd unit — signal the node process by its command line instead.
+scan-local:
+	@pkill -USR2 -f "tsx src/index.ts" && echo "scan triggered" || echo "no local scraper process found"
 
 # Confirm the tunnel is up and the bot API answers (uses BOT_API_TOKEN from .env).
 check:

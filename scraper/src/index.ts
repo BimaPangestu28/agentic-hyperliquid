@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { BotApi } from "./botApi.js";
 import { runForever, runOnce } from "./loop.js";
 import { notifyTelegram } from "./notify.js";
+import { createWake } from "./trigger.js";
 
 async function main(): Promise<void> {
   console.log("scraper boot: config loaded, launching Chrome…");
@@ -48,6 +49,10 @@ async function main(): Promise<void> {
   const hlPage = await context.newPage();
   const nbPage = context.pages()[0] ?? (await context.newPage());
 
+  // Manual-trigger wake: SIGUSR2 cuts the poll wait short to force an immediate scan
+  // without restarting the daemon (see `make scan`). SIGUSR2 (not SIGUSR1, which Node
+  // reserves to start the inspector) so triggering never opens a debugger port.
+  const wake = createWake();
   const deps = {
     cfg,
     api: new BotApi(cfg),
@@ -58,6 +63,7 @@ async function main(): Promise<void> {
     dryRun,
     sessionAlertSent: { value: false },
     quotaAlertedDay: { value: "" },
+    wake,
   };
 
   if (once) {
@@ -65,6 +71,12 @@ async function main(): Promise<void> {
     await context.close();
     return;
   }
+
+  process.on("SIGUSR2", () => {
+    console.log("SIGUSR2 — manual scan triggered");
+    void notifyTelegram(cfg, "🔔 Manual scan dipicu — jalan sekarang (skip sisa interval).");
+    wake.fire();
+  });
 
   // Heartbeat so the operator knows the daemon actually started (and with which knobs).
   await notifyTelegram(
