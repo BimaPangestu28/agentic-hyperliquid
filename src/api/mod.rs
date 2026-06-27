@@ -267,7 +267,7 @@ async fn execute(
         }],
     };
 
-    // Size with the Aggressive profile (max leverage), market entry.
+    // Size with the Moderate profile (default for auto-scalp), market entry.
     let equity = state
         .exchange
         .equity()
@@ -286,7 +286,7 @@ async fn execute(
         entry_mode: settings.entry_mode,
         entry_pct: settings.entry_pct,
         entry_fixed_usd: settings.entry_fixed_usd,
-        profile: crate::sizing::RiskProfile::Aggressive,
+        profile: crate::sizing::RiskProfile::Moderate,
         leverage: &settings.leverage,
         asset_meta: &asset_meta,
     })
