@@ -27,9 +27,11 @@ async function main(): Promise<void> {
   const context = await chromium.launchPersistentContext(cfg.userDataDir, {
     headless: cfg.headless,
     channel: cfg.browserChannel,
-    viewport: null,
+    // 1920×1080 so the Hyperliquid chart screenshot also captures the order book + order
+    // form (more context for Neurobro). Match the window size to the viewport for capture.
+    viewport: { width: 1920, height: 1080 },
     // Stop announcing automation (drops navigator.webdriver + the automation banner).
-    args: ["--disable-blink-features=AutomationControlled"],
+    args: ["--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
     ignoreDefaultArgs: ["--enable-automation"],
   });
 

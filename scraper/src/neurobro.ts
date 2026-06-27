@@ -103,7 +103,12 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
     } catch {
       // An overlay likely re-appeared and intercepted the click — dismiss and retry once.
       await dismissOverlay(page);
-      await newChat.click({ timeout: 10_000 });
+      try {
+        await newChat.click({ timeout: 10_000 });
+      } catch (error) {
+        await dumpDebugShot(page, "new-chat-blocked");
+        throw error;
+      }
     }
     await page.waitForTimeout(800);
   }
@@ -127,19 +132,30 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
   // token, so an early read catches a half-filled row (missing columns, literal "**"
   // markdown). Require: a visible table whose data row has all columns, no streaming
   // "**", and a rendered "n/10" confidence. Independent of "$" and header language.
-  await page.waitForFunction(() => {
-    const tables = [...document.querySelectorAll("table")].filter((t) => (t as HTMLElement).offsetParent);
-    return tables.some((t) => {
-      const headerCount = t.querySelectorAll("thead th").length;
-      const row = t.querySelector("tbody tr");
-      if (!row || headerCount < 4) return false;
-      const cells = [...row.querySelectorAll("td")].map((td) => td.textContent || "");
-      if (cells.length < headerCount) return false;        // every column present
-      const text = cells.join(" ");
-      if (text.includes("**")) return false;               // markdown still streaming
-      return /\d\s*\/\s*10/.test(text);                    // confidence finished rendering
-    });
-  }, { timeout: 150_000 });
+  try {
+    await page.waitForFunction(() => {
+      const tables = [...document.querySelectorAll("table")].filter((t) => (t as HTMLElement).offsetParent);
+      return tables.some((t) => {
+        const headerCount = t.querySelectorAll("thead th").length;
+        const row = t.querySelector("tbody tr");
+        if (!row || headerCount < 4) return false;
+        const cells = [...row.querySelectorAll("td")].map((td) => td.textContent || "");
+        if (cells.length < headerCount) return false;        // every column present
+        const text = cells.join(" ");
+        if (text.includes("**")) return false;               // markdown still streaming
+        return /\d\s*\/\s*10/.test(text);                    // confidence finished rendering
+      });
+    }, { timeout: 150_000 });
+  } catch (error) {
+    if (process.env.NEUROBRO_DEBUG_SHOT) {
+      const shot = process.env.NEUROBRO_DEBUG_SHOT;
+      const fs = await import("node:fs");
+      await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+      await fs.promises.writeFile(shot.replace(/\.png$/, "") + ".html", await page.content()).catch(() => {});
+      console.warn(`table wait failed for ${coin} — dumped ${shot} + .html`);
+    }
+    throw error;
+  }
   await page.waitForTimeout(800); // settle
 
   // Return the smallest container holding the finished table (+ thesis when nearby).
