@@ -41,15 +41,15 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     // hint injected into the Neurobro prompt. Best-effort: a failure just omits the hint.
     hyperliquidInfoUrl: env.HYPERLIQUID_INFO_URL ?? "https://api.hyperliquid.xyz/info",
     // TradingView date-range tab the scraper clicks before screenshotting for Neurobro.
-    // "1d" = one day of intraday candles (good for scalping). Matches the button's
-    // value / data-name="date-range-tab-<VALUE>"; HL's visible tabs are lowercase
-    // (1d, 5d, 1m, 3m, 6m, 1y, 5y) and matching is case-insensitive. Lower timeframe
-    // (entry timing).
-    hlTimeframe: env.HL_TIMEFRAME ?? "1d",
-    // Higher-timeframe range captured as a SECOND screenshot for trend-bias context. Both
-    // images go to Neurobro (HTF first, LTF second) so it aligns entries with the larger
-    // trend. Set empty ("") to disable multi-timeframe and send a single LTF image.
-    hlTimeframeHtf: env.HL_TIMEFRAME_HTF ?? "5d",
+    // The button's value/data-name="date-range-tab-<VALUE>" is UPPERCASE (1D, 5D, 1M, 3M,
+    // 6M, 12M, 60M) even though the visible label is lowercase. "1D" = 1 day of 1-minute
+    // candles — the lower timeframe for entry timing. Matching is case-insensitive anyway.
+    hlTimeframe: env.HL_TIMEFRAME ?? "1D",
+    // Higher-timeframe range captured as a SECOND screenshot for trend-bias context. "5D"
+    // = 5 days of 5-minute candles, one step up from the 1-minute LTF. Both images go to
+    // Neurobro (HTF first, LTF second) so it aligns entries with the larger trend. Bump to
+    // "1M" (30-min candles) for a stronger trend view; set empty ("") to disable.
+    hlTimeframeHtf: env.HL_TIMEFRAME_HTF ?? "5D",
     // Candle interval + period for the ATR volatility hint (via the public info API).
     atrInterval: env.ATR_INTERVAL ?? "5m",
     atrPeriod: Number(env.ATR_PERIOD ?? "14"),
