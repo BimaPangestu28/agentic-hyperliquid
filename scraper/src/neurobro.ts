@@ -11,7 +11,7 @@ const PROMPT = (coin: string) =>
  */
 export async function isNeurobroReady(page: Page, cfg: Config): Promise<boolean> {
   if (!page.url().startsWith(cfg.neurobroUrl)) {
-    await page.goto(cfg.neurobroUrl, { waitUntil: "networkidle" });
+    await page.goto(cfg.neurobroUrl, { waitUntil: "domcontentloaded" });
   }
   try {
     await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 20_000 });
@@ -57,7 +57,7 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
   // the SPA and re-triggers the Cloudflare challenge; staying on the loaded SPA reuses
   // the already-cleared session.
   if (!page.url().startsWith(cfg.neurobroUrl)) {
-    await page.goto(cfg.neurobroUrl, { waitUntil: "networkidle" });
+    await page.goto(cfg.neurobroUrl, { waitUntil: "domcontentloaded" });
   }
 
   // Start a fresh conversation each cycle (the "new chat" square-pen button). Without

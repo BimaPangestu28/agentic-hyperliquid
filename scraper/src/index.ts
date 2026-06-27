@@ -1,4 +1,5 @@
 import { chromium } from "playwright";
+import { rmSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { BotApi } from "./botApi.js";
 import { runForever, runOnce } from "./loop.js";
@@ -11,6 +12,13 @@ async function main(): Promise<void> {
   // --once runs a single cycle then exits (real execute, unlike --dry-run). Useful for
   // a first live test against the bot and for cron-style scheduling instead of a daemon.
   const once = dryRun || process.argv.includes("--once");
+
+  // Clear stale Chrome singleton locks. A pod SIGKILL leaves SingletonLock/Socket/Cookie
+  // in the persistent profile, and the next launch aborts with "profile appears to be in
+  // use" → crash loop. Safe to remove: only one scraper replica ever runs (replicas: 1).
+  for (const lock of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    rmSync(`${cfg.userDataDir}/${lock}`, { force: true });
+  }
 
   // Reuse the persistent Chrome profile established by `npm run login` so the
   // Cloudflare cf_clearance cookie + Neurobro auth carry over. Real Chrome channel

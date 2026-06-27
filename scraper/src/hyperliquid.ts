@@ -41,7 +41,10 @@ async function selectChartRange(page: Page, range: string): Promise<boolean> {
 }
 
 export async function screenshotChart(page: Page, cfg: Config, coin: string): Promise<Buffer> {
-  await page.goto(`${cfg.hyperliquidUrl}/trade/${coin}`, { waitUntil: "networkidle" });
+  // domcontentloaded, not networkidle: HL streams live prices over a websocket that
+  // never goes idle, so networkidle would always hit the timeout. The explicit waits
+  // below give the chart time to render.
+  await page.goto(`${cfg.hyperliquidUrl}/trade/${coin}`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(4000); // let the chart canvas render
   await selectChartRange(page, cfg.hlTimeframe); // set the date range (e.g. 1D = 1-min candles, 1 day) before capture
   return await page.screenshot({ fullPage: false }); // viewport screenshot (chart + book + price)
