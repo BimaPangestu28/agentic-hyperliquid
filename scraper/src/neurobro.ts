@@ -1,8 +1,25 @@
 import type { Page } from "playwright";
 import type { Config } from "./config.js";
 
+// Sent to Neurobro alongside the chart screenshot. Sharpened to push higher-quality
+// setups while staying compatible with extract.ts (table columns Arah/Masuk/Stop Loss/
+// Take Profit/Keyakinan + a "Tesis" blockquote) and the streaming-done check (an "x/10"
+// confidence). Two pipeline-aware constraints: entry must sit within ~0.3% of the last
+// price so it clears the bot's MAX_DEVIATION (0.4%) slippage gate without wasting quota,
+// and weak setups are routed to a LOW Keyakinan so the existing confidence>=7 gate filters
+// them — a soft "no-trade" that never drops the table the extractor depends on.
 const PROMPT = (coin: string) =>
-  `Analisa chart ${coin} ini buat scalping di Hyperliquid perpetual. Kasih SATU setup scalping hit-and-run: tentukan arah (LONG/SHORT), harga Masuk, Stop Loss, dan SATU Take Profit aja (TP1 100%, JANGAN ada TP2/TP3). Wajib sertakan angka harga eksplisit, tingkat Keyakinan (x/10), dan tesis singkat. Tampilkan sebagai kartu "Setup Trading".`;
+  `Kamu scalper hit-and-run di Hyperliquid perpetual. Analisa chart ${coin} pada timeframe yang ditampilkan dan beri SATU setup scalping terbaik.
+
+Aturan wajib:
+- Arah (LONG/SHORT) sesuai bias struktur & momentum di chart. Jangan lawan tren kuat tanpa sinyal pembalikan yang jelas.
+- Harga Masuk harus dekat harga sekarang & eksekutabel (maks ~0.3% dari harga terakhir) — entry di pullback/retest level nyata, BUKAN ngejar harga yang sudah jauh.
+- Stop Loss di level invalidasi struktural terdekat (di luar swing/likuiditas), ketat sesuai volatilitas — ini batas "salah", bukan angka asal.
+- SATU Take Profit saja (TP 100%, JANGAN TP2/TP3) di level struktur/likuiditas realistis berikutnya. Jarak TP minimal 1.5x jarak Stop Loss (risk:reward >= 1.5R).
+- Keyakinan (x/10) jujur & terkalibrasi: 8-10 hanya bila banyak konfluensi searah (tren + level + momentum + volume); 7 = layak; <=6 = marjinal/kurang edge. JANGAN gelembungkan — kalau nggak ada edge jelas, kasih Keyakinan rendah.
+- Semua harga angka eksplisit.
+
+Tampilkan sebagai kartu "Setup Trading" dengan kolom: Arah, Masuk, Stop Loss, Take Profit, Keyakinan. Lalu satu blockquote "Tesis:" 1-2 kalimat yang menyebut alasan konfluensi DAN level invalidasi.`;
 
 /**
  * True when Neurobro's chat composer is reachable — i.e. the saved session is still
