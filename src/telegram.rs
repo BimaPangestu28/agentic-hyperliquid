@@ -158,12 +158,19 @@ fn position_line(position: &OpenPosition) -> String {
     )
 }
 
-/// Running-P&L push: total + per-position unrealized PnL.
+/// Running-P&L push: total + per-position unrealized PnL, best performers first.
 pub fn render_pnl_summary(equity: f64, positions: &[OpenPosition]) -> String {
     let mut out = String::from("📊 Running P&L\n");
     out.push_str(&format!("Equity: ${:.2}\n", equity));
     out.push_str(&format!("Total uPnL: ${:+.2}\n", total_unrealized_pnl(positions)));
-    for position in positions {
+    // Rank by unrealized PnL, highest first (NaN sorts last via Equal fallback).
+    let mut ranked: Vec<&OpenPosition> = positions.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.unrealized_pnl
+            .partial_cmp(&a.unrealized_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for position in ranked {
         out.push_str(&position_line(position));
     }
     out
@@ -1894,6 +1901,25 @@ mod tests {
                 mark_px: 3400.0, unrealized_pnl: -12.8, leverage: 2.0, notional: 4080.0,
             },
         ]
+    }
+
+    #[test]
+    fn pnl_summary_orders_by_unrealized_pnl_desc() {
+        // Input deliberately out of order: loss first, win second.
+        let positions = vec![
+            crate::hyperliquid::OpenPosition {
+                coin: "LOSS".into(), direction: "long".into(), size: 1.0, entry_px: 10.0,
+                mark_px: 9.0, unrealized_pnl: -5.0, leverage: 3.0, notional: 10.0,
+            },
+            crate::hyperliquid::OpenPosition {
+                coin: "WIN".into(), direction: "long".into(), size: 1.0, entry_px: 10.0,
+                mark_px: 12.0, unrealized_pnl: 7.0, leverage: 3.0, notional: 10.0,
+            },
+        ];
+        let text = super::render_pnl_summary(100.0, &positions);
+        let win = text.find("WIN").expect("WIN listed");
+        let loss = text.find("LOSS").expect("LOSS listed");
+        assert!(win < loss, "highest uPnL (WIN) must be listed before LOSS");
     }
 
     #[test]
