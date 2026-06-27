@@ -300,6 +300,24 @@ async fn execute(
         StatusCode::UNPROCESSABLE_ENTITY
     })?;
 
+    // Affordability gate: sizing checks margin against TOTAL equity, but the exchange
+    // accepts a new order only against FREE collateral (equity minus margin already used by
+    // open positions). When the account is fully margined this is ~0, so the order would be
+    // rejected with "Insufficient margin" → a 500. Reject up-front as a capacity conflict
+    // instead, so the scraper backs off the coin rather than retrying a doomed order.
+    let free_collateral = state
+        .exchange
+        .free_collateral()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if plan.margin > free_collateral {
+        tracing::warn!(
+            coin = %setup.coin, required_margin = plan.margin, free_collateral,
+            "auto-scalp skipped: insufficient free collateral (account near capacity)"
+        );
+        return Err(StatusCode::CONFLICT);
+    }
+
     // Execute: market entry + SL/TP bracket, no confirm.
     crate::telegram::execute_plan(
         state.exchange.as_ref(),
@@ -405,6 +423,47 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["equity_usd"].as_f64().unwrap(), 1234.5);
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_when_free_collateral_below_required_margin() {
+        // Account has plenty of equity but is fully margined (free collateral ~0). The
+        // order must be rejected up-front as a capacity conflict (409), not attempted and
+        // 500'd at the exchange.
+        let mock = MockExchange {
+            equity: 1000.0,
+            meta: Some(crate::sizing::AssetMeta { sz_decimals: 2, max_leverage: 0 }),
+            ..Default::default()
+        };
+        mock.set_free_collateral(1.0);
+        let mut seed = crate::settings::sample();
+        seed.auto_scalp_enabled = true;
+        let state = ApiState {
+            exchange: Arc::new(mock),
+            db_path: ":memory:".into(),
+            token: "t".into(),
+            settings_seed: seed,
+            telegram_bot_token: "test-token".into(),
+            allowed_user_ids: vec![1],
+        };
+        let body = serde_json::json!({
+            "coin": "LINK", "direction": "long", "entry": 7.33, "stop_loss": 7.17,
+            "take_profit": 7.60, "confidence": 7, "thesis": "t"
+        })
+        .to_string();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     fn state_with_positions(open_positions: Vec<crate::hyperliquid::OpenPosition>) -> ApiState {

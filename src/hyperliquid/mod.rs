@@ -96,6 +96,11 @@ pub struct OpenPosition {
 #[async_trait]
 pub trait Exchange: Send + Sync {
     async fn equity(&self) -> anyhow::Result<f64>;
+    /// Free collateral (USDC) not already backing an open position — what the exchange
+    /// checks when accepting a new order. Distinct from [`equity`](Self::equity): sizing
+    /// is a % of total equity, but affordability must use this. When the account is fully
+    /// margined this is ~0 even though equity is large.
+    async fn free_collateral(&self) -> anyhow::Result<f64>;
     async fn asset_meta(&self, coin: &str) -> anyhow::Result<Option<AssetMeta>>;
     async fn set_leverage(&self, coin: &str, leverage: u32) -> anyhow::Result<()>;
     async fn place_entry(&self, order: &EntryOrder) -> anyhow::Result<OrderResult>;
@@ -177,6 +182,9 @@ pub mod mock {
         pub closes: Mutex<Vec<(String, f64)>>,
         /// Coins for which `close_position` returns Err (best-effort test hook).
         pub fail_close_coins: Mutex<Vec<String>>,
+        /// Overrides `free_collateral()` when `Some`; otherwise it returns `equity`
+        /// (so a fully-funded account passes the affordability guard by default).
+        pub free_collateral_override: Mutex<Option<f64>>,
     }
 
     impl MockExchange {
@@ -207,12 +215,21 @@ pub mod mock {
         pub fn set_flows(&self, ledger_flows: Vec<super::LedgerFlow>) {
             *self.flows.lock().unwrap() = ledger_flows;
         }
+
+        /// Seeds the value returned by `free_collateral()` (defaults to `equity`).
+        pub fn set_free_collateral(&self, free: f64) {
+            *self.free_collateral_override.lock().unwrap() = Some(free);
+        }
     }
 
     #[async_trait]
     impl Exchange for MockExchange {
         async fn equity(&self) -> anyhow::Result<f64> {
             Ok(self.equity)
+        }
+
+        async fn free_collateral(&self) -> anyhow::Result<f64> {
+            Ok(self.free_collateral_override.lock().unwrap().unwrap_or(self.equity))
         }
 
         async fn asset_meta(&self, _coin: &str) -> anyhow::Result<Option<AssetMeta>> {
@@ -641,6 +658,17 @@ impl Exchange for HyperliquidExchange {
                 .parse::<f64>()
                 .map_err(|e| anyhow::anyhow!("cannot parse account_value: {e}"))
         }
+    }
+
+    /// Reads `user_state.withdrawable` — the exchange's own free-collateral figure
+    /// (account value minus margin already used by open positions). Used to reject a new
+    /// order up-front when there is no room, instead of letting it 500 at the exchange.
+    async fn free_collateral(&self) -> anyhow::Result<f64> {
+        let state = self.info.user_state(self.address).await?;
+        state
+            .withdrawable
+            .parse::<f64>()
+            .map_err(|e| anyhow::anyhow!("cannot parse withdrawable: {e}"))
     }
 
     /// Returns sizing metadata for `coin`, or `Ok(None)` when the coin is not
