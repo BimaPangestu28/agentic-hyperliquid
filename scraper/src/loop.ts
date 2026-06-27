@@ -149,7 +149,12 @@ export async function runOnce(deps: RunDeps): Promise<void> {
       console.log(`${coin}: execute → ${result.status} ok=${result.ok}`);
       const direction = setup.direction.toUpperCase();
       if (result.ok) {
-        await notifyTelegram(deps.cfg, `✅ ${coin} ${direction} dieksekusi — entry ${setup.entry}, SL ${setup.stopLoss}, TP ${setup.takeProfit} (conf ${setup.confidence}/10)`);
+        // Cooldown on success too: otherwise the moment this position closes (SL/TP) the
+        // coin is eligible again and gets re-entered next scan — churning the same coin
+        // and stacking overlapping brackets, which is what makes the bot's close-fill
+        // labels (SL/TP) misattribute against the newest bracket.
+        cooldown(deps, coin);
+        await notifyTelegram(deps.cfg, `✅ ${coin} ${direction} dieksekusi — entry ${setup.entry}, SL ${setup.stopLoss}, TP ${setup.takeProfit} (conf ${setup.confidence}/10) · cooldown ${cooldownMins}m`);
       } else {
         await notifyTelegram(deps.cfg, `❌ ${coin} ${direction}: eksekusi gagal (${result.status}) — cooldown ${cooldownMins}m`);
         cooldown(deps, coin);
