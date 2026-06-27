@@ -60,12 +60,22 @@ export async function requestSetup(page: Page, cfg: Config, coin: string, screen
     await page.goto(cfg.neurobroUrl, { waitUntil: "domcontentloaded" });
   }
 
+  // A modal/dialog overlay (announcement, quota notice, etc.) can cover the composer and
+  // intercept clicks — dismiss it before interacting with the new-chat control.
+  await dismissOverlay(page);
+
   // Start a fresh conversation each cycle (the "new chat" square-pen button). Without
   // this, every cycle piles into one ever-growing thread, which slows the SPA and makes
   // card lookups flaky. Done in-SPA (no reload) so the Cloudflare session is preserved.
   const newChat = page.locator('button:has(svg.lucide-square-pen)').first();
   if (await newChat.isVisible().catch(() => false)) {
-    await newChat.click();
+    try {
+      await newChat.click({ timeout: 10_000 });
+    } catch {
+      // An overlay likely re-appeared and intercepted the click — dismiss and retry once.
+      await dismissOverlay(page);
+      await newChat.click({ timeout: 10_000 });
+    }
     await page.waitForTimeout(800);
   }
   await page.locator('textarea[name="input"]:visible').first().waitFor({ state: "visible", timeout: 30_000 });
