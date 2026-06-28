@@ -290,6 +290,16 @@ pub fn render_settings(settings: &Settings) -> String {
         None => "disabled".to_string(),
     };
     let auto_scalp = if settings.auto_scalp_enabled { "ON 🟢" } else { "OFF 🔴" };
+    let min_rr = if settings.min_rr > 0.0 {
+        format!("{:.2}", settings.min_rr)
+    } else {
+        "disabled".to_string()
+    };
+    let blacklist = if settings.coin_blacklist.is_empty() {
+        "(kosong)".to_string()
+    } else {
+        settings.coin_blacklist.join(", ")
+    };
     format!(
         "⚙️ Settings\n\n\
          Entry mode: {}\n\
@@ -304,9 +314,11 @@ pub fn render_settings(settings: &Settings) -> String {
          trigger_expiry_secs: {}s\n\
          pnl_push_secs: {}s\n\
          auto_scalp_enabled: {}\n\
-         max_open_positions: {}\n\n\
+         max_open_positions: {}\n\
+         min_rr: {}\n\
+         coin_blacklist: {}\n\n\
          Change a number:  /set <key> <value>\n\
-         e.g.  /set entry_pct 10\n\
+         e.g.  /set min_rr 1.5  ·  /set coin_blacklist XPL,ZEC\n\
          Switch entry mode with the buttons below.",
         settings.entry_mode.label(),
         settings.risk_pct,
@@ -321,6 +333,8 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.pnl_push_secs,
         auto_scalp,
         settings.max_open_positions,
+        min_rr,
+        blacklist,
     )
 }
 
@@ -1807,6 +1821,8 @@ mod tests {
             watchlist: Vec::new(),
             auto_scalp_enabled: false,
             max_open_positions: 5,
+            min_rr: 0.0,
+            coin_blacklist: Vec::new(),
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1827,6 +1843,8 @@ mod tests {
             watchlist: Vec::new(),
             auto_scalp_enabled: false,
             max_open_positions: 5,
+            min_rr: 0.0,
+            coin_blacklist: Vec::new(),
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }

@@ -292,6 +292,17 @@ impl IntoResponse for ExecuteError {
     }
 }
 
+/// Reward-to-risk ratio of a setup: reward distance (entry→take-profit) divided by
+/// risk distance (entry→stop-loss). Returns `0.0` when the risk distance is
+/// effectively zero, so a degenerate setup fails any positive `min_rr` gate.
+fn risk_reward_ratio(entry: f64, stop_loss: f64, take_profit: f64) -> f64 {
+    let risk_distance = (entry - stop_loss).abs();
+    if risk_distance < f64::EPSILON {
+        return 0.0;
+    }
+    (take_profit - entry).abs() / risk_distance
+}
+
 async fn execute(
     State(state): State<ApiState>,
     Json(req): Json<ExecuteRequest>,
@@ -314,7 +325,34 @@ async fn execute(
             "low_confidence",
         ));
     }
-    // Gate 3: position cap.
+    // Gate 3: coin blacklist — bars a symbol from auto-execution outright.
+    let coin = req.coin.to_uppercase();
+    if settings
+        .coin_blacklist
+        .iter()
+        .any(|blacklisted| blacklisted.eq_ignore_ascii_case(&coin))
+    {
+        return Err(ExecuteError::reason(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "blacklisted",
+        ));
+    }
+    // Gate 4: minimum reward:risk. Disabled when min_rr is 0.0.
+    if settings.min_rr > 0.0 {
+        let reward_to_risk = risk_reward_ratio(req.entry, req.stop_loss, req.take_profit);
+        if reward_to_risk < settings.min_rr {
+            return Err(ExecuteError::detailed(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({
+                    "ok": false,
+                    "reason": "low_rr",
+                    "rr": reward_to_risk,
+                    "min_rr": settings.min_rr,
+                }),
+            ));
+        }
+    }
+    // Gate 5: position cap.
     let open_positions = state
         .exchange
         .positions()
@@ -339,7 +377,7 @@ async fn execute(
         _ => return Err(ExecuteError::reason(StatusCode::BAD_REQUEST, "bad_direction")),
     };
     let setup = crate::parser::TradeSetup {
-        coin: req.coin.to_uppercase(),
+        coin,
         direction,
         timeframe: Some("scalp".to_string()),
         risk_reward: None,
@@ -521,6 +559,86 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["equity_usd"].as_f64().unwrap(), 1234.5);
+    }
+
+    #[test]
+    fn risk_reward_ratio_handles_both_sides_and_degenerate() {
+        // Long: entry 100, SL 95 (risk 5), TP 110 (reward 10) -> 2.0
+        assert!((risk_reward_ratio(100.0, 95.0, 110.0) - 2.0).abs() < 1e-9);
+        // Short: entry 100, SL 105 (risk 5), TP 90 (reward 10) -> 2.0
+        assert!((risk_reward_ratio(100.0, 105.0, 90.0) - 2.0).abs() < 1e-9);
+        // Zero risk distance -> 0.0 (fails any positive gate).
+        assert_eq!(risk_reward_ratio(100.0, 100.0, 110.0), 0.0);
+    }
+
+    /// Builds auto-scalp-enabled state with a given seed mutation applied.
+    fn auto_scalp_state(mutate: impl FnOnce(&mut crate::settings::Settings)) -> ApiState {
+        let mock = MockExchange {
+            equity: 1000.0,
+            meta: Some(crate::sizing::AssetMeta { sz_decimals: 2, max_leverage: 0 }),
+            ..Default::default()
+        };
+        let mut seed = crate::settings::sample();
+        seed.auto_scalp_enabled = true;
+        mutate(&mut seed);
+        ApiState {
+            exchange: Arc::new(mock),
+            db_path: ":memory:".into(),
+            token: "t".into(),
+            settings_seed: seed,
+            telegram_bot_token: "test-token".into(),
+            allowed_user_ids: vec![1],
+        }
+    }
+
+    async fn post_execute(state: ApiState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/execute")
+                    .header("authorization", "Bearer t")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_blacklisted_coin() {
+        let state = auto_scalp_state(|s| s.coin_blacklist = vec!["XPL".into()]);
+        let (status, json) = post_execute(
+            state,
+            serde_json::json!({
+                "coin": "xpl", "direction": "long", "entry": 1.0, "stop_loss": 0.95,
+                "take_profit": 1.20, "confidence": 8, "thesis": "t"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["reason"].as_str().unwrap(), "blacklisted");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_setup_below_min_rr() {
+        let state = auto_scalp_state(|s| s.min_rr = 1.5);
+        // entry 100, SL 95 (risk 5), TP 102 (reward 2) -> RR 0.4 < 1.5
+        let (status, json) = post_execute(
+            state,
+            serde_json::json!({
+                "coin": "BTC", "direction": "long", "entry": 100.0, "stop_loss": 95.0,
+                "take_profit": 102.0, "confidence": 8, "thesis": "t"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["reason"].as_str().unwrap(), "low_rr");
+        assert!((json["rr"].as_f64().unwrap() - 0.4).abs() < 1e-9);
     }
 
     #[tokio::test]

@@ -109,9 +109,13 @@ pub fn compute_stats(fills: &[Fill], trades: &[TradeRecord]) -> Stats {
                 conf_bucket.losses += 1;
             }
 
+            // Normalize casing/whitespace so the same timeframe from differently-cased
+            // signal sources ("Scalp" vs "scalp") aggregates into a single bucket.
             let timeframe_label = trade_record
                 .timeframe
-                .clone()
+                .as_deref()
+                .map(|tf| tf.trim().to_lowercase())
+                .filter(|tf| !tf.is_empty())
                 .unwrap_or_else(|| "n/a".into());
             let tf_bucket = tf.entry(timeframe_label.clone()).or_insert(BucketStat {
                 label: timeframe_label,
@@ -245,6 +249,30 @@ mod tests {
             .by_timeframe
             .iter()
             .any(|b| b.label == "scalp" && b.losses == 1));
+    }
+
+    #[test]
+    fn timeframe_buckets_are_case_insensitive() {
+        // Signal sources emit inconsistent casing ("Scalp" vs "scalp"); these must
+        // aggregate into a single bucket rather than splitting wins/losses apart.
+        let trades = vec![
+            trade_record("BTC", 7, "Scalp", 1000),
+            trade_record("SOL", 7, "scalp", 1000),
+        ];
+        let fills = vec![
+            fill("BTC", 10.0, "Close Long", 2_000_000), // win, "Scalp"
+            fill("SOL", -5.0, "Close Long", 2_000_000), // loss, "scalp"
+        ];
+        let stats = compute_stats(&fills, &trades);
+        let scalp: Vec<_> = stats
+            .by_timeframe
+            .iter()
+            .filter(|b| b.label == "scalp")
+            .collect();
+        assert_eq!(scalp.len(), 1, "Scalp/scalp must merge into one bucket");
+        assert_eq!(scalp[0].wins, 1);
+        assert_eq!(scalp[0].losses, 1);
+        assert!((scalp[0].pnl - 5.0).abs() < 1e-9);
     }
 
     #[test]

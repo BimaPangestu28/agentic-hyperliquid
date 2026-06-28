@@ -30,6 +30,11 @@ pub struct Settings {
     pub auto_scalp_enabled: bool,
     /// Max concurrent open positions the auto-scalp loop may hold.
     pub max_open_positions: u32,
+    /// Minimum reward:risk a setup must clear to be auto-executed. `0.0` disables
+    /// the gate (default), preserving prior behavior until the user opts in.
+    pub min_rr: f64,
+    /// Coins barred from auto-execution entirely, upper-cased. Empty by default.
+    pub coin_blacklist: Vec<String>,
 }
 
 impl Settings {
@@ -48,13 +53,15 @@ impl Settings {
             watchlist: Vec::new(),
             auto_scalp_enabled: false,
             max_open_positions: 5,
+            min_rr: 0.0,
+            coin_blacklist: Vec::new(),
         }
     }
 }
 
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
-max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs, auto_scalp_enabled, max_open_positions";
+max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs, auto_scalp_enabled, max_open_positions, min_rr, coin_blacklist";
 
 /// Parses a percentage that must be strictly positive and at most 100.
 fn parse_percent(value: &str) -> Result<f64, String> {
@@ -81,6 +88,29 @@ fn parse_timeout_secs(value: &str) -> Result<u64, String> {
         return Err("entry_fill_timeout_secs must be >= 1".to_string());
     }
     Ok(parsed)
+}
+
+/// Parses a minimum reward:risk ratio; must be a number of at least 0
+/// (`0` disables the gate).
+fn parse_min_rr(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value.parse().map_err(|_| format!("'{value}' is not a number"))?;
+    if parsed < 0.0 {
+        return Err(format!("min_rr must be >= 0 (got {parsed})"));
+    }
+    Ok(parsed)
+}
+
+/// Parses a comma-separated coin blacklist into trimmed, upper-cased, de-duplicated
+/// symbols. An empty string clears the list.
+fn parse_coin_blacklist(value: &str) -> Vec<String> {
+    let mut coins: Vec<String> = Vec::new();
+    for raw in value.split(',') {
+        let coin = raw.trim().to_uppercase();
+        if !coin.is_empty() && !coins.contains(&coin) {
+            coins.push(coin);
+        }
+    }
+    coins
 }
 
 /// Parses a trigger expiry in seconds; whole number of at least 1.
@@ -144,6 +174,8 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
             }
             next.max_open_positions = parsed;
         }
+        "min_rr" => next.min_rr = parse_min_rr(value)?,
+        "coin_blacklist" => next.coin_blacklist = parse_coin_blacklist(value),
         _ => return Err(format!("Unknown setting '{key}'. Valid keys: {VALID_KEYS}")),
     }
     Ok(next)
@@ -213,6 +245,8 @@ impl SettingsStore {
         self.put("watchlist", &settings.watchlist.join(","))?;
         self.put("auto_scalp_enabled", &settings.auto_scalp_enabled.to_string())?;
         self.put("max_open_positions", &settings.max_open_positions.to_string())?;
+        self.put("min_rr", &settings.min_rr.to_string())?;
+        self.put("coin_blacklist", &settings.coin_blacklist.join(","))?;
         Ok(())
     }
 
@@ -300,6 +334,15 @@ impl SettingsStore {
         if let Some(raw) = self.get("max_open_positions")? {
             if let Ok(value) = raw.parse() { resolved.max_open_positions = value; }
         }
+        if let Some(raw) = self.get("min_rr")? {
+            match raw.parse() {
+                Ok(value) => resolved.min_rr = value,
+                Err(_) => tracing::warn!(key = "min_rr", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
+        }
+        if let Some(raw) = self.get("coin_blacklist")? {
+            resolved.coin_blacklist = parse_coin_blacklist(&raw);
+        }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
         Ok(resolved)
@@ -322,6 +365,8 @@ pub fn sample() -> Settings {
         watchlist: Vec::new(),
         auto_scalp_enabled: false,
         max_open_positions: 5,
+        min_rr: 0.0,
+        coin_blacklist: Vec::new(),
     }
 }
 
@@ -479,6 +524,34 @@ mod tests {
         let capped = apply_setting(&base, "max_open_positions", "3").unwrap();
         assert_eq!(capped.max_open_positions, 3);
         assert!(apply_setting(&base, "max_open_positions", "0").is_err());
+    }
+
+    #[test]
+    fn sets_min_rr_and_rejects_negative() {
+        assert_eq!(apply_setting(&sample(), "min_rr", "1.5").unwrap().min_rr, 1.5);
+        assert_eq!(apply_setting(&sample(), "min_rr", "0").unwrap().min_rr, 0.0);
+        assert!(apply_setting(&sample(), "min_rr", "-1").is_err());
+        assert!(apply_setting(&sample(), "min_rr", "abc").is_err());
+    }
+
+    #[test]
+    fn sets_coin_blacklist_uppercased_and_deduped() {
+        let next = apply_setting(&sample(), "coin_blacklist", " xpl, zec ,XPL").unwrap();
+        assert_eq!(next.coin_blacklist, vec!["XPL".to_string(), "ZEC".to_string()]);
+        // Empty value clears the list.
+        assert!(apply_setting(&next, "coin_blacklist", "").unwrap().coin_blacklist.is_empty());
+    }
+
+    #[test]
+    fn persist_load_roundtrips_min_rr_and_blacklist() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        let mut settings = sample();
+        settings.min_rr = 1.8;
+        settings.coin_blacklist = vec!["XPL".into(), "ZEC".into()];
+        store.persist(&settings).unwrap();
+        let loaded = store.load(sample()).unwrap();
+        assert_eq!(loaded.min_rr, 1.8);
+        assert_eq!(loaded.coin_blacklist, vec!["XPL".to_string(), "ZEC".to_string()]);
     }
 
     #[test]
