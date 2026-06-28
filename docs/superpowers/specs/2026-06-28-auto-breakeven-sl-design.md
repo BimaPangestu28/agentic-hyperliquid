@@ -38,6 +38,20 @@ alike. Disabled by default; opt-in per the user's risk appetite.
    than a small loss.
 4. **Default off.** Behaviour is unchanged until the user enables it.
 
+## Mechanism: exchange-truth (no journal dependency)
+
+The auto-scalp path (`api/mod.rs`) does **not** journal its trades, and the
+stop-loss order id is not persisted anywhere. So the monitor reads ground truth
+from the exchange instead of the journal: it lists the resting orders for each
+position, finds the stop-loss trigger, and uses its trigger price as the current
+stop and its order id as the cancel target. This covers **every** position
+(auto-scalp and manual) with no schema change and no persisted idempotency flag.
+
+**Idempotency without a flag:** a long's original stop sits *below* entry; once
+moved to breakeven it sits *at/above* entry. So "already moved" is detected purely
+from state — if the resting stop is already on the profitable side of entry, skip.
+(Mirror for shorts.)
+
 ## Architecture
 
 A new background loop, `run_breakeven_monitor`, mirroring the existing
@@ -50,23 +64,23 @@ Each tick:
 
 1. Read live settings; if `breakeven_enabled` is false, idle and continue.
 2. Poll `positions()`.
-3. For each open position, look up the most recent journaled trade for that coin
-   (the trade live now) to obtain `stop_loss`, `direction`, `sl_order_id`, and the
-   `breakeven_moved` flag.
-4. **Skip** the position when any of: `breakeven_moved` is already set;
-   `sl_order_id` is unknown; or `risk_distance` is effectively zero.
-5. Compute `risk_distance = |position.entry_px - stop_loss|` (using the position's
-   actual average fill) and `profit_distance` (mark vs entry, direction-aware).
-6. If `profit_distance >= breakeven_trigger_r * risk_distance`:
+3. For each open position, call `open_orders(coin)` and find the **stop-loss
+   trigger**: `is_trigger && reduce_only && !is_take_profit`. Skip the position if
+   there is no such order (nothing to move).
+4. Let `stop = sl.trigger_price`. **Skip** if the stop is already on the profitable
+   side of entry (`already_at_breakeven` → already moved), or if
+   `risk_distance = |entry_px - stop|` is effectively zero.
+5. Compute `profit_distance` (mark vs entry, direction-aware).
+6. If `reached_breakeven_threshold` (`profit_distance >= breakeven_trigger_r *
+   risk_distance`):
    1. Compute `be_price = breakeven_price(direction, entry_px, breakeven_buffer_pct)`.
    2. **Guard:** `be_price` must be a valid stop relative to mark (below mark for a
       long, above for a short). If not (only when `R*risk < buffer`, rare), log and
       skip.
    3. Place the **new** stop-loss trigger at `be_price`, reduce-only, sized to the
-      current position size → obtain the new order id.
-   4. **Then** cancel the **old** stop-loss by `sl_order_id`.
-   5. Persist `sl_order_id = new_oid` and `breakeven_moved = 1` for that trade.
-   6. Notify the user: `🛡️ SL {coin} digeser ke breakeven`.
+      current position size.
+   4. **Then** cancel the **old** stop-loss by `sl.oid`.
+   5. Notify the user: `🛡️ SL {coin} digeser ke breakeven`.
 
 **Ordering — place new before cancelling old:** the position is never left without
 a stop. If the cancel fails, two reduce-only stops rest briefly; the breakeven one
@@ -75,8 +89,11 @@ leftover is swept by `cancel_orders_for_coin` when the position finally closes.
 
 ## Pure core (unit-tested, no I/O)
 
+`Direction` is the existing `crate::parser::Direction` enum (`Long` / `Short`).
+
 ```rust
 /// True when profit has reached `trigger_r` times the initial risk distance.
+/// risk = |entry - stop_loss|; profit = (mark-entry) for Long, (entry-mark) for Short.
 fn reached_breakeven_threshold(
     direction: Direction, entry: f64, stop_loss: f64, mark: f64, trigger_r: f64,
 ) -> bool;
@@ -84,27 +101,37 @@ fn reached_breakeven_threshold(
 /// Breakeven stop price: entry nudged past itself by `buffer_pct`% to cover fees.
 /// Long → entry * (1 + buffer_pct/100); short → entry * (1 - buffer_pct/100).
 fn breakeven_price(direction: Direction, entry: f64, buffer_pct: f64) -> f64;
+
+/// True when the resting `stop` is already on the profitable side of `entry`
+/// (Long: stop >= entry; Short: stop <= entry) — i.e. it has already been moved.
+fn already_at_breakeven(direction: Direction, entry: f64, stop: f64) -> bool;
 ```
 
-The monitor loop is a thin wiring layer over these two functions plus exchange and
-journal I/O.
+The monitor loop is a thin wiring layer over these three functions plus exchange I/O.
 
-## Data changes (journal)
+## Exchange trait addition
 
-Two columns added to the `trades` table via the existing additive
-`ALTER TABLE ADD COLUMN` migration pattern:
+A read-only query, mirroring the existing `frontendOpenOrders` usage in
+`cancel_orders_for_coin`:
 
-- `sl_order_id INTEGER` — the order id of the live stop-loss. Captured when the
-  bracket is placed (`place_bracket` in `telegram.rs` and the trigger-entry arming
-  path in `monitor.rs`), where `place_trigger` already returns an `OrderResult`
-  carrying `order_id` (currently discarded). Updated when the breakeven move
-  re-places the stop.
-- `breakeven_moved INTEGER NOT NULL DEFAULT 0` — idempotency flag so the move runs
-  exactly once per position.
+```rust
+async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<OpenOrder>>;
 
-A small journal read returns `(stop_loss, direction, sl_order_id, breakeven_moved)`
-for the most recent trade of a coin; a small journal write updates
-`sl_order_id`/`breakeven_moved` for that trade.
+pub struct OpenOrder {
+    pub coin: String,
+    pub oid: u64,
+    pub trigger_price: f64,  // 0.0 for non-trigger orders
+    pub is_trigger: bool,
+    pub reduce_only: bool,
+    pub is_take_profit: bool, // from HL orderType: "Take Profit *" → true, "Stop *" → false
+}
+```
+
+Real impl: raw POST `{"type":"frontendOpenOrders","user":<addr>}` (same pattern as
+`usdc_flows`), mapping `triggerPx`, `isTrigger`, `reduceOnly`, and `orderType`.
+Mock impl: returns a seeded `Vec<OpenOrder>` for tests.
+
+No journal schema changes are required.
 
 ## Settings (runtime-tunable via `/set`, persisted, default-safe)
 
@@ -133,14 +160,16 @@ Validation: `breakeven_trigger_r > 0`; `breakeven_buffer_pct >= 0`. Added to
 - `reached_breakeven_threshold`: long & short, just-below vs just-at vs above
   threshold, `trigger_r` other than 1.0, degenerate `risk_distance = 0`.
 - `breakeven_price`: long above entry, short below entry, buffer scales correctly.
+- `already_at_breakeven`: long stop below/at/above entry; short mirror.
 - Settings: `breakeven_trigger_r` rejects ≤ 0; `breakeven_buffer_pct` rejects < 0;
-  persist/reload round-trips all three keys and the two new journal columns.
+  persist/reload round-trips all three keys.
 
-**Integration (MockExchange):**
-- Position past threshold → new stop placed at breakeven, old stop cancelled,
-  `breakeven_moved` set, one notification.
+**Integration (MockExchange, seeded positions + open_orders):**
+- Position past threshold with a far stop → new stop placed at breakeven, old stop
+  cancelled (recorded in `cancels`), one notification.
 - Position below threshold → no order activity.
-- `breakeven_moved` already set → no-op.
+- Stop already at/past entry (already moved) → no-op.
+- No reduce-only stop trigger present → no-op.
 - `breakeven_enabled` false → loop idles, no order activity.
 
 ## Out-of-scope / future
