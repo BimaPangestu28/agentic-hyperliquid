@@ -515,7 +515,7 @@ mod tests {
             coin: "BTC".into(), direction: "long".into(), size: 0.5,
             entry_px: 100.0, mark_px: 106.0, unrealized_pnl: 0.0, leverage: 10.0, notional: 0.0,
         };
-        let orders = vec![
+        let orders = [
             OpenOrder { coin: "BTC".into(), oid: 1, trigger_price: 95.0,  is_trigger: true, reduce_only: true, is_take_profit: false },
             OpenOrder { coin: "BTC".into(), oid: 2, trigger_price: 100.1, is_trigger: true, reduce_only: true, is_take_profit: false },
         ];
