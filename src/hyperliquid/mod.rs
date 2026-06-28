@@ -204,6 +204,9 @@ pub mod mock {
         pub closes: Mutex<Vec<(String, f64)>>,
         /// Coins for which `close_position` returns Err (best-effort test hook).
         pub fail_close_coins: Mutex<Vec<String>>,
+        /// When `true`, `place_trigger` returns Err immediately (fail-injection for
+        /// safety tests that verify the old stop is never cancelled when placement fails).
+        pub fail_place_trigger: Mutex<bool>,
         /// Overrides `free_collateral()` when `Some`; otherwise it returns `equity`
         /// (so a fully-funded account passes the affordability guard by default).
         pub free_collateral_override: Mutex<Option<f64>>,
@@ -247,6 +250,12 @@ pub mod mock {
         pub fn set_open_orders_detail(&self, orders: Vec<super::OpenOrder>) {
             *self.open_orders_detail.lock().unwrap() = orders;
         }
+
+        /// Configures `place_trigger` to return an error on the next call(s).
+        /// Pass `true` to arm the failure; `false` to restore normal behaviour.
+        pub fn set_fail_place_trigger(&self, fail: bool) {
+            *self.fail_place_trigger.lock().unwrap() = fail;
+        }
     }
 
     #[async_trait]
@@ -281,6 +290,9 @@ pub mod mock {
         }
 
         async fn place_trigger(&self, order: &TriggerOrder) -> anyhow::Result<OrderResult> {
+            if *self.fail_place_trigger.lock().unwrap() {
+                return Err(anyhow::anyhow!("simulated place_trigger failure"));
+            }
             self.triggers.lock().unwrap().push(order.clone());
             Ok(OrderResult {
                 order_id: Some(2),

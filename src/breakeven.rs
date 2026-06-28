@@ -133,6 +133,30 @@ mod tests {
     }
 
     #[test]
+    fn decide_moves_short_past_threshold() {
+        let position = OpenPosition {
+            coin: "BTC".into(), direction: "short".into(), size: 0.5,
+            entry_px: 100.0, mark_px: 95.0, unrealized_pnl: 0.0, leverage: 10.0, notional: 0.0,
+        };
+        let stop = OpenOrder { coin: "BTC".into(), oid: 9, trigger_price: 105.0, is_trigger: true, reduce_only: true, is_take_profit: false };
+        let action = decide_breakeven(&position, Some(&stop), 1.0, 0.1).unwrap();
+        assert!((action.be_price - 99.9).abs() < 1e-9);
+        assert!(action.close_is_buy); // short closes with a buy
+        assert_eq!(action.old_oid, 9);
+    }
+
+    #[test]
+    fn decide_skips_when_breakeven_price_wrong_side_of_mark() {
+        let position = OpenPosition {
+            coin: "BTC".into(), direction: "long".into(), size: 0.5,
+            entry_px: 100.0, mark_px: 100.002, unrealized_pnl: 0.0, leverage: 10.0, notional: 0.0,
+        };
+        let stop = OpenOrder { coin: "BTC".into(), oid: 3, trigger_price: 99.999, is_trigger: true, reduce_only: true, is_take_profit: false };
+        // 1R cleared, but breakeven price (100.1) is above the mark (100.002) -> invalid stop -> skip.
+        assert!(decide_breakeven(&position, Some(&stop), 1.0, 0.1).is_none());
+    }
+
+    #[test]
     fn decide_moves_long_past_threshold() {
         // entry 100 stop 95 risk 5; mark 105 = 1R -> move. BE = 100.1, close side = sell (false).
         let action = decide_breakeven(&long_position(100.0, 105.0), Some(&stop_order(7, 95.0)), 1.0, 0.1).unwrap();

@@ -467,6 +467,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_breakeven_preserves_old_stop_when_place_fails() {
+        use crate::hyperliquid::testing::MockExchange;
+        use crate::breakeven::BreakevenAction;
+        let mock = MockExchange::new_for_test();
+        mock.set_fail_place_trigger(true);
+        let action = BreakevenAction { be_price: 100.1, size: 0.5, close_is_buy: false, old_oid: 7 };
+        let result = crate::breakeven::apply_breakeven(&mock, "BTC", &action).await;
+        assert!(result.is_err(), "place failure must propagate");
+        // Old stop must NOT be cancelled when the new stop failed to place.
+        assert!(mock.cancels.lock().unwrap().is_empty(), "old stop must remain when new stop placement fails");
+    }
+
+    #[tokio::test]
     async fn apply_breakeven_places_new_stop_then_cancels_old() {
         use crate::hyperliquid::testing::MockExchange;
         use crate::breakeven::BreakevenAction;
