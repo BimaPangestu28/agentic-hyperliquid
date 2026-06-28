@@ -2,6 +2,7 @@
 //! function is a deterministic computation over prices, so the decision logic
 //! is unit-tested without an exchange or a clock.
 
+use crate::hyperliquid::{Exchange, OpenOrder, OpenPosition, TriggerOrder};
 use crate::parser::Direction;
 
 /// True when profit has reached `trigger_r` times the initial risk distance.
@@ -45,9 +46,117 @@ pub fn already_at_breakeven(direction: Direction, entry: f64, stop: f64) -> bool
     }
 }
 
+/// The concrete order change to apply when a stop should be moved to breakeven.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakevenAction {
+    pub be_price: f64,
+    pub size: f64,
+    /// Side of the replacement stop (a long position closes with a sell → false).
+    pub close_is_buy: bool,
+    /// The order id of the stop to cancel after the new one is placed.
+    pub old_oid: u64,
+}
+
+/// Decides whether `position`'s stop should be moved to breakeven, given the
+/// resting stop-loss order (`stop`) and the configured thresholds. Returns `None`
+/// to skip: no stop found, already moved, degenerate risk, profit below threshold,
+/// or the computed breakeven price is not a valid stop relative to the mark.
+pub fn decide_breakeven(
+    position: &OpenPosition,
+    stop: Option<&OpenOrder>,
+    trigger_r: f64,
+    buffer_pct: f64,
+) -> Option<BreakevenAction> {
+    let stop = stop?;
+    let direction = if position.direction.eq_ignore_ascii_case("long") {
+        Direction::Long
+    } else {
+        Direction::Short
+    };
+    let entry = position.entry_px;
+    let stop_price = stop.trigger_price;
+
+    if already_at_breakeven(direction, entry, stop_price) {
+        return None;
+    }
+    if !reached_breakeven_threshold(direction, entry, stop_price, position.mark_px, trigger_r) {
+        return None;
+    }
+    let be_price = breakeven_price(direction, entry, buffer_pct);
+    // Guard: the new stop must sit on the correct side of the mark (below for a
+    // long, above for a short). Only violated when R*risk < buffer (rare).
+    let valid = match direction {
+        Direction::Long => be_price < position.mark_px,
+        Direction::Short => be_price > position.mark_px,
+    };
+    if !valid {
+        return None;
+    }
+    let close_is_buy = matches!(direction, Direction::Short);
+    Some(BreakevenAction { be_price, size: position.size, close_is_buy, old_oid: stop.oid })
+}
+
+/// Applies a breakeven move: places the new stop FIRST (position never
+/// unprotected), then cancels the old stop by id.
+pub async fn apply_breakeven<E: Exchange + ?Sized>(
+    exchange: &E,
+    coin: &str,
+    action: &BreakevenAction,
+) -> anyhow::Result<()> {
+    exchange
+        .place_trigger(&TriggerOrder {
+            coin: coin.to_string(),
+            is_buy: action.close_is_buy,
+            size: action.size,
+            trigger_price: action.be_price,
+            is_take_profit: false,
+        })
+        .await?;
+    exchange.cancel_order(coin, action.old_oid).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hyperliquid::{OpenOrder, OpenPosition};
+
+    fn long_position(entry: f64, mark: f64) -> OpenPosition {
+        OpenPosition {
+            coin: "BTC".into(), direction: "long".into(), size: 0.5,
+            entry_px: entry, mark_px: mark, unrealized_pnl: 0.0, leverage: 10.0, notional: 0.0,
+        }
+    }
+
+    fn stop_order(oid: u64, trigger: f64) -> OpenOrder {
+        OpenOrder { coin: "BTC".into(), oid, trigger_price: trigger, is_trigger: true, reduce_only: true, is_take_profit: false }
+    }
+
+    #[test]
+    fn decide_moves_long_past_threshold() {
+        // entry 100 stop 95 risk 5; mark 105 = 1R -> move. BE = 100.1, close side = sell (false).
+        let action = decide_breakeven(&long_position(100.0, 105.0), Some(&stop_order(7, 95.0)), 1.0, 0.1).unwrap();
+        assert!((action.be_price - 100.1).abs() < 1e-9);
+        assert_eq!(action.old_oid, 7);
+        assert!(!action.close_is_buy); // long closes with a sell
+        assert!((action.size - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decide_skips_below_threshold() {
+        assert!(decide_breakeven(&long_position(100.0, 104.0), Some(&stop_order(7, 95.0)), 1.0, 0.1).is_none());
+    }
+
+    #[test]
+    fn decide_skips_when_already_at_breakeven() {
+        // stop already at/above entry -> already moved.
+        assert!(decide_breakeven(&long_position(100.0, 110.0), Some(&stop_order(7, 100.0)), 1.0, 0.1).is_none());
+    }
+
+    #[test]
+    fn decide_skips_when_no_stop_order() {
+        assert!(decide_breakeven(&long_position(100.0, 110.0), None, 1.0, 0.1).is_none());
+    }
 
     #[test]
     fn threshold_met_for_long_at_and_above_one_r() {
