@@ -285,6 +285,66 @@ pub async fn run_pnl_monitor<E: Exchange + 'static>(
     }
 }
 
+/// Polls open positions and moves each stop-loss to breakeven once profit reaches
+/// `breakeven_trigger_r` R. Reads settings live each tick; disabled (idle) when
+/// `breakeven_enabled` is false. Never panics: all errors are logged.
+pub async fn run_breakeven_monitor<E: Exchange + 'static>(
+    bot: Bot,
+    exchange: Arc<E>,
+    settings: Arc<Mutex<Settings>>,
+    allowed_user_ids: Vec<i64>,
+    poll_secs: u64,
+) {
+    let interval = Duration::from_secs(poll_secs.max(1));
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let (enabled, trigger_r, buffer_pct) = {
+            let guard = settings.lock().unwrap();
+            (guard.breakeven_enabled, guard.breakeven_trigger_r, guard.breakeven_buffer_pct)
+        };
+        if !enabled {
+            continue;
+        }
+
+        let positions = match exchange.positions().await {
+            Ok(positions) => positions,
+            Err(error) => { tracing::warn!("breakeven monitor positions() failed: {error}"); continue; }
+        };
+
+        for position in &positions {
+            let orders = match exchange.open_orders(&position.coin).await {
+                Ok(orders) => orders,
+                Err(error) => { tracing::warn!("breakeven monitor open_orders({}) failed: {error}", position.coin); continue; }
+            };
+            // Pick the reduce-only stop nearest the mark. If a prior move's cancel of the
+            // old stop failed, two stops can rest; the breakeven one is nearest the mark, so
+            // decide_breakeven's already-at-breakeven check then short-circuits (no duplicate).
+            let stop = orders
+                .iter()
+                .filter(|o| o.is_trigger && o.reduce_only && !o.is_take_profit)
+                .min_by(|a, b| {
+                    let da = (a.trigger_price - position.mark_px).abs();
+                    let db = (b.trigger_price - position.mark_px).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let action = match crate::breakeven::decide_breakeven(position, stop, trigger_r, buffer_pct) {
+                Some(action) => action,
+                None => continue,
+            };
+            match crate::breakeven::apply_breakeven(exchange.as_ref(), &position.coin, &action).await {
+                Ok(()) => {
+                    notify_users(&bot, &allowed_user_ids,
+                        &format!("🛡️ SL {} digeser ke breakeven (${:.4}).", position.coin, action.be_price)).await;
+                }
+                Err(error) => {
+                    tracing::warn!("breakeven move for {} failed: {error}", position.coin);
+                }
+            }
+        }
+    }
+}
+
 /// Sends `message` to every allowlisted user, logging (not propagating) send errors.
 async fn notify_users(bot: &Bot, allowed_user_ids: &[i64], message: &str) {
     for user_id in allowed_user_ids {
@@ -413,5 +473,62 @@ mod tests {
         // Equidistant: 310 is 30 from SL(280) and 30 from TP1(340) → TP wins.
         let bracket = Bracket { stop_loss: 280.0, take_profits: vec![340.0] };
         assert_eq!(classify_close_fill(310.0, &bracket), CloseLabel::TakeProfit(1));
+    }
+
+    #[tokio::test]
+    async fn apply_breakeven_preserves_old_stop_when_place_fails() {
+        use crate::hyperliquid::testing::MockExchange;
+        use crate::breakeven::BreakevenAction;
+        let mock = MockExchange::new_for_test();
+        mock.set_fail_place_trigger(true);
+        let action = BreakevenAction { be_price: 100.1, size: 0.5, close_is_buy: false, old_oid: 7 };
+        let result = crate::breakeven::apply_breakeven(&mock, "BTC", &action).await;
+        assert!(result.is_err(), "place failure must propagate");
+        // Old stop must NOT be cancelled when the new stop failed to place.
+        assert!(mock.cancels.lock().unwrap().is_empty(), "old stop must remain when new stop placement fails");
+    }
+
+    #[tokio::test]
+    async fn apply_breakeven_places_new_stop_then_cancels_old() {
+        use crate::hyperliquid::testing::MockExchange;
+        use crate::breakeven::BreakevenAction;
+        let mock = MockExchange::new_for_test();
+        let action = BreakevenAction { be_price: 100.1, size: 0.5, close_is_buy: false, old_oid: 7 };
+        crate::breakeven::apply_breakeven(&mock, "BTC", &action).await.unwrap();
+        // New reduce-only stop placed at the breakeven price.
+        let triggers = mock.triggers.lock().unwrap();
+        assert_eq!(triggers.len(), 1);
+        assert!(!triggers[0].is_take_profit);
+        assert!((triggers[0].trigger_price - 100.1).abs() < 1e-9);
+        // Old stop cancelled by oid.
+        let cancels = mock.cancels.lock().unwrap();
+        assert_eq!(*cancels, vec![("BTC".to_string(), 7u64)]);
+    }
+
+    #[test]
+    fn nearest_mark_stop_selection_skips_when_breakeven_stop_already_rests() {
+        use crate::hyperliquid::{OpenOrder, OpenPosition};
+        // Long: entry 100, mark 106 (well past 1R). Two reduce-only stops rest:
+        // the OLD one below entry (95) and a BREAKEVEN one just above entry (100.1)
+        // from a prior move whose cancel failed.
+        let position = OpenPosition {
+            coin: "BTC".into(), direction: "long".into(), size: 0.5,
+            entry_px: 100.0, mark_px: 106.0, unrealized_pnl: 0.0, leverage: 10.0, notional: 0.0,
+        };
+        let orders = [
+            OpenOrder { coin: "BTC".into(), oid: 1, trigger_price: 95.0,  is_trigger: true, reduce_only: true, is_take_profit: false },
+            OpenOrder { coin: "BTC".into(), oid: 2, trigger_price: 100.1, is_trigger: true, reduce_only: true, is_take_profit: false },
+        ];
+        // Mirror the loop's nearest-mark selection.
+        let stop = orders.iter()
+            .filter(|o| o.is_trigger && o.reduce_only && !o.is_take_profit)
+            .min_by(|a, b| {
+                let da = (a.trigger_price - position.mark_px).abs();
+                let db = (b.trigger_price - position.mark_px).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        // Nearest the mark (106) is the breakeven stop (100.1), already at breakeven -> skip.
+        assert_eq!(stop.unwrap().oid, 2);
+        assert!(crate::breakeven::decide_breakeven(&position, stop, 1.0, 0.1).is_none());
     }
 }

@@ -91,6 +91,23 @@ pub struct OpenPosition {
     pub notional: f64, // position value in USD
 }
 
+// ── OpenOrder (resting order snapshot, for stop/TP inspection) ─────────────────
+
+/// A resting order on the book, with enough detail to identify a reduce-only
+/// stop-loss trigger and read/cancel it. Derived from `frontendOpenOrders`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenOrder {
+    pub coin: String,
+    pub oid: u64,
+    /// Trigger price for trigger orders; `0.0` for plain limit orders.
+    pub trigger_price: f64,
+    pub is_trigger: bool,
+    pub reduce_only: bool,
+    /// True for take-profit triggers, false for stop-loss triggers
+    /// (from Hyperliquid `orderType`: "Take Profit *" → true, "Stop *" → false).
+    pub is_take_profit: bool,
+}
+
 // ── Exchange trait ────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -126,6 +143,9 @@ pub trait Exchange: Send + Sync {
     async fn positions(&self) -> anyhow::Result<Vec<OpenPosition>>;
     /// USDC deposits/withdrawals from the non-funding ledger, oldest first.
     async fn usdc_flows(&self) -> anyhow::Result<Vec<LedgerFlow>>;
+    /// Resting orders for `coin`, including trigger price and reduce-only/TP flags,
+    /// so callers can locate the live stop-loss. Read-only.
+    async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<OpenOrder>>;
 }
 
 // ── Test utilities ────────────────────────────────────────────────────────────
@@ -176,12 +196,17 @@ pub mod mock {
         pub fills_detailed: Mutex<Vec<super::FillDetail>>,
         /// Pre-loaded USDC ledger flows returned by `usdc_flows()`.
         pub flows: Mutex<Vec<super::LedgerFlow>>,
+        /// Pre-loaded resting orders returned by `open_orders()`.
+        pub open_orders_detail: Mutex<Vec<super::OpenOrder>>,
         /// Records every `place_trigger_entry` call as `(coin, is_buy, size, trigger_price)`.
         pub trigger_entries: Mutex<Vec<(String, bool, f64, f64)>>,
         /// Records every `close_position` call as `(coin, size)`.
         pub closes: Mutex<Vec<(String, f64)>>,
         /// Coins for which `close_position` returns Err (best-effort test hook).
         pub fail_close_coins: Mutex<Vec<String>>,
+        /// When `true`, `place_trigger` returns Err immediately (fail-injection for
+        /// safety tests that verify the old stop is never cancelled when placement fails).
+        pub fail_place_trigger: Mutex<bool>,
         /// Overrides `free_collateral()` when `Some`; otherwise it returns `equity`
         /// (so a fully-funded account passes the affordability guard by default).
         pub free_collateral_override: Mutex<Option<f64>>,
@@ -220,6 +245,17 @@ pub mod mock {
         pub fn set_free_collateral(&self, free: f64) {
             *self.free_collateral_override.lock().unwrap() = Some(free);
         }
+
+        /// Seeds the resting orders returned by `open_orders()`.
+        pub fn set_open_orders_detail(&self, orders: Vec<super::OpenOrder>) {
+            *self.open_orders_detail.lock().unwrap() = orders;
+        }
+
+        /// Configures `place_trigger` to return an error on the next call(s).
+        /// Pass `true` to arm the failure; `false` to restore normal behaviour.
+        pub fn set_fail_place_trigger(&self, fail: bool) {
+            *self.fail_place_trigger.lock().unwrap() = fail;
+        }
     }
 
     #[async_trait]
@@ -254,6 +290,9 @@ pub mod mock {
         }
 
         async fn place_trigger(&self, order: &TriggerOrder) -> anyhow::Result<OrderResult> {
+            if *self.fail_place_trigger.lock().unwrap() {
+                return Err(anyhow::anyhow!("simulated place_trigger failure"));
+            }
             self.triggers.lock().unwrap().push(order.clone());
             Ok(OrderResult {
                 order_id: Some(2),
@@ -327,6 +366,17 @@ pub mod mock {
 
         async fn usdc_flows(&self) -> anyhow::Result<Vec<super::LedgerFlow>> {
             Ok(self.flows.lock().unwrap().clone())
+        }
+
+        async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<super::OpenOrder>> {
+            Ok(self
+                .open_orders_detail
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|order| order.coin.eq_ignore_ascii_case(coin))
+                .cloned()
+                .collect())
         }
     }
 
@@ -484,6 +534,18 @@ pub mod mock {
             flow.usdc, -200.5,
             "usdc must be negative for withdrawals — sign must not be stripped"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_open_orders_filters_by_coin() {
+        let mock = MockExchange::new_for_test();
+        mock.set_open_orders_detail(vec![
+            OpenOrder { coin: "BTC".into(), oid: 11, trigger_price: 95.0, is_trigger: true, reduce_only: true, is_take_profit: false },
+            OpenOrder { coin: "ETH".into(), oid: 22, trigger_price: 0.0, is_trigger: false, reduce_only: false, is_take_profit: false },
+        ]);
+        let btc = mock.open_orders("btc").await.unwrap();
+        assert_eq!(btc.len(), 1);
+        assert_eq!(btc[0].oid, 11);
     }
 }
 
@@ -1099,5 +1161,57 @@ impl Exchange for HyperliquidExchange {
         // Sort oldest first for consistent ordering.
         ledger_flows.sort_by_key(|flow| flow.time_ms);
         Ok(ledger_flows)
+    }
+
+    /// Resting orders for `coin` via the `frontendOpenOrders` info endpoint, which
+    /// (unlike `openOrders`) includes `triggerPx`, `isTrigger`, `reduceOnly`, and
+    /// `orderType` — enough to identify the reduce-only stop-loss trigger.
+    async fn open_orders(&self, coin: &str) -> anyhow::Result<Vec<OpenOrder>> {
+        let address_hex = format!("{:#x}", self.address);
+        let body = serde_json::json!({
+            "type": "frontendOpenOrders",
+            "user": address_hex,
+        })
+        .to_string();
+
+        let base_url = &self.info.http_client.base_url;
+        let response_text = self
+            .info
+            .http_client
+            .client
+            .post(format!("{base_url}/info"))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_orders request failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_orders response read failed: {e}"))?;
+
+        let raw_rows: Vec<serde_json::Value> = serde_json::from_str(&response_text)
+            .map_err(|e| anyhow::anyhow!("open_orders JSON parse failed: {e}"))?;
+
+        let orders = raw_rows
+            .into_iter()
+            .filter_map(|row| {
+                let row_coin = row.get("coin")?.as_str()?.to_string();
+                if !row_coin.eq_ignore_ascii_case(coin) {
+                    return None;
+                }
+                let oid = row.get("oid")?.as_u64()?;
+                let is_trigger = row.get("isTrigger").and_then(|v| v.as_bool()).unwrap_or(false);
+                let reduce_only = row.get("reduceOnly").and_then(|v| v.as_bool()).unwrap_or(false);
+                let trigger_price = row
+                    .get("triggerPx")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let order_type = row.get("orderType").and_then(|v| v.as_str()).unwrap_or("");
+                let is_take_profit = order_type.to_ascii_lowercase().contains("take profit");
+                Some(OpenOrder { coin: row_coin, oid, trigger_price, is_trigger, reduce_only, is_take_profit })
+            })
+            .collect();
+        Ok(orders)
     }
 }
