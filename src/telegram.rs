@@ -1701,6 +1701,22 @@ pub async fn run<E: Exchange + 'static>(
         });
     }
 
+    // Background breakeven monitor: moves each stop-loss to breakeven once profit
+    // reaches breakeven_trigger_r. Reads settings live (disabled = idle). Shares the
+    // bot's settings Arc so /set takes effect without restart.
+    {
+        let monitor_bot = bot.clone();
+        let monitor_exchange = context.exchange.clone();
+        let monitor_settings = context.settings.clone();
+        let monitor_user_ids = context.config.allowed_user_ids.clone();
+        let monitor_poll_secs = context.config.monitor_poll_secs;
+        tokio::spawn(async move {
+            crate::monitor::run_breakeven_monitor(
+                monitor_bot, monitor_exchange, monitor_settings, monitor_user_ids, monitor_poll_secs,
+            ).await;
+        });
+    }
+
     // Background P&L push: periodically sends running unrealized-P&L summary to
     // all allowed users while positions are open. Interval is read live from
     // settings each tick; 0 disables without restarting the task.
