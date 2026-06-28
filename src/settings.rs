@@ -35,6 +35,13 @@ pub struct Settings {
     pub min_rr: f64,
     /// Coins barred from auto-execution entirely, upper-cased. Empty by default.
     pub coin_blacklist: Vec<String>,
+    /// Master toggle for auto-breakeven stop-loss (default false).
+    pub breakeven_enabled: bool,
+    /// Profit (in R-multiples of initial risk) at which the stop is moved to
+    /// breakeven. Must be > 0.
+    pub breakeven_trigger_r: f64,
+    /// Fee buffer past entry (percent) for the breakeven stop. Must be >= 0.
+    pub breakeven_buffer_pct: f64,
 }
 
 impl Settings {
@@ -55,13 +62,16 @@ impl Settings {
             max_open_positions: 5,
             min_rr: 0.0,
             coin_blacklist: Vec::new(),
+            breakeven_enabled: false,
+            breakeven_trigger_r: 1.0,
+            breakeven_buffer_pct: 0.1,
         }
     }
 }
 
 /// Comma-separated list of valid `/set` keys, used in error messages.
 const VALID_KEYS: &str = "entry_mode, risk_pct, entry_pct, entry_fixed_usd, \
-max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs, auto_scalp_enabled, max_open_positions, min_rr, coin_blacklist";
+max_daily_risk_pct, entry_fill_timeout_secs, trigger_expiry_secs, leverage_conservative, leverage_moderate, leverage_aggressive, pnl_push_secs, auto_scalp_enabled, max_open_positions, min_rr, coin_blacklist, breakeven_enabled, breakeven_trigger_r, breakeven_buffer_pct";
 
 /// Parses a percentage that must be strictly positive and at most 100.
 fn parse_percent(value: &str) -> Result<f64, String> {
@@ -96,6 +106,24 @@ fn parse_min_rr(value: &str) -> Result<f64, String> {
     let parsed: f64 = value.parse().map_err(|_| format!("'{value}' is not a number"))?;
     if parsed < 0.0 {
         return Err(format!("min_rr must be >= 0 (got {parsed})"));
+    }
+    Ok(parsed)
+}
+
+/// Parses the breakeven R-multiple trigger; must be a number strictly > 0.
+fn parse_breakeven_trigger_r(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value.parse().map_err(|_| format!("'{value}' is not a number"))?;
+    if parsed <= 0.0 {
+        return Err(format!("breakeven_trigger_r must be > 0 (got {parsed})"));
+    }
+    Ok(parsed)
+}
+
+/// Parses the breakeven fee buffer percent; must be a number of at least 0.
+fn parse_breakeven_buffer_pct(value: &str) -> Result<f64, String> {
+    let parsed: f64 = value.parse().map_err(|_| format!("'{value}' is not a number"))?;
+    if parsed < 0.0 {
+        return Err(format!("breakeven_buffer_pct must be >= 0 (got {parsed})"));
     }
     Ok(parsed)
 }
@@ -176,6 +204,15 @@ pub fn apply_setting(current: &Settings, key: &str, raw_value: &str) -> Result<S
         }
         "min_rr" => next.min_rr = parse_min_rr(value)?,
         "coin_blacklist" => next.coin_blacklist = parse_coin_blacklist(value),
+        "breakeven_enabled" => {
+            next.breakeven_enabled = match value {
+                "true" | "on" | "1" => true,
+                "false" | "off" | "0" => false,
+                _ => return Err("breakeven_enabled must be true or false".to_string()),
+            };
+        }
+        "breakeven_trigger_r" => next.breakeven_trigger_r = parse_breakeven_trigger_r(value)?,
+        "breakeven_buffer_pct" => next.breakeven_buffer_pct = parse_breakeven_buffer_pct(value)?,
         _ => return Err(format!("Unknown setting '{key}'. Valid keys: {VALID_KEYS}")),
     }
     Ok(next)
@@ -247,6 +284,9 @@ impl SettingsStore {
         self.put("max_open_positions", &settings.max_open_positions.to_string())?;
         self.put("min_rr", &settings.min_rr.to_string())?;
         self.put("coin_blacklist", &settings.coin_blacklist.join(","))?;
+        self.put("breakeven_enabled", &settings.breakeven_enabled.to_string())?;
+        self.put("breakeven_trigger_r", &settings.breakeven_trigger_r.to_string())?;
+        self.put("breakeven_buffer_pct", &settings.breakeven_buffer_pct.to_string())?;
         Ok(())
     }
 
@@ -343,6 +383,21 @@ impl SettingsStore {
         if let Some(raw) = self.get("coin_blacklist")? {
             resolved.coin_blacklist = parse_coin_blacklist(&raw);
         }
+        if let Some(raw) = self.get("breakeven_enabled")? {
+            resolved.breakeven_enabled = matches!(raw.as_str(), "true" | "on" | "1");
+        }
+        if let Some(raw) = self.get("breakeven_trigger_r")? {
+            match raw.parse() {
+                Ok(value) => resolved.breakeven_trigger_r = value,
+                Err(_) => tracing::warn!(key = "breakeven_trigger_r", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
+        }
+        if let Some(raw) = self.get("breakeven_buffer_pct")? {
+            match raw.parse() {
+                Ok(value) => resolved.breakeven_buffer_pct = value,
+                Err(_) => tracing::warn!(key = "breakeven_buffer_pct", value = %raw, "failed to parse stored setting; keeping seed value"),
+            }
+        }
         // Seed any missing keys and normalize storage.
         self.persist(&resolved)?;
         Ok(resolved)
@@ -367,6 +422,9 @@ pub fn sample() -> Settings {
         max_open_positions: 5,
         min_rr: 0.0,
         coin_blacklist: Vec::new(),
+        breakeven_enabled: false,
+        breakeven_trigger_r: 1.0,
+        breakeven_buffer_pct: 0.1,
     }
 }
 
@@ -566,5 +624,42 @@ mod tests {
         assert_eq!(loaded.watchlist, vec!["BTC".to_string(), "ETH".to_string()]);
         assert!(loaded.auto_scalp_enabled);
         assert_eq!(loaded.max_open_positions, 4);
+    }
+
+    #[test]
+    fn sets_breakeven_trigger_r_and_rejects_non_positive() {
+        assert_eq!(apply_setting(&sample(), "breakeven_trigger_r", "1.5").unwrap().breakeven_trigger_r, 1.5);
+        assert!(apply_setting(&sample(), "breakeven_trigger_r", "0").is_err());
+        assert!(apply_setting(&sample(), "breakeven_trigger_r", "-1").is_err());
+        assert!(apply_setting(&sample(), "breakeven_trigger_r", "abc").is_err());
+    }
+
+    #[test]
+    fn sets_breakeven_buffer_pct_and_rejects_negative() {
+        assert_eq!(apply_setting(&sample(), "breakeven_buffer_pct", "0.2").unwrap().breakeven_buffer_pct, 0.2);
+        assert_eq!(apply_setting(&sample(), "breakeven_buffer_pct", "0").unwrap().breakeven_buffer_pct, 0.0);
+        assert!(apply_setting(&sample(), "breakeven_buffer_pct", "-0.1").is_err());
+    }
+
+    #[test]
+    fn toggles_breakeven_enabled() {
+        let on = apply_setting(&sample(), "breakeven_enabled", "on").unwrap();
+        assert!(on.breakeven_enabled);
+        let off = apply_setting(&on, "breakeven_enabled", "off").unwrap();
+        assert!(!off.breakeven_enabled);
+    }
+
+    #[test]
+    fn persist_load_roundtrips_breakeven_settings() {
+        let store = SettingsStore::open_in_memory().unwrap();
+        let mut settings = sample();
+        settings.breakeven_enabled = true;
+        settings.breakeven_trigger_r = 1.5;
+        settings.breakeven_buffer_pct = 0.2;
+        store.persist(&settings).unwrap();
+        let loaded = store.load(sample()).unwrap();
+        assert!(loaded.breakeven_enabled);
+        assert_eq!(loaded.breakeven_trigger_r, 1.5);
+        assert_eq!(loaded.breakeven_buffer_pct, 0.2);
     }
 }

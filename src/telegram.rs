@@ -300,6 +300,11 @@ pub fn render_settings(settings: &Settings) -> String {
     } else {
         settings.coin_blacklist.join(", ")
     };
+    let breakeven = if settings.breakeven_enabled {
+        format!("ON · {:.2}R · buf {:.2}%", settings.breakeven_trigger_r, settings.breakeven_buffer_pct)
+    } else {
+        "OFF".to_string()
+    };
     format!(
         "⚙️ Settings\n\n\
          Entry mode: {}\n\
@@ -316,9 +321,10 @@ pub fn render_settings(settings: &Settings) -> String {
          auto_scalp_enabled: {}\n\
          max_open_positions: {}\n\
          min_rr: {}\n\
-         coin_blacklist: {}\n\n\
+         coin_blacklist: {}\n\
+         breakeven: {}\n\n\
          Change a number:  /set <key> <value>\n\
-         e.g.  /set min_rr 1.5  ·  /set coin_blacklist XPL,ZEC\n\
+         e.g.  /set min_rr 1.5  ·  /set coin_blacklist XPL,ZEC  ·  /set breakeven_enabled on  ·  /set breakeven_trigger_r 1.0\n\
          Switch entry mode with the buttons below.",
         settings.entry_mode.label(),
         settings.risk_pct,
@@ -335,6 +341,7 @@ pub fn render_settings(settings: &Settings) -> String {
         settings.max_open_positions,
         min_rr,
         blacklist,
+        breakeven,
     )
 }
 
@@ -1823,6 +1830,9 @@ mod tests {
             max_open_positions: 5,
             min_rr: 0.0,
             coin_blacklist: Vec::new(),
+            breakeven_enabled: false,
+            breakeven_trigger_r: 1.0,
+            breakeven_buffer_pct: 0.1,
         };
         let text = super::render_settings(&settings);
         assert!(text.contains("% Balance"));
@@ -1845,6 +1855,9 @@ mod tests {
             max_open_positions: 5,
             min_rr: 0.0,
             coin_blacklist: Vec::new(),
+            breakeven_enabled: false,
+            breakeven_trigger_r: 1.0,
+            breakeven_buffer_pct: 0.1,
         };
         assert!(super::render_settings(&settings).contains("disabled"));
     }
