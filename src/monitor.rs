@@ -317,8 +317,17 @@ pub async fn run_breakeven_monitor<E: Exchange + 'static>(
                 Ok(orders) => orders,
                 Err(error) => { tracing::warn!("breakeven monitor open_orders({}) failed: {error}", position.coin); continue; }
             };
-            // The reduce-only stop-loss trigger for this position (not a take-profit).
-            let stop = orders.iter().find(|o| o.is_trigger && o.reduce_only && !o.is_take_profit);
+            // Pick the reduce-only stop nearest the mark. If a prior move's cancel of the
+            // old stop failed, two stops can rest; the breakeven one is nearest the mark, so
+            // decide_breakeven's already-at-breakeven check then short-circuits (no duplicate).
+            let stop = orders
+                .iter()
+                .filter(|o| o.is_trigger && o.reduce_only && !o.is_take_profit)
+                .min_by(|a, b| {
+                    let da = (a.trigger_price - position.mark_px).abs();
+                    let db = (b.trigger_price - position.mark_px).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
             let action = match crate::breakeven::decide_breakeven(position, stop, trigger_r, buffer_pct) {
                 Some(action) => action,
                 None => continue,
@@ -494,5 +503,32 @@ mod tests {
         // Old stop cancelled by oid.
         let cancels = mock.cancels.lock().unwrap();
         assert_eq!(*cancels, vec![("BTC".to_string(), 7u64)]);
+    }
+
+    #[test]
+    fn nearest_mark_stop_selection_skips_when_breakeven_stop_already_rests() {
+        use crate::hyperliquid::{OpenOrder, OpenPosition};
+        // Long: entry 100, mark 106 (well past 1R). Two reduce-only stops rest:
+        // the OLD one below entry (95) and a BREAKEVEN one just above entry (100.1)
+        // from a prior move whose cancel failed.
+        let position = OpenPosition {
+            coin: "BTC".into(), direction: "long".into(), size: 0.5,
+            entry_px: 100.0, mark_px: 106.0, unrealized_pnl: 0.0, leverage: 10.0, notional: 0.0,
+        };
+        let orders = vec![
+            OpenOrder { coin: "BTC".into(), oid: 1, trigger_price: 95.0,  is_trigger: true, reduce_only: true, is_take_profit: false },
+            OpenOrder { coin: "BTC".into(), oid: 2, trigger_price: 100.1, is_trigger: true, reduce_only: true, is_take_profit: false },
+        ];
+        // Mirror the loop's nearest-mark selection.
+        let stop = orders.iter()
+            .filter(|o| o.is_trigger && o.reduce_only && !o.is_take_profit)
+            .min_by(|a, b| {
+                let da = (a.trigger_price - position.mark_px).abs();
+                let db = (b.trigger_price - position.mark_px).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        // Nearest the mark (106) is the breakeven stop (100.1), already at breakeven -> skip.
+        assert_eq!(stop.unwrap().oid, 2);
+        assert!(crate::breakeven::decide_breakeven(&position, stop, 1.0, 0.1).is_none());
     }
 }
